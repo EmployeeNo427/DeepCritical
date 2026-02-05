@@ -101,6 +101,17 @@ class PrimaryWorkflowOrchestrator:
 
     def _create_primary_agent(self):
         """Create the primary REACT agent."""
+        import os
+        import warnings
+
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            warnings.warn(
+                "ANTHROPIC_API_KEY not set. Workflow orchestration requires LLM credentials. "
+                "Set the environment variable or configure an alternative model.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         # Get prompts from the prompts module
         prompts = WorkflowOrchestratorPrompts()
 

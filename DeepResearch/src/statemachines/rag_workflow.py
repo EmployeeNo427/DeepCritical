@@ -140,7 +140,7 @@ class InitializeRAG(BaseNode[RAGState]):  # type: ignore[unsupported-base]
         # Create vector store config
         vs_cfg = rag_cfg.get("vector_store", {})
         vector_store_config = VectorStoreConfig(
-            store_type=VectorStoreType(vs_cfg.get("store_type", "chroma")),
+            store_type=VectorStoreType(vs_cfg.get("store_type", "faiss")),
             connection_string=vs_cfg.get("connection_string"),
             host=vs_cfg.get("host", "localhost"),
             port=vs_cfg.get("port", 8000),
@@ -208,9 +208,22 @@ class LoadDocuments(BaseNode[RAGState]):  # type: ignore[unsupported-base]
 
     async def _load_from_file(self, source: dict[str, Any]) -> list[Document]:
         """Load documents from file sources."""
-        # Implementation would depend on file type (PDF, TXT, etc.)
-        # For now, return empty list
-        return []
+        from pathlib import Path
+
+        path = Path(source.get("path", ""))
+        if not path.exists():
+            return []
+
+        try:
+            content = path.read_text(encoding="utf-8")
+            return [
+                Document(
+                    content=content,
+                    metadata={"source": "file", "path": str(path)},
+                )
+            ]
+        except Exception:
+            return []
 
     async def _load_from_database(self, source: dict[str, Any]) -> list[Document]:
         """Load documents from database sources."""
