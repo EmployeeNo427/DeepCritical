@@ -99,14 +99,35 @@ class PrimaryWorkflowOrchestrator:
             "overall_system_judge": None,
         }
 
+    _api_key_warned: bool = False  # Class-level flag to warn only once
+
     def _create_primary_agent(self):
         """Create the primary REACT agent."""
         import os
         import warnings
 
-        if not os.environ.get("ANTHROPIC_API_KEY"):
+        model_name = self.config.primary_workflow.parameters.get(
+            "model_name", "anthropic:claude-sonnet-4-0"
+        )
+
+        # Check API key based on configured provider
+        if model_name.startswith("anthropic:"):
+            key_var = "ANTHROPIC_API_KEY"
+        elif model_name.startswith("openai:"):
+            key_var = "OPENAI_API_KEY"
+        elif model_name.startswith("google:") or model_name.startswith("gemini:"):
+            key_var = "GOOGLE_API_KEY"
+        else:
+            key_var = None  # Unknown provider, skip check
+
+        if (
+            key_var
+            and not os.environ.get(key_var)
+            and not PrimaryWorkflowOrchestrator._api_key_warned
+        ):
+            PrimaryWorkflowOrchestrator._api_key_warned = True
             warnings.warn(
-                "ANTHROPIC_API_KEY not set. Workflow orchestration requires LLM credentials. "
+                f"{key_var} not set. Workflow orchestration requires LLM credentials. "
                 "Set the environment variable or configure an alternative model.",
                 RuntimeWarning,
                 stacklevel=2,

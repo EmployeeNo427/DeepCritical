@@ -222,7 +222,12 @@ class LoadDocuments(BaseNode[RAGState]):  # type: ignore[unsupported-base]
                     metadata={"source": "file", "path": str(path)},
                 )
             ]
-        except Exception:
+        except Exception as e:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Failed to load file '%s': %s", path, e
+            )
             return []
 
     async def _load_from_database(self, source: dict[str, Any]) -> list[Document]:
