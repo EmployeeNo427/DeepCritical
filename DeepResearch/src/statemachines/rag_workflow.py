@@ -65,6 +65,7 @@ class RAGState:
     documents: list[Document] = field(default_factory=list)
     rag_response: RAGResponse | None = None
     rag_result: dict[str, Any] | None = None  # For agent results
+    rag_system: Any | None = None  # For runtime system access
     processing_steps: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     config: DictConfig | None = None
@@ -238,6 +239,8 @@ class ProcessDocuments(BaseNode[RAGState]):  # type: ignore[unsupported-base]
 
             # Chunk documents based on configuration
             rag_config = ctx.state.rag_config
+            if not rag_config:
+                raise ValueError("RAG config not initialized")
             chunked_documents = await self._chunk_documents(
                 ctx.state.documents, rag_config.chunk_size, rag_config.chunk_overlap
             )
@@ -321,6 +324,8 @@ class StoreDocuments(BaseNode[RAGState]):  # type: ignore[unsupported-base]
         """Store documents in vector store."""
         try:
             rag_config = ctx.state.rag_config
+            if not rag_config:
+                raise ValueError("RAG config not initialized")
 
             # Initialize Embeddings via Factory
             from DeepResearch.src.datatypes.embeddings_factory import create_embeddings
@@ -359,7 +364,7 @@ class StoreDocuments(BaseNode[RAGState]):  # type: ignore[unsupported-base]
             ctx.state.processing_steps.append("embeddings_initialized")
 
             # Store RAG system in context for querying
-            ctx.set("rag_system", rag_system)
+            ctx.state.rag_system = rag_system
 
             return QueryRAG()
 
@@ -440,7 +445,7 @@ class QueryRAG(BaseNode[RAGState]):  # type: ignore[unsupported-base]
                 )
             else:
                 # Fallback to direct system query
-                rag_system = ctx.get("rag_system")
+                rag_system = ctx.state.rag_system
                 if rag_system:
                     rag_response = await rag_system.query(rag_query)
                     ctx.state.rag_response = rag_response

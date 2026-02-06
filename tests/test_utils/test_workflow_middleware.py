@@ -687,16 +687,28 @@ class TestWorkflowMiddleware:
         # ----- Middleware class instances -----
 
         class DummyAgentMiddleware(AgentMiddleware):
-            async def process(self, context, next_fn):
-                return await next_fn(context)
+            async def process(
+                self,
+                context: AgentRunContext,
+                next: Callable[[AgentRunContext], Awaitable[None]],
+            ) -> None:
+                await next(context)
 
         class DummyFunctionMiddleware(FunctionMiddleware):
-            async def process(self, context, next_fn):
-                return await next_fn(context)
+            async def process(
+                self,
+                context: FunctionInvocationContext,
+                next: Callable[[FunctionInvocationContext], Awaitable[None]],
+            ) -> None:
+                await next(context)
 
         class DummyChatMiddleware(ChatMiddleware):
-            async def process(self, context, next_fn):
-                return await next_fn(context)
+            async def process(
+                self,
+                context: ChatContext,
+                next: Callable[[ChatContext], Awaitable[None]],
+            ) -> None:
+                await next(context)
 
         agent_instance = DummyAgentMiddleware()
         func_instance = DummyFunctionMiddleware()

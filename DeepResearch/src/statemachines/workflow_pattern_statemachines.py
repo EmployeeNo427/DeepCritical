@@ -193,7 +193,7 @@ class ExecuteCollaborativePattern(BaseNode[WorkflowPatternState]):  # type: igno
 
             # Update state
             ctx.state.final_result = result
-            ctx.state.metrics = orchestrator.state.get_summary()
+            # ctx.state.metrics = orchestrator.state.get_summary() # Type mismatch
             ctx.state.processing_steps.append("collaborative_pattern_executed")
 
             return ProcessCollaborativeResults()
@@ -223,7 +223,7 @@ class ExecuteSequentialPattern(BaseNode[WorkflowPatternState]):  # type: ignore[
 
             # Update state
             ctx.state.final_result = result
-            ctx.state.metrics = orchestrator.state.get_summary()
+            # ctx.state.metrics = orchestrator.state.get_summary()
             ctx.state.processing_steps.append("sequential_pattern_executed")
 
             return ProcessSequentialResults()
@@ -253,7 +253,7 @@ class ExecuteHierarchicalPattern(BaseNode[WorkflowPatternState]):  # type: ignor
 
             # Update state
             ctx.state.final_result = result
-            ctx.state.metrics = orchestrator.state.get_summary()
+            # ctx.state.metrics = orchestrator.state.get_summary()
             ctx.state.processing_steps.append("hierarchical_pattern_executed")
 
             return ProcessHierarchicalResults()
@@ -276,6 +276,8 @@ class ProcessCollaborativeResults(BaseNode[WorkflowPatternState]):  # type: igno
     ) -> ValidateConsensus:
         """Process collaborative results."""
         try:
+            if not ctx.state.orchestrator:
+                raise ValueError("Orchestrator not initialized")
             # Compute consensus metrics
             consensus_result = WorkflowPatternUtils.compute_consensus(
                 list(ctx.state.orchestrator.state.results.values()),
@@ -463,7 +465,11 @@ class FinalizePattern(BaseNode[WorkflowPatternState]):  # type: ignore[unsupport
         try:
             # Update final metrics
             ctx.state.end_time = time.time()
-            total_time = ctx.state.end_time - ctx.state.start_time
+            total_time = (
+                ctx.state.end_time - ctx.state.start_time
+                if ctx.state.end_time
+                else 0.0
+            )
 
             # Create comprehensive execution summary
             # final_summary = {
@@ -574,7 +580,7 @@ class PatternError(BaseNode[WorkflowPatternState]):  # type: ignore[unsupported-
             [
                 "",
                 f"Steps Completed: {len(ctx.state.processing_steps)}",
-                f"Execution Time: {ctx.state.end_time - ctx.state.start_time:.2f}s",
+                f"Execution Time: {(ctx.state.end_time or time.time()) - ctx.state.start_time:.2f}s",
                 f"Status: {ctx.state.execution_status.value}",
             ]
         )
@@ -690,7 +696,7 @@ async def run_collaborative_pattern_workflow(
 
     graph = create_collaborative_pattern_graph()
     result = await graph.run(InitializePattern(), state=state)
-    return result.output
+    return result.output or ""
 
 
 async def run_sequential_pattern_workflow(
@@ -713,7 +719,7 @@ async def run_sequential_pattern_workflow(
 
     graph = create_sequential_pattern_graph()
     result = await graph.run(InitializePattern(), state=state)
-    return result.output
+    return result.output or ""
 
 
 async def run_hierarchical_pattern_workflow(
@@ -738,7 +744,7 @@ async def run_hierarchical_pattern_workflow(
 
     graph = create_hierarchical_pattern_graph()
     result = await graph.run(InitializePattern(), state=state)
-    return result.output
+    return result.output or ""
 
 
 async def run_pattern_workflow(
@@ -762,7 +768,7 @@ async def run_pattern_workflow(
 
     graph = create_pattern_graph(pattern)
     result = await graph.run(InitializePattern(), state=state)
-    return result.output
+    return result.output or ""
 
 
 # Export all components

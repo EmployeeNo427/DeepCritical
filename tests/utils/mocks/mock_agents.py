@@ -9,7 +9,7 @@ class MockPlannerAgent:
     """Mock planner agent for testing."""
 
     async def plan(
-        self, query: str, state: dict[str, Any] | None = None
+        self, query: str, state: Any | None = None
     ) -> dict[str, Any]:
         """Mock planning functionality."""
         return {
@@ -23,7 +23,7 @@ class MockExecutorAgent:
     """Mock executor agent for testing."""
 
     async def execute(
-        self, plan: dict[str, Any], state: dict[str, Any] | None = None
+        self, plan: dict[str, Any], state: Any | None = None
     ) -> dict[str, Any]:
         """Mock execution functionality."""
         return {
@@ -37,7 +37,7 @@ class MockEvaluatorAgent:
     """Mock evaluator agent for testing."""
 
     async def evaluate(
-        self, result: dict[str, Any], query: str, state: dict[str, Any] | None = None
+        self, result: dict[str, Any], query: str, state: Any | None = None
     ) -> dict[str, Any]:
         """Mock evaluation functionality."""
         return {

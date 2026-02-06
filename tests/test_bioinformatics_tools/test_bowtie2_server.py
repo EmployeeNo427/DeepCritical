@@ -423,7 +423,7 @@ class TestBowtie2Server(BaseBioinformaticsToolTest):
 
     @pytest.mark.optional
     @pytest.mark.containerized
-    def test_containerized_execution(
+    def test_containerized_execution(  # type: ignore[override]
         self, tool_instance, sample_input_files, sample_output_dir, test_config
     ):
         """Test tool execution in containerized environment."""

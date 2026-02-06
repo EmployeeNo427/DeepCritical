@@ -44,30 +44,32 @@ class MockEmbeddings(Embeddings):
         self.dimension = dimension
         self._vectors = {}
 
-    async def vectorize_documents(self, texts: list[str]) -> list[list[float]]:
+    async def vectorize_documents(
+        self, document_chunks: list[str]
+    ) -> list[list[float]]:
         """Generate mock embeddings for documents."""
         # Return mock embeddings directly for testing
         return [
             [(len(text) + i + j) / 1000.0 for j in range(self.dimension)]
-            for i, text in enumerate(texts)
+            for i, text in enumerate(document_chunks)
         ]
 
-    def vectorize_documents_sync(self, texts: list[str]) -> list[list[float]]:
+    def vectorize_documents_sync(self, document_chunks: list[str]) -> list[list[float]]:
         """Sync version of vectorize_documents."""
         # For testing, return mock embeddings directly
         return [
             [(len(text) + i + j) / 1000.0 for j in range(self.dimension)]
-            for i, text in enumerate(texts)
+            for i, text in enumerate(document_chunks)
         ]
 
-    async def vectorize_query(self, query: str) -> list[float]:
+    async def vectorize_query(self, text: str) -> list[float]:
         """Generate mock embedding for query."""
-        return [(len(query) + j) / 1000.0 for j in range(self.dimension)]
+        return [(len(text) + j) / 1000.0 for j in range(self.dimension)]
 
-    def vectorize_query_sync(self, query: str) -> list[float]:
+    def vectorize_query_sync(self, text: str) -> list[float]:
         """Sync version of vectorize_query."""
         # Run async version in sync context
-        return asyncio.run(self.vectorize_query(query))
+        return asyncio.run(self.vectorize_query(text))
 
 
 class TestNeo4jVectorStore:
@@ -174,7 +176,7 @@ class TestNeo4jVectorStore:
         async def mock_get_session():
             yield mock_session
 
-        store.get_session = mock_get_session
+        store.get_session = mock_get_session  # type: ignore
 
         # Mock async run method
         call_count = 0
@@ -238,7 +240,7 @@ class TestNeo4jVectorStore:
         async def mock_get_session():
             yield mock_session
 
-        store.get_session = mock_get_session
+        store.get_session = mock_get_session  # type: ignore
 
         # Mock search results
         mock_record = MagicMock()
@@ -326,7 +328,7 @@ class TestNeo4jVectorStore:
         async def mock_get_session():
             yield mock_session
 
-        store.get_session = mock_get_session
+        store.get_session = mock_get_session  # type: ignore
 
         # Mock document retrieval
         mock_record = MagicMock()
@@ -379,7 +381,7 @@ class TestNeo4jVectorStore:
         async def mock_get_session():
             yield mock_session
 
-        store.get_session = mock_get_session
+        store.get_session = mock_get_session  # type: ignore
 
         # Mock delete operation
         mock_result = MagicMock()
@@ -420,7 +422,7 @@ class TestNeo4jVectorStore:
         async def mock_get_session():
             yield mock_session
 
-        store.get_session = mock_get_session
+        store.get_session = mock_get_session  # type: ignore
 
         # Mock count result
         mock_record = MagicMock()

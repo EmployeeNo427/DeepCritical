@@ -489,9 +489,9 @@ async def example_basic_usage():
             temperature=0.7,
         )
 
-        await client.chat_completions(chat_request)  # type: ignore[attr-defined]
+        await client.chat_completions(chat_request)
 
-    await client.close()  # type: ignore[attr-defined]
+    await client.close()
 
 
 async def example_streaming():
@@ -521,9 +521,9 @@ async def example_embeddings():
         input=["Hello world", "How are you?"],
     )
 
-    await client.embeddings(embedding_request)  # type: ignore[attr-defined]
+    await client.embeddings(embedding_request)
 
-    await client.close()  # type: ignore[attr-defined]
+    await client.close()
 
 
 async def example_batch_processing():

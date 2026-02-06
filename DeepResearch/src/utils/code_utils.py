@@ -391,7 +391,7 @@ def execute_code(
         if original_filename is None:
             Path(filepath).unlink(missing_ok=True)
         if result.returncode:
-            logs = result.stderr
+            logs = cast("str", result.stderr)
             if original_filename is None:
                 abs_path = str(pathlib.Path(filepath).absolute())
                 logs = logs.replace(str(abs_path), "").replace(filename, "")
@@ -399,7 +399,7 @@ def execute_code(
                 abs_path = str(pathlib.Path(work_dir).absolute()) + PATH_SEPARATOR
                 logs = logs.replace(str(abs_path), "")
         else:
-            logs = result.stdout
+            logs = cast("str", result.stdout)
         return result.returncode, logs, None
 
     # create a docker client

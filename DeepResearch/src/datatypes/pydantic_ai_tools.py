@@ -155,7 +155,7 @@ class CodeExecBuiltinRunner:
 
         # Load system prompt from Hydra (if available)
         try:
-            from DeepResearch.src.prompts import PromptLoader  # type: ignore
+            from DeepResearch.src.prompts import PromptLoader
 
             # In this wrapper, cfg may be empty; PromptLoader expects DictConfig-like object
             loader = PromptLoader(cfg)  # type: ignore
@@ -209,15 +209,23 @@ class UrlContextBuiltinRunner:
 
         cfg = _get_cfg()
         builtin_tools = _build_builtin_tools(cfg)
-        # Ensure UrlContextTool present
+        # Ensure WebFetchTool present
         if not any(
-            getattr(t, "__class__", object).__name__ == "UrlContextTool"
+            getattr(t, "__class__", object).__name__
+            in ["UrlContextTool", "WebFetchTool"]
             for t in builtin_tools
         ):
             try:
-                from pydantic_ai import UrlContextTool
+                from pydantic_ai import WebFetchTool
 
-                builtin_tools.append(UrlContextTool())
+                builtin_tools.append(WebFetchTool())
+            except ImportError:
+                try:
+                    from pydantic_ai import UrlContextTool  # type: ignore
+
+                    builtin_tools.append(UrlContextTool())
+                except Exception:
+                    return {"success": False, "error": "pydantic_ai not available"}
             except Exception:
                 return {"success": False, "error": "pydantic_ai not available"}
 

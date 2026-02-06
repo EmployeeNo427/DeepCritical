@@ -17,7 +17,7 @@ from .src.agents.workflow_orchestrator import (
     PrimaryWorkflowOrchestrator,
     WorkflowOrchestrationConfig,
 )
-from .src.datatypes.orchestrator import Orchestrator  # type: ignore
+from .src.datatypes.orchestrator import Orchestrator
 from .src.datatypes.workflow_orchestration import (
     AgentOrchestratorConfig,
     AgentRole,
@@ -188,7 +188,7 @@ class Plan(BaseNode[ResearchState]):
 # --- Primary REACT Workflow Node ---
 @dataclass
 class PrimaryREACTWorkflow(BaseNode[ResearchState]):
-    async def run(
+    async def run(  # type: ignore[override]
         self, ctx: GraphRunContext[ResearchState]
     ) -> Annotated[End[str], Edge(label="done")]:
         """Execute the primary REACT workflow with orchestration."""
@@ -457,7 +457,7 @@ class PrimaryREACTWorkflow(BaseNode[ResearchState]):
 # --- Enhanced REACT Workflow Node ---
 @dataclass
 class EnhancedREACTWorkflow(BaseNode[ResearchState]):
-    async def run(
+    async def run(  # type: ignore[override]
         self, ctx: GraphRunContext[ResearchState]
     ) -> Annotated[End[str], Edge(label="done")]:
         """Execute the enhanced REACT workflow with nested loops and subgraphs."""
@@ -731,7 +731,7 @@ class Analyze(BaseNode[ResearchState]):
 
 @dataclass
 class Synthesize(BaseNode[ResearchState]):
-    async def run(
+    async def run(  # type: ignore[override]
         self, ctx: GraphRunContext[ResearchState]
     ) -> Annotated[End[str], Edge(label="done")]:
         bag = ctx.state.execution_results.get("bag") or {}
@@ -824,7 +824,7 @@ class DSAnalyze(BaseNode[ResearchState]):
 
 @dataclass
 class DSSynthesize(BaseNode[ResearchState]):
-    async def run(
+    async def run(  # type: ignore[override]
         self, ctx: GraphRunContext[ResearchState]
     ) -> Annotated[End[str], Edge(label="done")]:
         bag = ctx.state.execution_results.get("bag") or {}
@@ -915,7 +915,7 @@ class PrimeExecute(BaseNode[ResearchState]):
 
 @dataclass
 class PrimeEvaluate(BaseNode[ResearchState]):
-    async def run(
+    async def run(  # type: ignore[override]
         self, ctx: GraphRunContext[ResearchState]
     ) -> Annotated[End[str], Edge(label="done")]:
         # Evaluate results and generate final answer
@@ -1025,7 +1025,7 @@ class BioinformaticsParse(BaseNode[ResearchState]):
 
 @dataclass
 class BioinformaticsFuse(BaseNode[ResearchState]):
-    async def run(
+    async def run(  # type: ignore[override]
         self, ctx: GraphRunContext[ResearchState]
     ) -> Annotated[End[str], Edge(label="done")]:
         # The bioinformatics workflow is already complete, just return the result
@@ -1062,7 +1062,7 @@ class RAGParse(BaseNode[ResearchState]):
 
 @dataclass
 class RAGExecute(BaseNode[ResearchState]):
-    async def run(
+    async def run(  # type: ignore[override]
         self, ctx: GraphRunContext[ResearchState]
     ) -> Annotated[End[str], Edge(label="done")]:
         # The RAG workflow is already complete, just return the result
@@ -1075,27 +1075,27 @@ def run_graph(question: str, cfg: DictConfig) -> str:
     state = ResearchState(question=question, config=cfg)
     # Include all nodes in runtime graph - instantiate them
     nodes = (
-        Plan(),
-        Search(),
-        Analyze(),
-        Synthesize(),
-        PrepareChallenge(),
-        RunChallenge(),
-        EvaluateChallenge(),
-        DSPlan(),
-        DSExecute(),
-        DSAnalyze(),
-        DSSynthesize(),
-        PrimeParse(),
-        PrimePlan(),
-        PrimeExecute(),
-        PrimeEvaluate(),
-        BioinformaticsParse(),
-        BioinformaticsFuse(),
-        RAGParse(),
-        RAGExecute(),
-        PrimaryREACTWorkflow(),
-        EnhancedREACTWorkflow(),
+        Plan,
+        Search,
+        Analyze,
+        Synthesize,
+        PrepareChallenge,
+        RunChallenge,
+        EvaluateChallenge,
+        DSPlan,
+        DSExecute,
+        DSAnalyze,
+        DSSynthesize,
+        PrimeParse,
+        PrimePlan,
+        PrimeExecute,
+        PrimeEvaluate,
+        BioinformaticsParse,
+        BioinformaticsFuse,
+        RAGParse,
+        RAGExecute,
+        PrimaryREACTWorkflow,
+        EnhancedREACTWorkflow,
     )
     g = Graph(nodes=nodes)
     # Run the graph starting from Plan node

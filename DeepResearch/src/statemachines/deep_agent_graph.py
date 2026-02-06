@@ -413,7 +413,7 @@ class AgentBuilder:
             subagents=self.config.subagents
         )
 
-    def build_agent(self) -> Agent:
+    def build_agent(self) -> Agent[DeepAgentState, Any]:
         """Build an agent with the configured middleware and tools."""
         # Create base agent
         agent = Agent(
@@ -448,7 +448,7 @@ class AgentBuilder:
 
         return base_prompt
 
-    def _add_tools(self, agent: Agent) -> None:
+    def _add_tools(self, agent: Agent[Any, Any]) -> None:
         """Add tools to the agent."""
         tool_map = {
             "write_todos": write_todos_tool,
@@ -470,7 +470,7 @@ class AgentBuilder:
                     if hasattr(tools_attr, "append") and callable(tools_attr.append):
                         tools_attr.append(tool_map[tool_name])  # type: ignore
 
-    def _add_middleware(self, agent: Agent) -> None:
+    def _add_middleware(self, agent: Agent[Any, Any]) -> None:
         """Add middleware to the agent."""
         # In a real implementation, you would integrate middleware
         # with the Pydantic AI agent system

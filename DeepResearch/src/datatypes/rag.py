@@ -806,8 +806,8 @@ class BioinformaticsRAGSystem(RAGSystem):
                 else 0.0
             ),
             "high_quality_docs": sum(1 for r in search_results if r.score > 0.8),
-            "evidence_diversity": len(bioinformatics_summary["evidence_codes"]),  # type: ignore
-            "source_diversity": len(bioinformatics_summary["source_databases"]),  # type: ignore
+            "evidence_diversity": len(bioinformatics_summary["evidence_codes"]),
+            "source_diversity": len(bioinformatics_summary["source_databases"]),
         }
 
         return BioinformaticsRAGResponse(

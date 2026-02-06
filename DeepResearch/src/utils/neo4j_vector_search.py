@@ -388,10 +388,10 @@ class Neo4jVectorSearch:
                     if test_results:
                         validation["search_works"] = True
                 except Exception as e:
-                    validation["errors"].append(f"Search test failed: {e}")  # type: ignore
+                    validation["errors"].append(f"Search test failed: {e}")
 
         except Exception as e:
-            validation["errors"].append(f"Validation failed: {e}")  # type: ignore
+            validation["errors"].append(f"Validation failed: {e}")
 
         # Print validation results
         print("Validation Results:")
@@ -402,7 +402,7 @@ class Neo4jVectorSearch:
 
         if validation["errors"]:
             print("Errors:")
-            for error in validation["errors"]:  # type: ignore
+            for error in validation["errors"]:
                 print(f"  - {error}")
 
         return validation

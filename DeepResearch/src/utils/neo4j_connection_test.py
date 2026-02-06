@@ -178,7 +178,7 @@ def test_database_performance(config: Neo4jConnectionConfig) -> dict[str, Any]:
             # Test basic counts
             start_time = time.time()
             record = session.run(HEALTH_CHECK_DATABASE_SIZE).single()
-            result["query_times"]["basic_count"] = time.time() - start_time  # type: ignore
+            result["query_times"]["basic_count"] = time.time() - start_time
 
             if record:
                 result["database_size"] = dict(record)
@@ -186,7 +186,7 @@ def test_database_performance(config: Neo4jConnectionConfig) -> dict[str, Any]:
             # Test simple node count
             start_time = time.time()
             record = session.run("MATCH (n) RETURN count(n) AS node_count").single()
-            result["query_times"]["node_count"] = time.time() - start_time  # type: ignore
+            result["query_times"]["node_count"] = time.time() - start_time
             result["node_count"] = record["node_count"] if record else 0
 
             # Test relationship count
@@ -194,7 +194,7 @@ def test_database_performance(config: Neo4jConnectionConfig) -> dict[str, Any]:
             record = session.run(
                 "MATCH ()-[r]->() RETURN count(r) AS relationship_count"
             ).single()
-            result["query_times"]["relationship_count"] = time.time() - start_time  # type: ignore
+            result["query_times"]["relationship_count"] = time.time() - start_time
             result["relationship_count"] = record["relationship_count"] if record else 0
 
         driver.close()
@@ -305,7 +305,7 @@ def run_comprehensive_health_check(
 
     if not results["connection_test"]["connection_success"]:
         results["overall_status"] = "critical"
-        results["recommendations"].append("Fix connection issues before proceeding")  # type: ignore
+        results["recommendations"].append("Fix connection issues before proceeding")
         return results
 
     # Performance test
@@ -344,16 +344,16 @@ def run_comprehensive_health_check(
 
     # Generate recommendations
     if results["overall_status"] == "critical":
-        results["recommendations"].append("Critical: Database connection failed")  # type: ignore
+        results["recommendations"].append("Critical: Database connection failed")
     elif results["overall_status"] == "degraded":
         if not results["schema_validation"]["constraints_valid"]:
-            results["recommendations"].append("Create missing database constraints")  # type: ignore
+            results["recommendations"].append("Create missing database constraints")
         if not results["vector_indexes"]:
-            results["recommendations"].append(  # type: ignore
+            results["recommendations"].append(
                 "Create vector indexes for search functionality"
             )
         if results["performance_test"]["query_times"].get("basic_count", 0) > 5.0:
-            results["recommendations"].append("Optimize database performance")  # type: ignore
+            results["recommendations"].append("Optimize database performance")
 
     # Print summary
     print("\n📊 Health Check Summary:")
@@ -368,7 +368,7 @@ def run_comprehensive_health_check(
 
     if results["recommendations"]:
         print("\n💡 Recommendations:")
-        for rec in results["recommendations"]:  # type: ignore
+        for rec in results["recommendations"]:
             print(f"  - {rec}")
 
     return results
@@ -452,7 +452,7 @@ def benchmark_connection_pooling(
                         conn_result["queries"] += 1
                     except Exception as e:
                         conn_result["errors"] += 1
-                        conn_result.setdefault("error_details", []).append(str(e))  # type: ignore
+                        conn_result.setdefault("error_details", []).append(str(e))
 
             conn_result["time"] = time.time() - start_time
             driver.close()
@@ -479,12 +479,12 @@ def benchmark_connection_pooling(
         result["successful_queries"] += conn_result["queries"]
         result["failed_queries"] += conn_result["errors"]
         if "error_details" in conn_result:
-            result["errors"].extend(conn_result["error_details"])  # type: ignore
+            result["errors"].extend(conn_result["error_details"])
 
     # Calculate metrics
     if result["total_time"] > 0:
-        result["avg_query_time"] = result["total_time"] / result["successful_queries"]  # type: ignore
-        result["qps"] = result["successful_queries"] / result["total_time"]  # type: ignore
+        result["avg_query_time"] = result["total_time"] / result["successful_queries"]
+        result["qps"] = result["successful_queries"] / result["total_time"]
 
     print("✓ Benchmarking completed")
     print(f"  Total queries: {result['successful_queries']}/{result['total_queries']}")

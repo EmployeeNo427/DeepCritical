@@ -17,7 +17,7 @@ from tests.utils.mocks.mock_data import create_mock_bam, create_mock_gtf
 
 # Import the MCP module to test MCP functionality
 try:
-    import DeepResearch.src.tools.bioinformatics.featurecounts_server as featurecounts_server_module  # type: ignore
+    import DeepResearch.src.tools.bioinformatics.featurecounts_server as featurecounts_server_module
 
     MCP_AVAILABLE = True
 except ImportError:
@@ -254,7 +254,7 @@ class TestFeatureCountsServer(BaseBioinformaticsToolTest):
 
     @pytest.mark.optional
     @pytest.mark.containerized
-    def test_containerized_execution(
+    def test_containerized_execution(  # type: ignore[override]
         self, tool_instance, sample_input_files, sample_output_dir, test_config
     ):
         """Test tool execution in containerized environment."""

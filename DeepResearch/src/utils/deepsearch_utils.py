@@ -661,7 +661,7 @@ class DeepSearchUtils:
     def create_search_orchestrator(schemas: DeepSearchSchemas) -> SearchOrchestrator:
         """Create a new search orchestrator."""
         if hasattr(schemas, "model_dump") and callable(schemas.model_dump):
-            model_dump_method = schemas.model_dump
+            model_dump_method = cast("Callable[[], dict[str, Any]]", schemas.model_dump)
             config_result = model_dump_method()
             # Ensure config is a dict
             if isinstance(config_result, dict):

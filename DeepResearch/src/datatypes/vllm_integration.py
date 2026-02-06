@@ -176,7 +176,7 @@ class VLLMLLMProvider(LLMProvider):
             msg = f"Failed to generate text: {e}"
             raise RuntimeError(msg)
 
-    async def generate_stream(
+    async def generate_stream(  # type: ignore[override]
         self, prompt: str, context: str | None = None, **kwargs: Any
     ) -> AsyncGenerator[str, None]:
         """Generate streaming text using the LLM."""

@@ -339,7 +339,9 @@ class WorkflowPatternUtils:
 
         # Find the most common result
         if result_counts:
-            most_common_result_str = max(result_counts, key=result_counts.get)
+            most_common_result_str = max(
+                result_counts, key=lambda k: result_counts.get(k, 0)
+            )
             most_common_count = result_counts[most_common_result_str]
             total_results = len(results)
 

@@ -24,6 +24,6 @@ class TestAgentInitialization:
     def test_state_tracking_attached(self, agent_bundle):
         agent = agent_bundle.agent
         assert hasattr(agent, "_test_state")
-        state = agent._test_state  # type: ignore[attr-defined]
+        state = agent._test_state
         assert state["calls"] == []
         assert state["context"] == {"queries": [], "numbers": [], "combined": []}

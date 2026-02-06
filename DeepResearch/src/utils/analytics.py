@@ -34,6 +34,8 @@ class AnalyticsEngine:
     def __init__(self, data_dir: str | None = None):
         """Initialize analytics engine."""
         self.data_dir = data_dir or DATA_DIR
+        if self.data_dir is None:
+            self.data_dir = "."  # Default fallback to current directory if DATA_DIR is somehow None
         self.counts_file = str(Path(self.data_dir) / "request_counts.json")
         self.times_file = str(Path(self.data_dir) / "request_times.json")
         self.lock_file = str(Path(self.data_dir) / "analytics.lock")
