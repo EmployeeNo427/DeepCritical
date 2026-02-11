@@ -208,9 +208,8 @@ class LoadDocuments(BaseNode[RAGState]):  # type: ignore[unsupported-base]
 
     async def _load_from_file(self, source: dict[str, Any]) -> list[Document]:
         """Load documents from file sources."""
-        from pathlib import Path
-
         import logging
+        from pathlib import Path
 
         logger = logging.getLogger(__name__)
 
