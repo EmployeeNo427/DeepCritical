@@ -210,8 +210,16 @@ class LoadDocuments(BaseNode[RAGState]):  # type: ignore[unsupported-base]
         """Load documents from file sources."""
         from pathlib import Path
 
+        import logging
+
+        logger = logging.getLogger(__name__)
+
         path = Path(source.get("path", ""))
-        if not path.exists():
+        if not path.is_file():
+            if not path.exists():
+                logger.warning("File path does not exist: '%s'", path)
+            else:
+                logger.warning("Path is not a file (directory?): '%s'", path)
             return []
 
         try:
@@ -223,9 +231,7 @@ class LoadDocuments(BaseNode[RAGState]):  # type: ignore[unsupported-base]
                 )
             ]
         except Exception as e:
-            import logging
-
-            logging.getLogger(__name__).warning("Failed to load file '%s': %s", path, e)
+            logger.warning("Failed to load file '%s': %s", path, e)
             return []
 
     async def _load_from_database(self, source: dict[str, Any]) -> list[Document]:
