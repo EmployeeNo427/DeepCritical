@@ -64,9 +64,9 @@ except ImportError:
 # Import base classes - may not be available in all environments
 try:
     from DeepResearch.src.datatypes.bioinformatics_mcp import (
-        MCPServerBase,  # type: ignore[import]
+        MCPServerBase,
     )
-    from DeepResearch.src.datatypes.mcp import (  # type: ignore[import]
+    from DeepResearch.src.datatypes.mcp import (
         MCPServerConfig,
         MCPServerDeployment,
         MCPServerStatus,
@@ -555,7 +555,7 @@ class CutadaptServer(MCPServerBase if BASE_CLASS_AVAILABLE else object):  # type
     def run_tool(self, tool_name: str, **kwargs):
         """Run a specific tool."""
         if tool_name == "cutadapt":
-            return cutadapt(**kwargs)  # type: ignore[call-arg]
+            return cutadapt(**kwargs)
         msg = f"Unknown tool: {tool_name}"
         raise ValueError(msg)
 

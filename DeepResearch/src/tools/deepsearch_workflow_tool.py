@@ -21,7 +21,7 @@ class WorkflowOutput(TypedDict):
 
     answer: str
     confidence_score: float
-    quality_metrics: dict[str, float]
+    quality_metrics: dict[str, Any]
     processing_steps: list[str]
     search_summary: dict[str, str]
 

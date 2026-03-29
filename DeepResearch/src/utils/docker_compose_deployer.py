@@ -5,7 +5,7 @@ This module provides deployment functionality for MCP servers using Docker Compo
 for production-like deployments, now integrated with AG2-style code execution.
 """
 
-# type: ignore  # Template file with dynamic variable substitution
+# Template file with dynamic variable substitution
 
 from __future__ import annotations
 

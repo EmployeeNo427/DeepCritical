@@ -304,7 +304,7 @@ class MCPServerBase(ABC):
             self.logger.warning("Failed to load system prompt: %s", e)
             return f"MCP Server: {self.name}"
 
-    def get_tool_spec(self, tool_name: str) -> ToolSpec | None:
+    def get_tool_spec(self, tool_name: str) -> ToolSpec | MCPToolSpec | None:
         """Get the specification for a tool."""
         if tool_name in self.tools:
             tool_info = self.tools[tool_name]
@@ -399,7 +399,7 @@ class MCPServerBase(ABC):
                 ],
                 stdout=str(result_data.get("stdout", "")),
                 stderr=str(result_data.get("stderr", "")),
-                exit_code=int(result_data.get("exit_code", 0 if success else 1)),
+                exit_code=int(result_data.get("exit_code") or (0 if success else 1)),
             )
 
         except Exception as e:

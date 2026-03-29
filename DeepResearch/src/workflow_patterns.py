@@ -8,7 +8,7 @@ agent interaction design patterns with minimal external dependencies.
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, List
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -88,7 +88,7 @@ class AgentExecutorRegistry:
         """Get an agent executor."""
         return self._executors.get(agent_id)
 
-    def list(self) -> list[str]:
+    def list(self) -> List[str]:
         """List all registered agent IDs."""
         return list(self._executors.keys())
 

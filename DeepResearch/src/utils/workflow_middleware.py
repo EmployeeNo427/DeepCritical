@@ -42,8 +42,8 @@ __all__ = [
 ]
 
 
-TAgent = TypeVar("TAgent")
-TChatClient = TypeVar("TChatClient")
+TAgent = TypeVar("TAgent", bound=Any)  # Bounding to Any to allow methods
+TChatClient = TypeVar("TChatClient", bound=Any)
 TContext = TypeVar("TContext")
 
 

@@ -32,7 +32,7 @@ class UserMessageImageContentPart(TypedDict):
 
 def content_str(
     content: str
-    | list[UserMessageTextContentPart | UserMessageImageContentPart]
+    | list[UserMessageTextContentPart | UserMessageImageContentPart | dict[str, Any]]
     | None,
 ) -> str:
     """Converts the `content` field of an OpenAI message into a string format.

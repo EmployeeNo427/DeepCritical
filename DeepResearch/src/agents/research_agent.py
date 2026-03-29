@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 try:
-    from pydantic_ai import Agent  # type: ignore
+    from pydantic_ai import Agent
 except Exception:  # pragma: no cover
     Agent = None  # type: ignore
 

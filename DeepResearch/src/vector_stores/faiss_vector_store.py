@@ -5,7 +5,7 @@ import os
 import pickle
 from typing import Any
 
-import faiss  # type: ignore
+import faiss
 import numpy as np
 
 from ..datatypes.rag import (
@@ -130,7 +130,7 @@ class FAISSVectorStore(VectorStore):
         ids_to_remove = np.array(
             [_stable_hash(doc_id) for doc_id in document_ids], dtype=np.int64
         )
-        self.index.remove_ids(ids_to_remove)  # type: ignore
+        self.index.remove_ids(ids_to_remove)
 
         for doc_id in document_ids:
             if doc_id in self.documents:

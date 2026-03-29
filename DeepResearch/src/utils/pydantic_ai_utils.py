@@ -25,7 +25,17 @@ def build_builtin_tools(cfg: dict[str, Any]) -> list[Any]:
     """Build Pydantic AI builtin tools from configuration."""
     try:
         # Import from Pydantic AI (exported at package root)
-        from pydantic_ai import CodeExecutionTool, UrlContextTool, WebSearchTool
+        from pydantic_ai import CodeExecutionTool, WebFetchTool, WebSearchTool
+    except ImportError:
+        try:
+            # Fallback for older versions
+            from pydantic_ai import (
+                CodeExecutionTool,
+                UrlContextTool,  # type: ignore
+                WebSearchTool,
+            )
+        except Exception:
+            return []
     except Exception:
         return []
 
@@ -63,7 +73,10 @@ def build_builtin_tools(cfg: dict[str, Any]) -> list[Any]:
     uc_cfg = builtin_cfg.get("url_context", {})
     if uc_cfg.get("enabled", False):
         with contextlib.suppress(Exception):
-            tools.append(UrlContextTool())
+            try:
+                tools.append(WebFetchTool())
+            except NameError:
+                tools.append(UrlContextTool())  # type: ignore
 
     return tools
 

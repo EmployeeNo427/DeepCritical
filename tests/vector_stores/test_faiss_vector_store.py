@@ -1,7 +1,7 @@
 import os
 from unittest.mock import MagicMock
 
-import faiss  # type: ignore
+import faiss
 import numpy as np
 import pytest
 

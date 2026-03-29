@@ -69,7 +69,11 @@ class TextNode(BaseNode):
         return cls(
             id_=chunk.id,
             text=chunk.text,
-            embedding=chunk.embedding,
+            embedding=(
+                chunk.embedding.tolist()
+                if hasattr(chunk.embedding, "tolist")
+                else chunk.embedding
+            ),
             metadata={
                 "start_index": chunk.start_index,
                 "end_index": chunk.end_index,

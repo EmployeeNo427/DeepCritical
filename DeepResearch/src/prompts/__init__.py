@@ -54,7 +54,7 @@ class PromptLoader:
         vars_map: dict[str, Any] = {}
         try:
             block = getattr(self.cfg, key, {})
-            vars_map.update(block.get("vars", {}) or {})  # type: ignore[attr-defined]
+            vars_map.update(block.get("vars", {}) or {})
         except Exception:
             pass
 

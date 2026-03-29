@@ -49,11 +49,11 @@ class AgentExecutionState(TypedDict, total=False):
 class AgentTestBundle:
     """Container for a test agent instance and captured execution state."""
 
-    agent: Agent
+    agent: Agent[Any, Any]
     state: AgentExecutionState
 
 
-ToolOverride = Callable[[Agent, AgentExecutionState], None]
+ToolOverride = Callable[[Agent[Any, Any], AgentExecutionState], None]
 
 
 @pytest.fixture

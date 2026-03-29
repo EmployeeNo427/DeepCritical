@@ -364,26 +364,26 @@ def setup_standard_vector_indexes(
         # Create indexes
         if create_publication_index:
             if create_publication_vector_index(driver, neo4j_config.database):
-                results["indexes_created"].append("publication_abstract_vector")  # type: ignore
+                results["indexes_created"].append("publication_abstract_vector")
             else:
-                results["indexes_failed"].append("publication_abstract_vector")  # type: ignore
+                results["indexes_failed"].append("publication_abstract_vector")
 
         if create_document_index:
             if create_document_vector_index(driver, neo4j_config.database):
-                results["indexes_created"].append("document_content_vector")  # type: ignore
+                results["indexes_created"].append("document_content_vector")
             else:
-                results["indexes_failed"].append("document_content_vector")  # type: ignore
+                results["indexes_failed"].append("document_content_vector")
 
         if create_chunk_index:
             if create_chunk_vector_index(driver, neo4j_config.database):
-                results["indexes_created"].append("chunk_text_vector")  # type: ignore
+                results["indexes_created"].append("chunk_text_vector")
             else:
-                results["indexes_failed"].append("chunk_text_vector")  # type: ignore
+                results["indexes_failed"].append("chunk_text_vector")
 
         # Validate created indexes
         print("\nValidating created indexes...")
         validations = {}
-        for index_name in results["indexes_created"]:  # type: ignore
+        for index_name in results["indexes_created"]:
             validations[index_name] = validate_vector_index(
                 driver, neo4j_config.database, index_name
             )
@@ -391,8 +391,8 @@ def setup_standard_vector_indexes(
         results["validations"] = validations
 
         # Summary
-        total_created = len(results["indexes_created"])  # type: ignore
-        total_failed = len(results["indexes_failed"])  # type: ignore
+        total_created = len(results["indexes_created"])
+        total_failed = len(results["indexes_failed"])
 
         print("\n✅ Vector index setup completed!")
         print(f"Indexes created: {total_created}")

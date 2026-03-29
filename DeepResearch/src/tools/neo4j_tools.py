@@ -49,7 +49,7 @@ class Neo4jVectorSearchTool(ToolRunner):
                 num_dimensions=384,
             )
         )
-        qvec = emb.vectorize_query_sync(params["query"])  # type: ignore[arg-type]
+        qvec = emb.vectorize_query_sync(params["query"])
 
         driver = GraphDatabase.driver(
             self._conn.uri,

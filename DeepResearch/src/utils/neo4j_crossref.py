@@ -365,18 +365,18 @@ def integrate_crossref_data(
         # Apply integrations
         if enrich_publications:
             count = enrich_publications_with_crossref(driver, neo4j_config.database)
-            results["integrations"]["publications_enriched"] = count  # type: ignore
+            results["integrations"]["publications_enriched"] = count
 
         if update_metadata:
             count = update_crossref_metadata(driver, neo4j_config.database)
-            results["integrations"]["metadata_updated"] = count  # type: ignore
+            results["integrations"]["metadata_updated"] = count
 
         # Final validation
         print("\nValidating final CrossRef data...")
         final_stats = validate_crossref_data(driver, neo4j_config.database)
         results["final_stats"] = final_stats
 
-        total_integrations = sum(results["integrations"].values())  # type: ignore
+        total_integrations = sum(results["integrations"].values())
         print("\n✅ CrossRef data integration completed successfully!")
         print(f"Total integrations applied: {total_integrations}")
 

@@ -65,11 +65,11 @@ class TestToolsModuleImports:
 
             metadata = ToolMetadata(
                 name="test_tool",
-                category=cast("Any", "search"),  # type: ignore
+                category=cast("Any", "search"),
                 description="Test tool",
             )
             assert metadata.name == "test_tool"
-            assert metadata.category == "search"  # type: ignore
+            assert metadata.category == "search"
             assert metadata.description == "Test tool"
 
             result = ExecutionResult(success=True, data={"test": "data"})
