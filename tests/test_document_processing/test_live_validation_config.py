@@ -56,6 +56,7 @@ def test_grobid_actions_override_uses_only_the_locally_built_image() -> None:
     )
     assert grobid["pull_policy"] == "never"
 
+
 def test_grobid_proxy_grants_only_caddys_embedded_file_capability() -> None:
     compose = yaml.safe_load(
         (
