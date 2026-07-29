@@ -493,6 +493,33 @@ def _docling_readiness_is_explicit(readiness: Mapping[str, Any]) -> bool:
     return readiness.get("status") == "ok"
 
 
+def _normalize_grobid_version(body: bytes) -> str:
+    """Normalize GROBID's current JSON response and legacy plain-text response."""
+
+    raw_version = body.decode("utf-8", errors="replace").strip()
+    if not raw_version:
+        raise ParserServiceError(
+            "GROBID version endpoint returned an empty value",
+            code="grobid_version_empty",
+        )
+    if not raw_version.startswith(("{", "[")):
+        return raw_version
+    try:
+        payload = json.loads(raw_version)
+    except json.JSONDecodeError as exc:
+        raise ParserServiceError(
+            "GROBID version endpoint returned malformed JSON",
+            code="grobid_version_invalid",
+        ) from exc
+    version = payload.get("version") if isinstance(payload, Mapping) else None
+    if not isinstance(version, str) or not version.strip():
+        raise ParserServiceError(
+            "GROBID version endpoint returned no valid version",
+            code="grobid_version_invalid",
+        )
+    return version.strip()
+
+
 class DoclingServeClient:
     """Thin asynchronous client for Docling Serve's durable conversion API."""
 
@@ -1040,13 +1067,7 @@ class GrobidClient:
                     max_bytes=self.max_response_bytes,
                     too_large_code="grobid_response_too_large",
                 )
-                version = body.decode("utf-8", errors="replace").strip()
-        if not version:
-            raise ParserServiceError(
-                "GROBID version endpoint returned an empty value",
-                code="grobid_version_empty",
-            )
-        return version
+        return _normalize_grobid_version(body)
 
     async def process_fulltext(
         self, content: bytes, *, filename: str = "document.pdf"
