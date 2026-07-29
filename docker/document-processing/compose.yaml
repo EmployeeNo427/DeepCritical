@@ -186,8 +186,9 @@ services:
       dockerfile: Dockerfile.grobid
       args:
         GROBID_BASE_DIGEST: "${GROBID_BASE_DIGEST:?Set an approved GROBID_BASE_DIGEST}"
-        # BuildKit normalizes image and layer timestamps to make the derived
-        # local image ID reproducible from the same Dockerfile and base digest.
+        # Ask BuildKit to normalize timestamps where supported. Cross-run
+        # identity is enforced by the base digest and Dockerfile Git blob because
+        # local image IDs may also encode builder metadata.
         SOURCE_DATE_EPOCH: "${SOURCE_DATE_EPOCH:-0}"
     image: "${GROBID_IMAGE_REPOSITORY:-deepcritical/grobid}:0.9.0-full-p0-c2"
     pull_policy: build
