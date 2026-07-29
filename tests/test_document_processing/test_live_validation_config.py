@@ -84,10 +84,7 @@ def test_grobid_build_uses_a_reproducible_epoch() -> None:
 def test_live_policy_versions_match_the_pinned_stack() -> None:
     config = yaml.safe_load(
         (
-            _repository_root()
-            / "configs"
-            / "document_processing"
-            / "default.yaml"
+            _repository_root() / "configs" / "document_processing" / "default.yaml"
         ).read_text(encoding="utf-8")
     )
     services = config["services"]
