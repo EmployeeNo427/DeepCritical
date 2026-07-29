@@ -114,3 +114,28 @@ def test_docling_api_healthcheck_requires_documented_explicit_readiness() -> Non
     assert 'payload["ready"] is True' in healthcheck
     assert '"ready" in payload' in healthcheck
     assert 'payload.get("status") == "ok"' in healthcheck
+
+
+def test_only_localhost_entrypoints_join_the_edge_network() -> None:
+    root = Path(__file__).resolve().parents[2]
+    compose = yaml.safe_load(
+        (root / "docker" / "document-processing" / "compose.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    services = compose["services"]
+    edge_members = {
+        name
+        for name, service in services.items()
+        if "parser-edge" in service.get("networks", [])
+    }
+
+    assert edge_members == {"docling-api", "grobid-proxy"}
+    assert compose["networks"]["parser-internal"]["internal"] is True
+    assert compose["networks"]["parser-edge"] == {"driver": "bridge"}
+    assert services["docling-api"]["ports"] == [
+        "127.0.0.1:${DOCLING_PORT:-5001}:5001"
+    ]
+    assert services["grobid-proxy"]["ports"] == [
+        "127.0.0.1:${GROBID_PORT:-8070}:8070"
+    ]
