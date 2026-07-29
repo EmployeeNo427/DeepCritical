@@ -13,19 +13,6 @@ on:
           - docling
           - grobid
           - ocr
-  # Bootstrap only: this trigger is removed after the first digest-pinned run.
-  pull_request:
-    branches:
-      - document-processing
-    paths:
-      - .github/workflows/document-processing-live.yml
-      - configs/document_processing/default.yaml
-      - docker/document-processing/**
-      - tests/test_document_processing/test_clients.py
-      - tests/test_document_processing/test_live_stack_contract.py
-      - tests/test_document_processing/test_live_validation_config.py
-      - DeepResearch/src/document_processing/**
-
 permissions:
   contents: read
 
