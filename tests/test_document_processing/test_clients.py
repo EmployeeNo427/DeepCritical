@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -151,13 +152,15 @@ class _MismatchedMemoryReporter:
     [
         ({"ready": True}, True),
         ({"ready": False}, False),
+        ({"ready": False, "status": "ok"}, False),
         ({}, False),
-        ({"status": "ok"}, False),
+        ({"status": "ok"}, True),
+        ({"status": "starting"}, False),
         ({"ready": 1}, False),
     ],
 )
 @pytest.mark.asyncio
-async def test_docling_health_requires_explicit_boolean_readiness(
+async def test_docling_health_requires_documented_explicit_readiness(
     readiness: dict[str, object],
     expected: bool,
 ) -> None:
@@ -887,6 +890,8 @@ async def test_container_ocr_conversion_uses_hardened_runtime_flags(
     assert command[command.index("--pids-limit") + 1] == "256"
     assert command[command.index("--tmpfs") + 1] == "/tmp:size=2g,mode=1777"
     assert command[command.index("--network") + 1] == "none"
+    if os.name == "posix":
+        assert command[command.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
 
 
 @pytest.mark.asyncio
