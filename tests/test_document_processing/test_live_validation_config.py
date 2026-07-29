@@ -55,3 +55,16 @@ def test_grobid_actions_override_uses_only_the_locally_built_image() -> None:
         "${GROBID_IMAGE_REPOSITORY:-deepcritical/grobid}:0.9.0-full-p0-c2"
     )
     assert grobid["pull_policy"] == "never"
+
+def test_grobid_proxy_grants_only_caddys_embedded_file_capability() -> None:
+    compose = yaml.safe_load(
+        (
+            _repository_root() / "docker" / "document-processing" / "compose.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    proxy = compose["services"]["grobid-proxy"]
+
+    assert proxy["cap_drop"] == ["ALL"]
+    assert proxy["cap_add"] == ["NET_BIND_SERVICE"]
+    assert proxy["security_opt"] == ["no-new-privileges:true"]
+
