@@ -13,6 +13,19 @@ on:
           - docling
           - grobid
           - ocr
+  # Bootstrap only: this trigger is removed after the first digest-pinned run.
+  pull_request:
+    branches:
+      - document-processing
+    paths:
+      - .github/workflows/document-processing-live.yml
+      - configs/document_processing/default.yaml
+      - docker/document-processing/**
+      - tests/test_document_processing/test_clients.py
+      - tests/test_document_processing/test_live_stack_contract.py
+      - tests/test_document_processing/test_live_validation_config.py
+      - DeepResearch/src/document_processing/**
+
 permissions:
   contents: read
 
@@ -62,9 +75,10 @@ jobs:
             ruff==0.14.6 \
             ty==0.0.34
 
-      - name: Run configuration tests
+      - name: Run focused unit and configuration tests
         run: |
           python -m pytest \
+            tests/test_document_processing/test_clients.py \
             tests/test_document_processing/test_deployment_config.py \
             tests/test_document_processing/test_live_validation_config.py \
             -q -p no:cacheprovider
@@ -73,14 +87,18 @@ jobs:
         run: |
           ruff check \
             DeepResearch/src/document_processing \
+            tests/test_document_processing/test_clients.py \
             tests/test_document_processing/test_deployment_config.py \
+            tests/test_document_processing/test_live_stack_contract.py \
             tests/test_document_processing/test_live_validation_config.py
 
       - name: Check Ruff formatting
         run: |
           ruff format --check \
             DeepResearch/src/document_processing \
+            tests/test_document_processing/test_clients.py \
             tests/test_document_processing/test_deployment_config.py \
+            tests/test_document_processing/test_live_stack_contract.py \
             tests/test_document_processing/test_live_validation_config.py
 
       - name: Run document-processing type checks
