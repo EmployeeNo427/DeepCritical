@@ -121,6 +121,9 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    networks:
+      - parser-internal
+      - parser-edge
     ports:
       - "127.0.0.1:${DOCLING_PORT:-5001}:5001"
     healthcheck:
@@ -235,6 +238,7 @@ services:
       GROBID_API_KEY: "${GROBID_API_KEY:?Set a non-default GROBID_API_KEY}"
     networks:
       - parser-internal
+      - parser-edge
     ports:
       - "127.0.0.1:${GROBID_PORT:-8070}:8070"
     volumes:
@@ -284,6 +288,8 @@ services:
 networks:
   parser-internal:
     internal: true
+  parser-edge:
+    driver: bridge
 
 volumes:
   redis-data:
