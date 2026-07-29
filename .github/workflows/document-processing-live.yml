@@ -13,15 +13,6 @@ on:
           - docling
           - grobid
           - ocr
-  # Bootstrap only: this trigger is removed after the first digest-pinned run.
-  pull_request:
-    branches:
-      - document-processing
-    paths:
-      - .github/workflows/document-processing-live.yml
-      - docker/document-processing/**
-      - tests/test_document_processing/test_live_stack_contract.py
-      - DeepResearch/src/document_processing/**
 
 permissions:
   contents: read
@@ -32,6 +23,7 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.11"
+  TESTED_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
   DOCLING_IMAGE_TAG: quay.io/docling-project/docling-serve-cpu:v1.21.0
   REDIS_IMAGE_TAG: redis:7.2.14-alpine3.21
   GROBID_BASE_IMAGE_TAG: grobid/grobid:0.9.0-full
@@ -49,8 +41,55 @@ env:
   ZERO_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
 
 jobs:
+  quality:
+    name: Configuration, tests, lint, and types
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the tested revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install validation dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-cache-dir \
+            --requirement docker/document-processing/requirements-live.txt \
+            pyyaml==6.0.3 \
+            ruff==0.14.6 \
+            ty==0.0.34
+
+      - name: Run configuration tests
+        run: |
+          python -m pytest \
+            tests/test_document_processing/test_deployment_config.py \
+            tests/test_document_processing/test_live_validation_config.py \
+            -q -p no:cacheprovider
+
+      - name: Run Ruff lint
+        run: |
+          ruff check \
+            DeepResearch/src/document_processing \
+            tests/test_document_processing/test_deployment_config.py \
+            tests/test_document_processing/test_live_validation_config.py
+
+      - name: Check Ruff formatting
+        run: |
+          ruff format --check \
+            DeepResearch/src/document_processing \
+            tests/test_document_processing/test_deployment_config.py \
+            tests/test_document_processing/test_live_validation_config.py
+
+      - name: Run document-processing type checks
+        run: ty check DeepResearch/src/document_processing
+
   docling:
     name: Docling contract (standard runner)
+    needs: quality
     if: >-
       github.event_name == 'pull_request' ||
       inputs.component == 'all' ||
@@ -60,10 +99,10 @@ jobs:
 
     steps:
       - name: Check out the tested revision
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -78,15 +117,10 @@ jobs:
           docker system prune --all --force --volumes
           df -h
 
-      - name: Install the locked live-test surface
+      - name: Install the exact live-test dependency set
         run: |
           python -m pip install --disable-pip-version-check --no-cache-dir \
-            aiohttp==3.12.15 \
-            defusedxml==0.7.1 \
-            pydantic==2.11.9 \
-            pypdf==6.14.2 \
-            pytest==8.4.2 \
-            pytest-asyncio==1.2.0
+            --requirement docker/document-processing/requirements-live.txt
           mkdir -p live-evidence
           python -m pip freeze > live-evidence/python-packages.txt
 
@@ -131,7 +165,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
           {
-            echo "revision=$GITHUB_SHA"
+            echo "revision=$TESTED_REVISION"
             echo "docling=$docling_ref"
             echo "redis=$redis_ref"
           } > live-evidence/images.txt
@@ -144,11 +178,13 @@ jobs:
             redis docling-api docling-worker
 
       - name: Run the Docling live contract
+        shell: bash
         env:
           DEEPCRITICAL_RUN_LIVE_DOCUMENT_PROCESSING: "1"
           DEEPCRITICAL_LIVE_REQUEST_TIMEOUT_SECONDS: "900"
           DEEPCRITICAL_LIVE_TASK_TIMEOUT_SECONDS: "1800"
         run: |
+          set -o pipefail
           python -m pytest \
             tests/test_document_processing/test_live_stack_contract.py::test_live_docling_async_conversion_contract \
             -vv --tb=short -p no:cacheprovider \
@@ -171,7 +207,7 @@ jobs:
 
       - name: Upload Docling evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: document-processing-docling-${{ github.run_id }}
           path: live-evidence
@@ -180,6 +216,7 @@ jobs:
 
   grobid:
     name: GROBID contract (standard runner)
+    needs: quality
     if: >-
       github.event_name == 'pull_request' ||
       inputs.component == 'all' ||
@@ -189,10 +226,10 @@ jobs:
 
     steps:
       - name: Check out the tested revision
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -207,19 +244,14 @@ jobs:
           docker system prune --all --force --volumes
           df -h
 
-      - name: Install the locked live-test surface
+      - name: Install the exact live-test dependency set
         run: |
           python -m pip install --disable-pip-version-check --no-cache-dir \
-            aiohttp==3.12.15 \
-            defusedxml==0.7.1 \
-            pydantic==2.11.9 \
-            pypdf==6.14.2 \
-            pytest==8.4.2 \
-            pytest-asyncio==1.2.0
+            --requirement docker/document-processing/requirements-live.txt
           mkdir -p live-evidence
           python -m pip freeze > live-evidence/python-packages.txt
 
-      - name: Pull base images and build GROBID
+      - name: Pull and record immutable GROBID base images
         shell: bash
         run: |
           resolve_image() {
@@ -261,11 +293,19 @@ jobs:
             echo "REDIS_PASSWORD=dc-redis-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           } >> "$GITHUB_ENV"
 
+          {
+            echo "revision=$TESTED_REVISION"
+            echo "grobid_base=$grobid_base_ref"
+            echo "caddy=$caddy_ref"
+          } > live-evidence/images.txt
+
+      - name: Build and record the project-owned GROBID image
+        shell: bash
+        run: |
           docker compose \
             --file docker/document-processing/compose.yaml \
             --profile build \
             build grobid-build
-
           grobid_image_id="$(
             docker image inspect "$GROBID_CI_IMAGE_TAG" --format '{{.Id}}'
           )"
@@ -278,13 +318,8 @@ jobs:
             exit 1
           fi
           echo "GROBID_IMAGE_DIGEST=$grobid_image_id" >> "$GITHUB_ENV"
-
-          {
-            echo "revision=$GITHUB_SHA"
-            echo "grobid_base=$grobid_base_ref"
-            echo "grobid_built_image=$GROBID_CI_IMAGE_TAG@$grobid_image_id"
-            echo "caddy=$caddy_ref"
-          } > live-evidence/images.txt
+          echo "grobid_built_image=$GROBID_CI_IMAGE_TAG@$grobid_image_id" \
+            >> live-evidence/images.txt
 
       - name: Start GROBID and its authenticated proxy
         working-directory: docker/document-processing
@@ -299,10 +334,12 @@ jobs:
             up --detach --wait --wait-timeout 900 grobid grobid-proxy
 
       - name: Run the GROBID live contract
+        shell: bash
         env:
           DEEPCRITICAL_RUN_LIVE_DOCUMENT_PROCESSING: "1"
           DEEPCRITICAL_LIVE_REQUEST_TIMEOUT_SECONDS: "900"
         run: |
+          set -o pipefail
           python -m pytest \
             tests/test_document_processing/test_live_stack_contract.py::test_live_grobid_tei_contract \
             -vv --tb=short -p no:cacheprovider \
@@ -335,7 +372,7 @@ jobs:
 
       - name: Upload GROBID evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: document-processing-grobid-${{ github.run_id }}
           path: live-evidence
@@ -344,6 +381,7 @@ jobs:
 
   ocr:
     name: OCRmyPDF contract (standard runner)
+    needs: quality
     if: >-
       github.event_name == 'pull_request' ||
       inputs.component == 'all' ||
@@ -353,22 +391,17 @@ jobs:
 
     steps:
       - name: Check out the tested revision
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install the locked live-test surface
+      - name: Install the exact live-test dependency set
         run: |
           python -m pip install --disable-pip-version-check --no-cache-dir \
-            aiohttp==3.12.15 \
-            defusedxml==0.7.1 \
-            pydantic==2.11.9 \
-            pypdf==6.14.2 \
-            pytest==8.4.2 \
-            pytest-asyncio==1.2.0
+            --requirement docker/document-processing/requirements-live.txt
           mkdir -p live-evidence
           python -m pip freeze > live-evidence/python-packages.txt
 
@@ -391,11 +424,12 @@ jobs:
           fi
           echo "OCR_IMAGE_REF=$ocr_ref" >> "$GITHUB_ENV"
           {
-            echo "revision=$GITHUB_SHA"
+            echo "revision=$TESTED_REVISION"
             echo "ocrmypdf=$ocr_ref"
           } > live-evidence/images.txt
 
       - name: Run the OCRmyPDF live contract
+        shell: bash
         env:
           DEEPCRITICAL_RUN_LIVE_DOCUMENT_PROCESSING: "1"
           DEEPCRITICAL_RUN_LIVE_DOCUMENT_PROCESSING_OCR: "1"
@@ -403,10 +437,61 @@ jobs:
           DEEPCRITICAL_LIVE_GROBID_API_KEY: dc-grobid-${{ github.run_id }}-${{ github.run_attempt }}
           DEEPCRITICAL_LIVE_OCR_TIMEOUT_SECONDS: "900"
         run: |
+          set -o pipefail
           DEEPCRITICAL_LIVE_OCR_IMAGE="$OCR_IMAGE_REF" python -m pytest \
             tests/test_document_processing/test_live_stack_contract.py::test_live_digest_addressed_ocr_derivative_contract \
             -vv --tb=short -p no:cacheprovider \
             2>&1 | tee live-evidence/pytest.txt
+
+      - name: Capture direct OCRmyPDF diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          mkdir -p live-evidence/ocr-debug/input live-evidence/ocr-debug/output
+          python - <<'PY'
+          from pathlib import Path
+          import runpy
+
+          module = runpy.run_path(
+              "tests/test_document_processing/test_live_stack_contract.py"
+          )
+          fixture = module["synthetic_image_only_pdf"]
+          pdf = fixture.__wrapped__()
+          Path("live-evidence/ocr-debug/input/original.pdf").write_bytes(pdf)
+          PY
+
+          set +e
+          set -o pipefail
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 256 \
+            --tmpfs /tmp:size=2g,mode=1777 \
+            --pull never \
+            --memory 4g \
+            --cpus 2 \
+            --mount \
+              type=bind,source="$PWD/live-evidence/ocr-debug/input",target=/input,readonly \
+            --mount \
+              type=bind,source="$PWD/live-evidence/ocr-debug/output",target=/output \
+            "$OCR_IMAGE_REF" \
+            --output-type pdf \
+            --optimize 1 \
+            --skip-text \
+            --sidecar /output/searchable.txt \
+            --jobs 1 \
+            --language eng \
+            /input/original.pdf \
+            /output/searchable.pdf \
+            2>&1 | tee live-evidence/ocr-direct.txt
+          status="${PIPESTATUS[0]}"
+          set -e
+          echo "direct_exit_code=$status" \
+            > live-evidence/ocr-direct-status.txt
+          find live-evidence/ocr-debug -maxdepth 2 -printf '%M %u:%g %p\n' \
+            > live-evidence/ocr-debug-files.txt
 
       - name: Collect OCR evidence
         if: always()
@@ -418,7 +503,7 @@ jobs:
 
       - name: Upload OCR evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: document-processing-ocr-${{ github.run_id }}
           path: live-evidence
