@@ -68,3 +68,38 @@ def test_grobid_proxy_grants_only_caddys_embedded_file_capability() -> None:
     assert proxy["cap_drop"] == ["ALL"]
     assert proxy["cap_add"] == ["NET_BIND_SERVICE"]
     assert proxy["security_opt"] == ["no-new-privileges:true"]
+
+
+def test_grobid_build_uses_a_reproducible_epoch() -> None:
+    compose = yaml.safe_load(
+        (
+            _repository_root() / "docker" / "document-processing" / "compose.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    build_args = compose["services"]["grobid-build"]["build"]["args"]
+
+    assert build_args["SOURCE_DATE_EPOCH"] == "${SOURCE_DATE_EPOCH:-0}"
+
+
+def test_live_policy_versions_match_the_pinned_stack() -> None:
+    config = yaml.safe_load(
+        (
+            _repository_root()
+            / "configs"
+            / "document_processing"
+            / "default.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    services = config["services"]
+
+    assert services["docling"]["container_image"] == (
+        "quay.io/docling-project/docling-serve-cpu:v1.21.0"
+    )
+    assert services["docling"]["component_version"] == "2.96.1"
+    assert services["docling"]["serve_version"] == "1.21.0"
+    assert services["grobid"]["container_image"] == (
+        "deepcritical/grobid:0.9.0-full-p0-c2"
+    )
+    assert services["grobid"]["component_version"] == "0.9.0"
+    assert services["ocr"]["container_image"] == "jbarlow83/ocrmypdf:v17.4.1"
+    assert services["ocr"]["component_version"] == "17.4.1"
