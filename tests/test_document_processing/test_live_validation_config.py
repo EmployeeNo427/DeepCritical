@@ -70,7 +70,7 @@ def test_grobid_proxy_grants_only_caddys_embedded_file_capability() -> None:
     assert proxy["security_opt"] == ["no-new-privileges:true"]
 
 
-def test_grobid_build_uses_a_reproducible_epoch() -> None:
+def test_grobid_build_requests_a_normalized_epoch() -> None:
     compose = yaml.safe_load(
         (
             _repository_root() / "docker" / "document-processing" / "compose.yaml"
