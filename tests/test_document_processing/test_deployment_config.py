@@ -133,9 +133,5 @@ def test_only_localhost_entrypoints_join_the_edge_network() -> None:
     assert edge_members == {"docling-api", "grobid-proxy"}
     assert compose["networks"]["parser-internal"]["internal"] is True
     assert compose["networks"]["parser-edge"] == {"driver": "bridge"}
-    assert services["docling-api"]["ports"] == [
-        "127.0.0.1:${DOCLING_PORT:-5001}:5001"
-    ]
-    assert services["grobid-proxy"]["ports"] == [
-        "127.0.0.1:${GROBID_PORT:-8070}:8070"
-    ]
+    assert services["docling-api"]["ports"] == ["127.0.0.1:${DOCLING_PORT:-5001}:5001"]
+    assert services["grobid-proxy"]["ports"] == ["127.0.0.1:${GROBID_PORT:-8070}:8070"]
