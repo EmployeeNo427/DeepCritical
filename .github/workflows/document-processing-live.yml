@@ -13,6 +13,19 @@ on:
           - docling
           - grobid
           - ocr
+  # Bootstrap only: this trigger is removed after the digest-pinned run passes.
+  pull_request:
+    branches:
+      - document-processing
+    paths:
+      - .github/workflows/document-processing-live.yml
+      - configs/document_processing/default.yaml
+      - docker/document-processing/**
+      - tests/test_document_processing/test_clients.py
+      - tests/test_document_processing/test_live_stack_contract.py
+      - tests/test_document_processing/test_live_validation_config.py
+      - DeepResearch/src/document_processing/**
+
 permissions:
   contents: read
 
@@ -29,12 +42,13 @@ env:
   GROBID_CI_IMAGE_TAG: deepcritical/grobid:0.9.0-full-p0-c2
   CADDY_IMAGE_TAG: caddy:2.11.4-alpine
   OCRMYPDF_IMAGE_TAG: jbarlow83/ocrmypdf:v17.4.1
-  # Immutable identities observed on standard runners; each job fails closed
-  # if a registry tag or reproducible project-owned build resolves differently.
+  # Registry images are immutable by digest. The local GROBID customization
+  # is bound to both its base digest and exact Dockerfile Git blob; its
+  # builder-specific image ID is recorded as evidence on every run.
   DOCLING_IMAGE_DIGEST: "sha256:c7d56cf78c45ab61406bc2dfebbac562c16e38538393f838991a949577cd3d0a"
   REDIS_IMAGE_DIGEST: "sha256:dfa18828cbc07b3ae6a95ec7343f6c214fdee2d836197b4be8e9904420762cd8"
   GROBID_BASE_DIGEST: "sha256:52774a8375b30a9bd541936964b48600c65afdb2e9120ae4764322478ab0ca0d"
-  GROBID_CI_IMAGE_ID: "sha256:8d1382bed4bd6e00b5bd5f8dc638a22d675deb827b07d9c178ad8323b8f921dd"
+  GROBID_DOCKERFILE_BLOB_SHA: "7a5a7e97e8c25666e6ff4b3378a8813b56fc0abc"
   CADDY_IMAGE_DIGEST: "sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
   OCRMYPDF_IMAGE_DIGEST: "sha256:172736b5dd378a3e1780145b47015f62504be7b4e0d8cc6f6b5eb0eae8ebd85b"
   ZERO_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
@@ -306,6 +320,13 @@ jobs:
       - name: Build and record the project-owned GROBID image
         shell: bash
         run: |
+          grobid_dockerfile_blob="$(
+            git hash-object docker/document-processing/Dockerfile.grobid
+          )"
+          if [[ "$grobid_dockerfile_blob" != "$GROBID_DOCKERFILE_BLOB_SHA" ]]; then
+            echo "GROBID Dockerfile does not match the committed Git blob" >&2
+            exit 1
+          fi
           docker compose \
             --file docker/document-processing/compose.yaml \
             --profile build \
@@ -317,13 +338,11 @@ jobs:
             echo "Built GROBID image has no immutable image ID" >&2
             exit 1
           fi
-          if [[ -n "$GROBID_CI_IMAGE_ID" && "$grobid_image_id" != "$GROBID_CI_IMAGE_ID" ]]; then
-            echo "Built GROBID image ID does not match the committed identity" >&2
-            exit 1
-          fi
           echo "GROBID_IMAGE_DIGEST=$grobid_image_id" >> "$GITHUB_ENV"
-          echo "grobid_built_image=$GROBID_CI_IMAGE_TAG@$grobid_image_id" \
-            >> live-evidence/images.txt
+          {
+            echo "grobid_dockerfile_blob=$grobid_dockerfile_blob"
+            echo "grobid_built_image=$GROBID_CI_IMAGE_TAG@$grobid_image_id"
+          } >> live-evidence/images.txt
 
       - name: Start GROBID and its authenticated proxy
         working-directory: docker/document-processing
