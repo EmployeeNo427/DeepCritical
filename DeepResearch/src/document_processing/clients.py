@@ -485,6 +485,14 @@ def _stringify_form_value(value: Any) -> str:
     return str(value)
 
 
+def _docling_readiness_is_explicit(readiness: Mapping[str, Any]) -> bool:
+    """Interpret only a documented, explicit Docling readiness value."""
+
+    if "ready" in readiness:
+        return readiness["ready"] is True
+    return readiness.get("status") == "ok"
+
+
 class DoclingServeClient:
     """Thin asynchronous client for Docling Serve's durable conversion API."""
 
@@ -574,7 +582,7 @@ class DoclingServeClient:
                         response, code="docling_version_failed"
                     )
         return ServiceHealth(
-            ready=readiness.get("ready") is True,
+            ready=_docling_readiness_is_explicit(readiness),
             readiness=readiness,
             versions=versions,
         )
@@ -1469,6 +1477,8 @@ class ContainerOCRmyPDFRunner(OCRmyPDFRunner):
             "--tmpfs",
             self.tmpfs,
         ]
+        if os.name == "posix":
+            arguments.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
         if self.container_digest is not None:
             arguments.extend(["--pull", "never"])
         return arguments
