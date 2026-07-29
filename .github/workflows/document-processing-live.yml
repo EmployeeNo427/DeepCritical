@@ -13,19 +13,6 @@ on:
           - docling
           - grobid
           - ocr
-  # Bootstrap only: this trigger is removed after the digest-pinned run passes.
-  pull_request:
-    branches:
-      - document-processing
-    paths:
-      - .github/workflows/document-processing-live.yml
-      - configs/document_processing/default.yaml
-      - docker/document-processing/**
-      - tests/test_document_processing/test_clients.py
-      - tests/test_document_processing/test_live_stack_contract.py
-      - tests/test_document_processing/test_live_validation_config.py
-      - DeepResearch/src/document_processing/**
-
 permissions:
   contents: read
 
@@ -35,7 +22,7 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.11"
-  TESTED_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+  TESTED_REVISION: ${{ github.sha }}
   DOCLING_IMAGE_TAG: quay.io/docling-project/docling-serve-cpu:v1.21.0
   REDIS_IMAGE_TAG: redis:7.2.14-alpine3.21
   GROBID_BASE_IMAGE_TAG: grobid/grobid:0.9.0-full
@@ -109,7 +96,6 @@ jobs:
     name: Docling contract (standard runner)
     needs: quality
     if: >-
-      github.event_name == 'pull_request' ||
       inputs.component == 'all' ||
       inputs.component == 'docling'
     runs-on: ubuntu-24.04
@@ -236,7 +222,6 @@ jobs:
     name: GROBID contract (standard runner)
     needs: quality
     if: >-
-      github.event_name == 'pull_request' ||
       inputs.component == 'all' ||
       inputs.component == 'grobid'
     runs-on: ubuntu-24.04
@@ -406,7 +391,6 @@ jobs:
     name: OCRmyPDF contract (standard runner)
     needs: quality
     if: >-
-      github.event_name == 'pull_request' ||
       inputs.component == 'all' ||
       inputs.component == 'ocr'
     runs-on: ubuntu-24.04
