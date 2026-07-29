@@ -168,7 +168,7 @@ async def test_docling_health_requires_documented_explicit_readiness(
         return web.json_response(readiness)
 
     async def version(_: web.Request) -> web.Response:
-        return web.json_response({"docling": "2.113.0", "serve": "1.21.0"})
+        return web.json_response({"docling": "2.96.1", "docling-serve": "1.21.0"})
 
     app = web.Application()
     app.router.add_get("/ready", ready)
@@ -186,7 +186,7 @@ async def test_docling_health_requires_documented_explicit_readiness(
     assert isinstance(health, ServiceHealth)
     assert health.ready is expected
     assert health.readiness == readiness
-    assert health.versions == {"docling": "2.113.0", "serve": "1.21.0"}
+    assert health.versions == {"docling": "2.96.1", "docling-serve": "1.21.0"}
 
 
 @pytest.mark.parametrize(
@@ -450,7 +450,7 @@ async def test_docling_client_version_and_async_conversion_contract() -> None:
 
     async def version(request: web.Request) -> web.Response:
         assert request.headers["X-API-Key"] == "docling-test-key-123"
-        return web.json_response({"docling": "2.113.0", "serve": "1.21.0"})
+        return web.json_response({"docling": "2.96.1", "docling-serve": "1.21.0"})
 
     async def submit(request: web.Request) -> web.Response:
         assert request.headers["X-API-Key"] == "docling-test-key-123"
@@ -494,7 +494,7 @@ async def test_docling_client_version_and_async_conversion_contract() -> None:
         await server.close()
 
     assert submitted.is_set()
-    assert versions == {"docling": "2.113.0", "serve": "1.21.0"}
+    assert versions == {"docling": "2.96.1", "docling-serve": "1.21.0"}
     assert conversion.document["schema_name"] == "DoclingDocument"
     assert conversion.remote_task_id == "task-123"
 
