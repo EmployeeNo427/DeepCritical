@@ -724,6 +724,62 @@ async def test_grobid_client_observes_version_and_preserves_tei() -> None:
 
 
 @pytest.mark.asyncio
+async def test_grobid_client_normalizes_structured_version_payload() -> None:
+    async def version(request: web.Request) -> web.Response:
+        assert request.headers["X-API-Key"] == "grobid-test-key-1234"
+        return web.json_response({"version": "0.9.0", "revision": "0.9.0"})
+
+    app = web.Application()
+    app.router.add_get("/api/version", version)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        client = GrobidClient(
+            str(server.make_url("/")).rstrip("/"),
+            api_key="grobid-test-key-1234",
+        )
+        observed = await client.version()
+    finally:
+        await server.close()
+
+    assert observed == "0.9.0"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "expected_code"),
+    [
+        (b"", "grobid_version_empty"),
+        (b'{"version":', "grobid_version_invalid"),
+        (b'{"revision":"0.9.0"}', "grobid_version_invalid"),
+        (b'["0.9.0"]', "grobid_version_invalid"),
+    ],
+)
+async def test_grobid_client_rejects_invalid_version_payload(
+    body: bytes, expected_code: str
+) -> None:
+    async def version(request: web.Request) -> web.Response:
+        assert request.headers["X-API-Key"] == "grobid-test-key-1234"
+        return web.Response(body=body, content_type="application/json")
+
+    app = web.Application()
+    app.router.add_get("/api/version", version)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        client = GrobidClient(
+            str(server.make_url("/")).rstrip("/"),
+            api_key="grobid-test-key-1234",
+        )
+        with pytest.raises(ParserServiceError) as error:
+            await client.version()
+    finally:
+        await server.close()
+
+    assert error.value.code == expected_code
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("chunked", [False, True], ids=["declared", "chunked"])
 async def test_grobid_rejects_oversized_tei_response(chunked: bool) -> None:
     response_limit = 64
