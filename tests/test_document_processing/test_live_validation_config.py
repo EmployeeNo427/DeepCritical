@@ -68,4 +68,3 @@ def test_grobid_proxy_grants_only_caddys_embedded_file_capability() -> None:
     assert proxy["cap_drop"] == ["ALL"]
     assert proxy["cap_add"] == ["NET_BIND_SERVICE"]
     assert proxy["security_opt"] == ["no-new-privileges:true"]
-
