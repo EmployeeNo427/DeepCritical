@@ -66,6 +66,9 @@ x-docling-container: &docling-container
 
 services:
   redis:
+    # Start directly as the image service account so cap_drop: ALL never blocks
+    # a root-to-redis setuid transition in the official entrypoint.
+    user: redis
     image: "redis:7.2.14-alpine3.21@${REDIS_IMAGE_DIGEST:?Set an approved REDIS_IMAGE_DIGEST}"
     pull_policy: never
     platform: "${DOCUMENT_PROCESSING_PLATFORM:-linux/amd64}"
