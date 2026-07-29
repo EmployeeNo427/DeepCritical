@@ -102,7 +102,7 @@ def test_docling_worker_health_checks_worker_heartbeat() -> None:
     assert "worker.hostname == hostname" in healthcheck
 
 
-def test_docling_api_healthcheck_requires_explicit_readiness_true() -> None:
+def test_docling_api_healthcheck_requires_documented_explicit_readiness() -> None:
     root = Path(__file__).resolve().parents[2]
     compose = yaml.safe_load(
         (root / "docker" / "document-processing" / "compose.yaml").read_text(
@@ -111,4 +111,6 @@ def test_docling_api_healthcheck_requires_explicit_readiness_true() -> None:
     )
     healthcheck = " ".join(compose["services"]["docling-api"]["healthcheck"]["test"])
 
-    assert 'payload.get("ready") is True' in healthcheck
+    assert 'payload["ready"] is True' in healthcheck
+    assert '"ready" in payload' in healthcheck
+    assert 'payload.get("status") == "ok"' in healthcheck
