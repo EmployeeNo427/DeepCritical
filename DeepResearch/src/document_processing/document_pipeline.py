@@ -234,13 +234,11 @@ class DocumentProcessingFailureRecorder:
         artifact = self.processor.store.get_artifact(artifact_id)
         terminal_during_stage = tuple(
             run
-            for run in self.processor.store.list_processing_runs(
-                artifact_id=artifact_id
-            )
+            for run in self.processor.store.list_processing_runs()
             if run.pipeline_run_id == failure.pipeline_run_id
             and run.started_at >= failure.started_at
             and run.stage_id == failure.stage_id
-            and run.component == failure.component
+            and run.component.capability == failure.component.capability
         )
         if terminal_during_stage:
             return

@@ -174,6 +174,13 @@ alternative does. Conditions are a closed typed set (`always`,
 `output_present`, `output_absent`, `diagnostic_present`, `stage_status`,
 `all`, and `any`); arbitrary expressions are not part of the schema.
 
+An `always` producer can still terminate as `failed` or `quarantined` without
+returning a required output. Consumers that require the missing value become
+`skipped`, and that terminal dependency propagates safely. A producer that was
+itself `skipped` propagates the same result. A `complete` or `partial` producer
+must return every registered required output; omission is an execution error
+rather than an implicit skip.
+
 `PipelineOrchestrator` evaluates those conditions and delegates each runnable
 node through the `StageExecutor` protocol. This release provides only
 `LocalStageExecutor`, which executes registered plugins in the current process
@@ -189,11 +196,22 @@ Expected component failures remain the component’s responsibility: it commits
 its terminal run and returns a typed outcome. The orchestrator reports an
 unexpected ordinary exception through the optional `StageFailureObserver`.
 The document pipeline supplies `DocumentProcessingFailureRecorder`, which
-commits one failed run only when the stage did not already commit a terminal
-run, stops downstream execution, and re-raises the original exception.
+commits one failed run only when the graph-stage invocation did not already
+commit a terminal run with the same capability. It correlates the pipeline run,
+graph stage, invocation time, and capability across source and OCR-derivative
+artifacts, so implementation aliases such as primary/fallback GROBID do not
+create duplicate failure records. Processing runs and their failure diagnostics
+use the same graph-stage identity. The recorder stops downstream execution and
+re-raises the original exception.
 Cancellation is re-raised and is never converted into an ordinary failure.
 The generic orchestration module has no dependency on the content-addressed
 store or document-specific models.
+
+The mandatory live-contract quality job runs the complete document-processing
+test suite with branch measurement and blocks unless every changed source line
+and branch is covered relative to the exact review base revision. This focused
+gate prevents unrelated, well-covered modules from masking untested changes;
+repository-wide Codecov reporting remains informational.
 
 This completes Follow-up 1’s allow-listed local execution layer and Follow-up
 2’s project-owned canonical document view. The execution boundary remains

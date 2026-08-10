@@ -13,6 +13,10 @@ on:
           - docling
           - grobid
           - ocr
+      compare_revision:
+        description: Exact Git revision used as the changed-coverage baseline
+        required: true
+        type: string
   pull_request:
     branches:
       - dev
@@ -36,6 +40,7 @@ env:
   PYTHON_VERSION: "3.11"
   UV_VERSION: "0.11.29"
   TESTED_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+  COVERAGE_BASE_REVISION: ${{ github.event.pull_request.base.sha || inputs.compare_revision }}
   DOCLING_IMAGE_TAG: quay.io/docling-project/docling-serve-cpu:v1.21.0
   REDIS_IMAGE_TAG: redis:7.2.14-alpine3.21
   GROBID_BASE_IMAGE_TAG: grobid/grobid:0.9.0-full
@@ -64,6 +69,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.TESTED_REVISION }}
+          fetch-depth: 0
 
       - name: Verify the checked-out revision
         run: |
@@ -101,10 +107,26 @@ jobs:
             --cov-fail-under=100
 
       - name: Run the complete document-processing suite
+        env:
+          COVERAGE_FILE: .coverage-document-processing
         run: |
           uv run --frozen pytest \
             tests/test_document_processing \
+            --cov=DeepResearch.src.document_processing \
+            --cov-branch \
+            --cov-report=term-missing \
+            --cov-report=xml:document-processing-coverage.xml \
             -q -p no:cacheprovider
+
+      - name: Enforce complete changed-code coverage
+        run: |
+          uv run --frozen diff-cover \
+            document-processing-coverage.xml \
+            --compare-branch="$COVERAGE_BASE_REVISION" \
+            --include='DeepResearch/src/document_processing/*.py' \
+            --branch-coverage \
+            --fail-under=100 \
+            --show-uncovered
 
       - name: Run the repository CI marker selection
         run: |

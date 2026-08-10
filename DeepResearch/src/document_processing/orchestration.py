@@ -12,6 +12,7 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -413,6 +414,18 @@ class StageContext:
                 f"stage {self.stage_id!r} input {name!r} is not {value_type.__name__}"
             )
         return value
+
+
+_ACTIVE_STAGE_CONTEXT: ContextVar[StageContext | None] = ContextVar(
+    "document_processing_active_stage_context",
+    default=None,
+)
+
+
+def _active_stage_context() -> StageContext | None:
+    """Return the task-local stage invocation while an executor is running."""
+
+    return _ACTIVE_STAGE_CONTEXT.get()
 
 
 class StagePlugin(Protocol):
@@ -1115,6 +1128,7 @@ class PipelineOrchestrator:
                 )
                 continue
             runtime_inputs: dict[str, object] = {}
+            blocked_by_terminal_dependency = False
             for port_name, binding in stage.spec.inputs.items():
                 if isinstance(binding, PipelineInputRef):
                     runtime_inputs[port_name] = inputs[binding.input_name]
@@ -1125,10 +1139,22 @@ class PipelineOrchestrator:
                     continue
                 target = stage.registration.input_ports[port_name]
                 if target.required:
+                    if source.status in {
+                        StageExecutionStatus.FAILED,
+                        StageExecutionStatus.QUARANTINED,
+                        StageExecutionStatus.SKIPPED,
+                    }:
+                        blocked_by_terminal_dependency = True
+                        break
                     raise PipelineExecutionError(
                         f"stage {stage.spec.stage_id!r} required input {port_name!r} "
                         f"was not produced by {binding.stage_id}.{binding.output_name}"
                     )
+            if blocked_by_terminal_dependency:
+                results[stage.spec.stage_id] = StageResult(
+                    status=StageExecutionStatus.SKIPPED
+                )
+                continue
             context = StageContext(
                 pipeline_id=pipeline.spec.pipeline_id,
                 pipeline_version=pipeline.spec.pipeline_version,
@@ -1139,6 +1165,7 @@ class PipelineOrchestrator:
             )
             started_at = utc_now()
             started_clock = time.perf_counter()
+            stage_context_token = _ACTIVE_STAGE_CONTEXT.set(context)
             try:
                 results[stage.spec.stage_id] = await self.executor.execute(
                     stage,
@@ -1168,6 +1195,8 @@ class PipelineOrchestrator:
                         )
                         raise exc from observer_error
                 raise
+            finally:
+                _ACTIVE_STAGE_CONTEXT.reset(stage_context_token)
         return PipelineExecution(pipeline_run_id=execution_id, results=results)
 
 
