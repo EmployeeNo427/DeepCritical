@@ -2511,9 +2511,20 @@ class DocumentProcessor:
         ):
             committed_status = ProcessingRunStatus.PARTIAL
         pipeline_context = _PIPELINE_CONTEXT.get()
+        from .orchestration import _active_stage_context
+
+        stage_context = _active_stage_context()
+        active_stage_id = (
+            stage_context.stage_id
+            if stage_context is not None
+            and pipeline_context is not None
+            and stage_context.pipeline_run_id == pipeline_context.pipeline_run_id
+            else run.stage_id
+        )
         run_payload.update(
             {
                 "status": committed_status,
+                "stage_id": active_stage_id,
                 "pipeline_run_id": (
                     pipeline_context.pipeline_run_id
                     if pipeline_context is not None
@@ -2736,12 +2747,20 @@ class DocumentProcessor:
         run_id: str | None = None,
         inputs: tuple[DataProductRef, ...] = (),
     ) -> ProcessingRun:
+        from .orchestration import _active_stage_context
+
+        active_stage = _active_stage_context()
+        resolved_stage_id = (
+            (active_stage.stage_id if active_stage is not None else None)
+            or stage_id
+            or component_id
+        )
         memory_measurement = getattr(error, "memory_measurement", None)
         resolved_run_id = run_id or _run_id()
         run = ProcessingRun(
             run_id=resolved_run_id,
             artifact_id=artifact.artifact_id,
-            stage_id=stage_id or component_id,
+            stage_id=resolved_stage_id,
             component=component_descriptor
             or _component_descriptor(component_id, component_version),
             runtime_identity_required=runtime_identity_required,
@@ -2777,7 +2796,7 @@ class DocumentProcessor:
             artifact,
             run.run_id,
             severity=DiagnosticSeverity.FATAL,
-            stage=component_id,
+            stage=resolved_stage_id,
             code=code,
             message=str(error) or error.__class__.__name__,
             details={
@@ -2787,7 +2806,7 @@ class DocumentProcessor:
             },
         )
         memory_diagnostic = self._memory_measurement_diagnostic(
-            artifact, run, memory_measurement, stage=component_id
+            artifact, run, memory_measurement, stage=resolved_stage_id
         )
         return self._commit_processing_run(
             artifact,

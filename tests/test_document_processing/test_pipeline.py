@@ -635,6 +635,12 @@ async def test_unexpected_stage_failure_persists_one_failed_run(
     assert failed.configuration_sha256 == sha256_bytes(b"{}")
     assert failed.pipeline_run_id is not None
     assert failed.output("diagnostics_manifest") is not None
+    diagnostic = next(
+        item
+        for item in store.list_diagnostics(artifact_id=artifact.artifact_id)
+        if item.processing_run_id == failed.run_id
+    )
+    assert diagnostic.stage == "route"
     assert docling.calls == 0
 
 
@@ -665,6 +671,165 @@ async def test_failure_observer_does_not_duplicate_a_terminal_component_run(
     assert len(runs) == 1
     assert runs[0].component_id == "docling"
     assert runs[0].status is ProcessingRunStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_failure_observer_correlates_primary_grobid_stage_alias(tmp_path) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+        stage_executor=_RaiseAfterStageExecutor("primary-grobid"),
+    )
+    artifact = processor.ingest_bytes(
+        b"%PDF-1.7\nPRIMARY GROBID",
+        acquisition_uri="https://example.test/primary-grobid.pdf",
+        media_type="application/pdf",
+        identifiers={"filename": "primary-grobid.pdf"},
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected failure after primary-grobid"):
+        await processor.process_artifact(artifact.artifact_id)
+
+    grobid_runs = [
+        run
+        for run in store.list_processing_runs(artifact_id=artifact.artifact_id)
+        if run.component_id == "grobid"
+    ]
+    assert len(grobid_runs) == 1
+    assert grobid_runs[0].stage_id == "primary-grobid"
+    assert all(
+        run.component_id != "grobid-primary"
+        for run in store.list_processing_runs(artifact_id=artifact.artifact_id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_failure_observer_correlates_ocr_stage_alias(tmp_path) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(scan_first=True),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+        stage_executor=_RaiseAfterStageExecutor("ocr"),
+    )
+    artifact = processor.ingest_bytes(
+        b"%PDF-1.7\nOCR FALLBACK",
+        acquisition_uri="https://example.test/ocr-fallback.pdf",
+        media_type="application/pdf",
+        identifiers={"filename": "ocr-fallback.pdf"},
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected failure after ocr"):
+        await processor.process_artifact(artifact.artifact_id)
+
+    ocr_runs = [
+        run
+        for run in store.list_processing_runs(artifact_id=artifact.artifact_id)
+        if run.component_id == "ocrmypdf"
+    ]
+    assert len(ocr_runs) == 1
+    assert ocr_runs[0].stage_id == "ocr"
+    assert all(
+        run.component_id != "ocrmypdf-fallback"
+        for run in store.list_processing_runs(artifact_id=artifact.artifact_id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_failure_observer_correlates_fallback_grobid_stage_alias(
+    tmp_path,
+) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(scan_first=True),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+        stage_executor=_RaiseAfterStageExecutor("fallback-grobid"),
+    )
+    artifact = processor.ingest_bytes(
+        b"%PDF-1.7\nFALLBACK GROBID",
+        acquisition_uri="https://example.test/fallback-grobid.pdf",
+        media_type="application/pdf",
+        identifiers={"filename": "fallback-grobid.pdf"},
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected failure after fallback-grobid"):
+        await processor.process_artifact(artifact.artifact_id)
+
+    grobid_runs = [
+        run for run in store.list_processing_runs() if run.component_id == "grobid"
+    ]
+    assert len(grobid_runs) == 2
+    assert {run.stage_id for run in grobid_runs} == {
+        "primary-grobid",
+        "fallback-grobid",
+    }
+    assert all(
+        run.component_id != "grobid-fallback" for run in store.list_processing_runs()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "media_type", "filename", "adapter_component"),
+    [
+        (
+            b"<article><body><p id='p1'>Methods</p></body></article>",
+            "application/jats+xml",
+            "paper.nxml",
+            "jats-locator-adapter",
+        ),
+        (
+            b'{"source":"PMC","date":"20260810","key":"test",'
+            b'"documents":[{"id":"PMC1","infons":{},"passages":['
+            b'{"offset":0,"infons":{},"text":"Methods","sentences":[],'
+            b'"annotations":[],"relations":[]}],"annotations":[],'
+            b'"relations":[]}]}',
+            "application/bioc+json",
+            "paper.bioc.json",
+            "bioc-adapter",
+        ),
+    ],
+)
+async def test_failure_observer_correlates_native_adapter_stage(
+    tmp_path,
+    content: bytes,
+    media_type: str,
+    filename: str,
+    adapter_component: str,
+) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+        stage_executor=_RaiseAfterStageExecutor("prepare"),
+    )
+    artifact = processor.ingest_bytes(
+        content,
+        acquisition_uri=f"https://example.test/{filename}",
+        media_type=media_type,
+        identifiers={"filename": filename},
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected failure after prepare"):
+        await processor.process_artifact(artifact.artifact_id)
+
+    runs = store.list_processing_runs(artifact_id=artifact.artifact_id)
+    adapter_runs = [run for run in runs if run.component_id == adapter_component]
+    assert len(adapter_runs) == 1
+    assert adapter_runs[0].stage_id == "prepare"
+    assert all(run.component_id != "document-native-adapter" for run in runs)
 
 
 @pytest.mark.asyncio
@@ -708,13 +873,14 @@ async def test_unrelated_terminal_run_does_not_hide_stage_failure(
 
     runs = store.list_processing_runs(artifact_id=artifact.artifact_id)
     assert len(runs) == 2
-    by_stage = {run.stage_id: run for run in runs}
-    assert by_stage["unrelated-stage"].component_id == "unrelated-component"
-    assert by_stage["unrelated-stage"].status is ProcessingRunStatus.FAILED
-    assert by_stage["route"].component_id == "document-router"
-    assert by_stage["route"].status is ProcessingRunStatus.FAILED
+    by_component = {run.component_id: run for run in runs}
+    assert by_component["unrelated-component"].stage_id == "route"
+    assert by_component["unrelated-component"].status is ProcessingRunStatus.FAILED
+    assert by_component["document-router"].stage_id == "route"
+    assert by_component["document-router"].status is ProcessingRunStatus.FAILED
     assert (
-        by_stage["route"].pipeline_run_id == by_stage["unrelated-stage"].pipeline_run_id
+        by_component["document-router"].pipeline_run_id
+        == by_component["unrelated-component"].pipeline_run_id
     )
 
 
