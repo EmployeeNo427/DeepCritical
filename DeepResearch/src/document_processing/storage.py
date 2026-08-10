@@ -238,7 +238,26 @@ class ContentAddressedStore:
     def put_canonical_document(self, view: CanonicalDocumentView) -> StoredBlob:
         """Persist one validated canonical view as deterministic CAS bytes."""
 
-        return self.put_blob(canonical_document_bytes(view))
+        # ``FrozenModel`` only provides shallow immutability and
+        # ``model_copy(update=...)`` deliberately skips validation.  Rebuild the
+        # complete view immediately before serialization so neither a mutated
+        # nested mapping nor a stale deterministic identity can become durable.
+        validated_view = CanonicalDocumentView.model_validate(
+            view.model_dump(mode="python")
+        )
+        return self.put_blob(canonical_document_bytes(validated_view))
+
+    def read_data_product_bytes(self, product: DataProductRef) -> bytes:
+        """Read a durable producer-declared product after full verification.
+
+        A syntactically valid reference is not sufficient provenance.  The
+        reference must also describe bytes in this store, name existing source
+        artifacts, and exactly match an output on its durable producer run.
+        """
+
+        validated_product = self._revalidate_product(product)
+        self._verify_durable_product_chain((validated_product,))
+        return self.read_blob(validated_product.blob_sha256)
 
     def read_canonical_document(self, product: DataProductRef) -> CanonicalDocumentView:
         """Load a canonical product with schema dispatch before validation."""
@@ -246,8 +265,27 @@ class ContentAddressedStore:
         validate_product_contract(product)
         if product.name != "canonical_document_view":
             raise ValueError("data product is not a canonical document view")
-        self._verify_product(product)
-        return load_canonical_document(self.read_blob(product.blob_sha256))
+        view = load_canonical_document(self.read_data_product_bytes(product))
+        producer = self.get_processing_run(product.producer_run_id)
+        artifact = self.get_artifact(producer.artifact_id)
+        if view.artifact_id != artifact.artifact_id:
+            raise RecordConflictError(
+                f"canonical product {product.product_id!r} artifact does not match "
+                f"producer artifact {artifact.artifact_id!r}"
+            )
+        if view.source_sha256 != artifact.source_sha256:
+            raise RecordConflictError(
+                f"canonical product {product.product_id!r} source hash does not "
+                f"match producer artifact {artifact.artifact_id!r}"
+            )
+        if producer.inputs != view.source_products:
+            raise RecordConflictError(
+                f"canonical product {product.product_id!r} source products do not "
+                f"exactly match producer run {producer.run_id!r} inputs"
+            )
+        for source_product in view.source_products:
+            self.read_data_product_bytes(source_product)
+        return view
 
     def verify_blob(self, sha256: str) -> Path:
         """Verify that a blob exists and matches its content address."""
@@ -358,16 +396,10 @@ class ContentAddressedStore:
         """Persist a processing run after validating every typed product."""
 
         self.get_artifact(processing_run.artifact_id)
-        for product in processing_run.inputs:
-            self._verify_product(product)
-            producer = self.get_processing_run(product.producer_run_id)
-            if product not in producer.outputs:
-                raise RecordConflictError(
-                    f"input product {product.product_id!r} is not declared by "
-                    f"producer run {producer.run_id!r}"
-                )
+        self._verify_durable_product_chain(processing_run.inputs)
         for product in processing_run.outputs:
             self._verify_product(product)
+            self._verify_output_lineage(product, processing_run)
         return self._save_record(
             "processing_runs", processing_run.run_id, processing_run
         )
@@ -661,6 +693,74 @@ class ContentAddressedStore:
             )
         for artifact_id in product.source_artifact_ids:
             self.get_artifact(artifact_id)
+
+    @staticmethod
+    def _revalidate_product(product: DataProductRef) -> DataProductRef:
+        try:
+            return DataProductRef.model_validate(product.model_dump(mode="python"))
+        except ValidationError as exc:
+            raise RecordConflictError("data product reference is invalid") from exc
+
+    def _verify_durable_product_chain(
+        self,
+        products: tuple[DataProductRef, ...],
+    ) -> None:
+        pending = [(product, False) for product in reversed(products)]
+        visiting_run_ids: set[str] = set()
+        verified_run_ids: set[str] = set()
+        while pending:
+            product, exiting = pending.pop()
+            if exiting:
+                producer_run_id = product.producer_run_id
+                visiting_run_ids.remove(producer_run_id)
+                verified_run_ids.add(producer_run_id)
+                continue
+
+            validated_product = self._revalidate_product(product)
+            producer_run_id = validated_product.producer_run_id
+            self._verify_product(validated_product)
+            producer = self.get_processing_run(producer_run_id)
+            self._verify_output_lineage(validated_product, producer)
+            if validated_product not in producer.outputs:
+                raise RecordConflictError(
+                    f"data product {validated_product.product_id!r} is not declared "
+                    f"by producer run {producer.run_id!r}"
+                )
+            if producer_run_id in visiting_run_ids:
+                raise RecordConflictError(
+                    f"processing-run input provenance contains a cycle at "
+                    f"{producer_run_id!r}"
+                )
+            if producer_run_id in verified_run_ids:
+                continue
+            visiting_run_ids.add(producer_run_id)
+            pending.append((validated_product, True))
+            pending.extend(
+                (input_product, False) for input_product in reversed(producer.inputs)
+            )
+
+    @staticmethod
+    def _verify_output_lineage(
+        product: DataProductRef,
+        producer: ProcessingRun,
+    ) -> None:
+        expected_lineage = tuple(
+            dict.fromkeys(
+                (
+                    producer.artifact_id,
+                    *(
+                        artifact_id
+                        for input_product in producer.inputs
+                        for artifact_id in input_product.source_artifact_ids
+                    ),
+                )
+            )
+        )
+        if product.source_artifact_ids != expected_lineage:
+            raise RecordConflictError(
+                f"data product {product.product_id!r} lineage must exactly equal "
+                f"producer artifact and inherited input lineage {expected_lineage!r}"
+            )
 
     def _save_record(
         self, category: str, record_id: str, record: _RECORD_MODEL

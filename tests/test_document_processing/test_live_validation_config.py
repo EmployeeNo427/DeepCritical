@@ -237,15 +237,6 @@ def test_quality_job_enforces_the_complete_repository_gate() -> None:
     assert "--branch-coverage" in changed_coverage
     assert "--fail-under=100" in changed_coverage
 
-    canonical_coverage = _step(
-        jobs,
-        "quality",
-        "Enforce canonical document contract coverage",
-    )["run"]
-    assert "tests/test_document_processing/test_canonical.py" in canonical_coverage
-    assert "--cov=DeepResearch.src.document_processing.canonical" in canonical_coverage
-    assert "--cov-fail-under=100" in canonical_coverage
-
     repository_suite = _step(
         jobs,
         "quality",
@@ -302,3 +293,28 @@ def test_quality_job_enforces_the_complete_repository_gate() -> None:
             "Build documentation",
         )["run"]
     )
+
+
+def test_canonical_contract_coverage_is_complete_and_isolated() -> None:
+    jobs = _live_workflow()["jobs"]
+    canonical_step = _step(
+        jobs,
+        "quality",
+        "Enforce canonical document contract coverage",
+    )
+    document_step = _step(
+        jobs,
+        "quality",
+        "Run the complete document-processing suite",
+    )
+
+    assert canonical_step["env"]["COVERAGE_FILE"] == ".coverage-canonical-document"
+    assert (
+        canonical_step["env"]["COVERAGE_FILE"] != document_step["env"]["COVERAGE_FILE"]
+    )
+    canonical_coverage = canonical_step["run"]
+    assert "tests/test_document_processing/test_canonical.py" in canonical_coverage
+    assert "--cov=DeepResearch.src.document_processing.canonical" in canonical_coverage
+    assert "--cov-branch" in canonical_coverage
+    assert "--cov-report=term-missing" in canonical_coverage
+    assert "--cov-fail-under=100" in canonical_coverage

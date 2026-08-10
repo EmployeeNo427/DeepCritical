@@ -98,11 +98,14 @@ jobs:
             -q -p no:cacheprovider
 
       - name: Enforce canonical document contract coverage
+        env:
+          COVERAGE_FILE: .coverage-canonical-document
         run: |
           uv run --frozen pytest \
             tests/test_document_processing/test_canonical.py \
             -q -p no:cacheprovider \
             --cov=DeepResearch.src.document_processing.canonical \
+            --cov-branch \
             --cov-report=term-missing \
             --cov-fail-under=100
 

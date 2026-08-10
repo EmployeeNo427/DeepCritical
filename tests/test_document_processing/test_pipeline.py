@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import time
+from dataclasses import replace
 from io import BytesIO
 from typing import Any
 
@@ -23,13 +24,17 @@ from DeepResearch.src.document_processing.document_pipeline import (
 )
 from DeepResearch.src.document_processing.models import (
     ArtifactRelationship,
+    ComponentDescriptor,
+    DataProductRef,
     DocumentArtifact,
     MemoryMeasurement,
     MemoryMeasurementScope,
     MemoryMeasurementStatus,
+    ProcessingRun,
     ProcessingRunStatus,
     RuntimeAttestation,
     RuntimeAttestationSource,
+    configuration_sha256,
     sha256_bytes,
     utc_now,
 )
@@ -37,6 +42,7 @@ from DeepResearch.src.document_processing.orchestration import (
     CompiledStage,
     LocalStageExecutor,
     StageContext,
+    StageExecutionStatus,
     StageResult,
 )
 from DeepResearch.src.document_processing.pipeline import (
@@ -522,9 +528,98 @@ def _config() -> DocumentProcessingConfig:
     )
 
 
+def test_commit_rejects_unsafe_output_policy_overrides(tmp_path) -> None:
+    processor = DocumentProcessor(
+        ContentAddressedStore(tmp_path / "store"),
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    artifact = processor.ingest_bytes(
+        b"policy guard",
+        acquisition_uri="https://example.test/policy-guard.txt",
+        media_type="text/plain",
+    )
+    now = utc_now()
+    base = ProcessingRun(
+        run_id="policy-guard-run",
+        artifact_id=artifact.artifact_id,
+        stage_id="policy-guard",
+        component=ComponentDescriptor(
+            component_id="policy-guard",
+            component_version="1",
+            capability="policy-guard",
+        ),
+        configuration={},
+        configuration_sha256=configuration_sha256({}),
+        started_at=now,
+        finished_at=now,
+        status=ProcessingRunStatus.FAILED,
+    )
+
+    unsafe_snapshot = base.model_copy(
+        update={"output_policy_snapshot": {"schema": "foreign-policy"}}
+    )
+    with pytest.raises(ValueError, match="output policy conflicts"):
+        processor._commit_processing_run(artifact, unsafe_snapshot)
+
+    unsafe_hash = base.model_copy(update={"output_policy_sha256": "0" * 64})
+    with pytest.raises(ValueError, match="output policy hash conflicts"):
+        processor._commit_processing_run(artifact, unsafe_hash)
+
+
+def test_diagnostic_reconciliation_rejects_manifest_identity_drift(tmp_path) -> None:
+    processor = DocumentProcessor(
+        ContentAddressedStore(tmp_path / "store"),
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    artifact = processor.ingest_bytes(
+        b"manifest identity",
+        acquisition_uri="https://example.test/manifest-identity.txt",
+        media_type="text/plain",
+    )
+    unrelated_artifact = processor.ingest_bytes(
+        b"unrelated artifact",
+        acquisition_uri="https://example.test/unrelated.txt",
+        media_type="text/plain",
+    )
+    now = utc_now()
+    committed = processor._commit_processing_run(
+        artifact,
+        ProcessingRun(
+            run_id="manifest-identity-run",
+            artifact_id=artifact.artifact_id,
+            stage_id="manifest-identity",
+            component=ComponentDescriptor(
+                component_id="manifest-identity",
+                component_version="1",
+                capability="manifest-identity",
+            ),
+            configuration={},
+            configuration_sha256=configuration_sha256({}),
+            started_at=now,
+            finished_at=now,
+            status=ProcessingRunStatus.FAILED,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="does not match its processing run"):
+        processor._reconcile_run_diagnostics(unrelated_artifact, committed)
+    with pytest.raises(ValueError, match="does not match its processing run"):
+        processor._reconcile_run_diagnostics(
+            artifact,
+            committed.model_copy(update={"run_id": "drifted-run-id"}),
+        )
+
+
 class _RecordingExecutor:
     def __init__(self) -> None:
         self.stage_ids: list[str] = []
+        self.results: dict[str, StageResult] = {}
         self.local = LocalStageExecutor()
 
     async def execute(
@@ -533,7 +628,29 @@ class _RecordingExecutor:
         context: StageContext,
     ) -> StageResult:
         self.stage_ids.append(stage.spec.stage_id)
-        return await self.local.execute(stage, context)
+        result = await self.local.execute(stage, context)
+        self.results[stage.spec.stage_id] = result
+        return result
+
+
+class _PoisonInMemoryCanonicalInputExecutor(_RecordingExecutor):
+    async def execute(
+        self,
+        stage: CompiledStage,
+        context: StageContext,
+    ) -> StageResult:
+        if stage.spec.stage_id == "canonicalize":
+            integrity: Any = context.inputs["integrity"]
+            integrity.scholarly.parsed.docling_stage.document["texts"][1]["text"] = (
+                "uncommitted in-memory replacement"
+            )
+            if integrity.alignment is not None:
+                object.__setattr__(
+                    integrity.alignment,
+                    "overlay",
+                    "uncommitted in-memory replacement",
+                )
+        return await super().execute(stage, context)
 
 
 class _RaiseAfterStageExecutor:
@@ -609,11 +726,12 @@ async def test_reference_flow_executes_through_the_compiled_local_dag(tmp_path) 
     assert result.canonical_document_sha256 == canonical_product.blob_sha256
     assert canonical_view.artifact_id == artifact.artifact_id
     assert canonical_view.blocks
-    assert {product.name for product in canonical_view.source_products} >= {
+    assert canonical_run.inputs == canonical_view.source_products
+    assert [product.name for product in canonical_view.source_products] == [
         "docling_document",
         "content_spans",
         "content_integrity_overlay",
-    }
+    ]
     component_spec = next(
         component
         for component in processor.pipeline_spec.components
@@ -624,6 +742,475 @@ async def test_reference_flow_executes_through_the_compiled_local_dag(tmp_path) 
         "text_normalization": "unicode-nfc-collapse-whitespace-v1",
     }
     assert not hasattr(processor, "_process_artifact_once_legacy")
+
+
+@pytest.mark.asyncio
+async def test_canonicalization_reloads_every_declared_product_from_storage(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    persisted_reads: list[str] = []
+    original_read = store.read_data_product_bytes
+
+    def record_read(product: DataProductRef) -> bytes:
+        persisted_reads.append(product.product_id)
+        return original_read(product)
+
+    monkeypatch.setattr(store, "read_data_product_bytes", record_read)
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+        stage_executor=_PoisonInMemoryCanonicalInputExecutor(),
+    )
+    artifact = processor.ingest_bytes(
+        b"<html><body>durable canonical inputs</body></html>",
+        acquisition_uri="https://example.test/durable-canonical-inputs.html",
+        media_type="text/html",
+        identifiers={"filename": "durable-canonical-inputs.html"},
+    )
+
+    result = await processor.process_artifact(artifact.artifact_id)
+
+    assert result.status is ProcessingRunStatus.COMPLETE
+    canonical_run = next(
+        run
+        for run in result.processing_runs
+        if run.component_id == "canonical-document-view"
+    )
+    assert {product.product_id for product in canonical_run.inputs}.issubset(
+        persisted_reads
+    )
+    canonical_view = store.read_canonical_document(
+        canonical_run.require_output("canonical_document_view")
+    )
+    assert canonical_run.inputs == canonical_view.source_products
+    assert any(
+        block.text == "Amyloid beta was measured in a reusable synthetic cohort."
+        for block in canonical_view.blocks
+    )
+    assert all(
+        block.text != "uncommitted in-memory replacement"
+        for block in canonical_view.blocks
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("product_name", ["docling_document", "alignment_overlay"])
+async def test_canonicalization_rejects_non_object_persisted_inputs(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    product_name: str,
+) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    use_pdf = product_name == "alignment_overlay"
+    filename = (
+        "invalid-canonical-input.pdf" if use_pdf else "invalid-canonical-input.html"
+    )
+    artifact = processor.ingest_bytes(
+        b"%PDF-1.7\ninvalid canonical input"
+        if use_pdf
+        else b"<html><body>invalid canonical input</body></html>",
+        acquisition_uri=f"https://example.test/{filename}",
+        media_type="application/pdf" if use_pdf else "text/html",
+        identifiers={"filename": filename},
+    )
+    original_canonicalize = processor._run_canonicalization
+    corrupted = False
+
+    def corrupt_persisted_input(*args: Any, **kwargs: Any):
+        original_read = store.read_data_product_bytes
+
+        def read_product(product: DataProductRef) -> bytes:
+            nonlocal corrupted
+            if product.name == product_name:
+                corrupted = True
+                return b"[]"
+            return original_read(product)
+
+        monkeypatch.setattr(store, "read_data_product_bytes", read_product)
+        try:
+            return original_canonicalize(*args, **kwargs)
+        finally:
+            monkeypatch.setattr(store, "read_data_product_bytes", original_read)
+
+    monkeypatch.setattr(
+        processor,
+        "_run_canonicalization",
+        corrupt_persisted_input,
+    )
+
+    result = await processor.process_artifact(artifact.artifact_id)
+
+    assert corrupted
+    assert result.status is ProcessingRunStatus.FAILED
+    canonical_run = next(
+        run
+        for run in result.processing_runs
+        if run.component_id == "canonical-document-view"
+    )
+    assert canonical_run.status is ProcessingRunStatus.FAILED
+    assert canonical_run.output("canonical_document_view") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_inputs", "warning_fragment"),
+    [
+        ("missing_blob", ["docling_document"], "blob not found"),
+        ("hash_mismatch", ["docling_document"], "hashes to"),
+        (
+            "missing_producer",
+            ["docling_document", "content_spans"],
+            "processing_runs record not found",
+        ),
+    ],
+)
+async def test_canonicalization_persists_one_failure_with_only_verified_inputs(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+    expected_inputs: list[str],
+    warning_fragment: str,
+) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    artifact = processor.ingest_bytes(
+        b"<html><body>canonical CAS verification</body></html>",
+        acquisition_uri="https://example.test/canonical-cas-verification.html",
+        media_type="text/html",
+        identifiers={"filename": "canonical-cas-verification.html"},
+    )
+    original_canonicalize = processor._run_canonicalization
+    corrupted = False
+
+    def corrupt_durable_input(*args: Any, **kwargs: Any):
+        nonlocal corrupted
+        docling_run = args[1]
+        integrity_run = kwargs["integrity_run"]
+        if failure_mode in {"missing_blob", "hash_mismatch"}:
+            product = docling_run.require_output("content_spans")
+            path = store.blob_path(product.blob_sha256)
+            if failure_mode == "missing_blob":
+                path.unlink()
+            else:
+                path.write_bytes(b"content whose digest does not match its CAS key")
+        else:
+            producer_id = integrity_run.require_output(
+                "content_integrity_overlay"
+            ).producer_run_id
+            store._record_path("processing_runs", producer_id).unlink()
+        corrupted = True
+        return original_canonicalize(*args, **kwargs)
+
+    monkeypatch.setattr(processor, "_run_canonicalization", corrupt_durable_input)
+
+    result = await processor.process_artifact(artifact.artifact_id)
+
+    assert corrupted
+    assert result.status is ProcessingRunStatus.FAILED
+    canonical_runs = store.list_processing_runs(
+        artifact_id=artifact.artifact_id,
+        component_id="canonical-document-view",
+    )
+    assert len(canonical_runs) == 1
+    failed_run = canonical_runs[0]
+    assert failed_run.status is ProcessingRunStatus.FAILED
+    assert [product.name for product in failed_run.inputs] == expected_inputs
+    assert any(warning_fragment in warning for warning in failed_run.warnings)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("producer_kind", ["alignment", "integrity"])
+async def test_canonicalization_rejects_mismatched_durable_producer_edges(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    producer_kind: str,
+) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    artifact = processor.ingest_bytes(
+        b"%PDF-1.7\ncanonical producer edge verification",
+        acquisition_uri="https://example.test/canonical-producer-edge.pdf",
+        media_type="application/pdf",
+        identifiers={"filename": "canonical-producer-edge.pdf"},
+    )
+    original_canonicalize = processor._run_canonicalization
+    mismatched_read = False
+
+    def mismatch_producer_edge(*args: Any, **kwargs: Any):
+        nonlocal mismatched_read
+        alignment_product = kwargs["scholarly_alignment_product"]
+        assert alignment_product is not None
+        target_run_id = (
+            alignment_product.producer_run_id
+            if producer_kind == "alignment"
+            else kwargs["integrity_run"].run_id
+        )
+        original_get = store.get_processing_run
+
+        def read_processing_run(run_id: str) -> ProcessingRun:
+            nonlocal mismatched_read
+            run = original_get(run_id)
+            if run_id == target_run_id:
+                mismatched_read = True
+                return run.model_copy(update={"inputs": tuple(reversed(run.inputs))})
+            return run
+
+        monkeypatch.setattr(store, "get_processing_run", read_processing_run)
+        try:
+            return original_canonicalize(*args, **kwargs)
+        finally:
+            monkeypatch.setattr(store, "get_processing_run", original_get)
+
+    monkeypatch.setattr(
+        processor,
+        "_run_canonicalization",
+        mismatch_producer_edge,
+    )
+
+    result = await processor.process_artifact(artifact.artifact_id)
+
+    assert mismatched_read
+    assert result.status is ProcessingRunStatus.FAILED
+    canonical_runs = store.list_processing_runs(
+        artifact_id=artifact.artifact_id,
+        component_id="canonical-document-view",
+    )
+    assert len(canonical_runs) == 1
+    assert canonical_runs[0].status is ProcessingRunStatus.FAILED
+    assert len(canonical_runs[0].inputs) == 5
+    assert "producer inputs must exactly match" in canonical_runs[0].warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_canonicalization_requires_selected_grobid_for_alignment(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    artifact = processor.ingest_bytes(
+        b"%PDF-1.7\nmissing selected GROBID edge",
+        acquisition_uri="https://example.test/missing-selected-grobid.pdf",
+        media_type="application/pdf",
+        identifiers={"filename": "missing-selected-grobid.pdf"},
+    )
+    original_canonicalize = processor._run_canonicalization
+
+    def remove_selected_grobid(*args: Any, **kwargs: Any):
+        kwargs["selected_grobid_run"] = None
+        return original_canonicalize(*args, **kwargs)
+
+    monkeypatch.setattr(
+        processor,
+        "_run_canonicalization",
+        remove_selected_grobid,
+    )
+
+    result = await processor.process_artifact(artifact.artifact_id)
+
+    assert result.status is ProcessingRunStatus.FAILED
+    canonical_runs = store.list_processing_runs(
+        artifact_id=artifact.artifact_id,
+        component_id="canonical-document-view",
+    )
+    assert len(canonical_runs) == 1
+    assert canonical_runs[0].status is ProcessingRunStatus.FAILED
+    assert canonical_runs[0].inputs == ()
+    assert "requires its selected GROBID run" in canonical_runs[0].warnings[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("media_type", "filename", "field_name"),
+    [
+        ("text/html", "wrong-integrity-hash.html", "document_sha256"),
+        (
+            "text/html",
+            "unexpected-integrity-overlay.html",
+            "scholarly_overlay_present",
+        ),
+        (
+            "application/pdf",
+            "missing-integrity-overlay.pdf",
+            "scholarly_overlay_present",
+        ),
+    ],
+)
+async def test_canonicalization_rejects_integrity_payload_identity_drift(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    media_type: str,
+    filename: str,
+    field_name: str,
+) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    artifact = processor.ingest_bytes(
+        (
+            b"%PDF-1.7\nintegrity identity drift"
+            if media_type == "application/pdf"
+            else b"<html><body>integrity identity drift</body></html>"
+        ),
+        acquisition_uri=f"https://example.test/{filename}",
+        media_type=media_type,
+        identifiers={"filename": filename},
+    )
+    original_validate = pipeline_module.validate_content_integrity
+
+    def drift_integrity_identity(*args: Any, **kwargs: Any):
+        report = original_validate(*args, **kwargs)
+        if field_name == "document_sha256":
+            return replace(report, document_sha256="0" * 64)
+        return replace(
+            report,
+            scholarly_overlay_present=not report.scholarly_overlay_present,
+        )
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "validate_content_integrity",
+        drift_integrity_identity,
+    )
+
+    result = await processor.process_artifact(artifact.artifact_id)
+
+    assert result.status is ProcessingRunStatus.FAILED
+    canonical_runs = store.list_processing_runs(
+        artifact_id=artifact.artifact_id,
+        component_id="canonical-document-view",
+    )
+    assert len(canonical_runs) == 1
+    assert canonical_runs[0].status is ProcessingRunStatus.FAILED
+    warning = canonical_runs[0].warnings[0]
+    if field_name == "document_sha256":
+        assert "document hash must match" in warning
+    else:
+        assert "overlay presence must match" in warning
+
+
+@pytest.mark.asyncio
+async def test_canonicalization_rejects_builder_source_product_drift(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = DocumentProcessor(
+        ContentAddressedStore(tmp_path / "store"),
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    artifact = processor.ingest_bytes(
+        b"<html><body>canonical source drift</body></html>",
+        acquisition_uri="https://example.test/canonical-source-drift.html",
+        media_type="text/html",
+        identifiers={"filename": "canonical-source-drift.html"},
+    )
+    original_builder = pipeline_module.build_canonical_document_view
+
+    def drift_source_products(*args: Any, **kwargs: Any):
+        view = original_builder(*args, **kwargs)
+        return view.model_copy(
+            update={"source_products": tuple(reversed(view.source_products))}
+        )
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "build_canonical_document_view",
+        drift_source_products,
+    )
+
+    result = await processor.process_artifact(artifact.artifact_id)
+
+    assert result.status is ProcessingRunStatus.FAILED
+    canonical_run = next(
+        run
+        for run in result.processing_runs
+        if run.component_id == "canonical-document-view"
+    )
+    assert canonical_run.status is ProcessingRunStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_canonicalization_rejects_reused_source_product_drift(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    artifact = processor.ingest_bytes(
+        b"<html><body>reused canonical source drift</body></html>",
+        acquisition_uri="https://example.test/reused-canonical-source-drift.html",
+        media_type="text/html",
+        identifiers={"filename": "reused-canonical-source-drift.html"},
+    )
+    first = await processor.process_artifact(artifact.artifact_id)
+    assert first.status is ProcessingRunStatus.COMPLETE
+    original_read = store.read_canonical_document
+    reused_view_read = False
+
+    def drift_source_products(product: DataProductRef):
+        nonlocal reused_view_read
+        reused_view_read = True
+        view = original_read(product)
+        return view.model_copy(
+            update={"source_products": tuple(reversed(view.source_products))}
+        )
+
+    monkeypatch.setattr(store, "read_canonical_document", drift_source_products)
+
+    second = await processor.process_artifact(artifact.artifact_id)
+
+    assert reused_view_read
+    assert second.status is ProcessingRunStatus.FAILED
+    canonical_runs = [
+        run
+        for run in second.processing_runs
+        if run.component_id == "canonical-document-view"
+    ]
+    assert {run.status for run in canonical_runs} == {ProcessingRunStatus.FAILED}
 
 
 @pytest.mark.asyncio
@@ -693,12 +1280,14 @@ async def test_canonical_stage_persists_invalid_integrity_payload_as_failure(
 async def test_canonical_mapping_error_is_persisted_as_partial(
     tmp_path,
 ) -> None:
+    executor = _RecordingExecutor()
     processor = DocumentProcessor(
         ContentAddressedStore(tmp_path / "store"),
         docling=BrokenHierarchyDocling(),
         grobid=FakeGrobid(),
         ocrmypdf=FakeOCR(),
         config=_config(),
+        stage_executor=executor,
     )
     artifact = processor.ingest_bytes(
         b"<html><body>broken native hierarchy</body></html>",
@@ -719,11 +1308,37 @@ async def test_canonical_mapping_error_is_persisted_as_partial(
     )
     assert result.status is ProcessingRunStatus.PARTIAL
     assert canonical_run.status is ProcessingRunStatus.PARTIAL
+    assert executor.results["canonicalize"].status is StageExecutionStatus.PARTIAL
     assert "UNRESOLVED_NATIVE_REFERENCE" in canonical_run.warnings
     assert any(
         diagnostic.code == "UNRESOLVED_NATIVE_REFERENCE"
         for diagnostic in view.diagnostics
     )
+
+    resumed_executor = _RecordingExecutor()
+    resumed_docling = BrokenHierarchyDocling()
+    resumed_processor = DocumentProcessor(
+        processor.store,
+        docling=resumed_docling,
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+        stage_executor=resumed_executor,
+    )
+
+    resumed = await resumed_processor.process_artifact(artifact.artifact_id)
+
+    resumed_canonical_run = next(
+        run
+        for run in resumed.processing_runs
+        if run.component_id == "canonical-document-view"
+    )
+    assert resumed.status is ProcessingRunStatus.PARTIAL
+    assert resumed_canonical_run.run_id == canonical_run.run_id
+    assert resumed_executor.results["canonicalize"].status is (
+        StageExecutionStatus.PARTIAL
+    )
+    assert resumed_docling.calls == 0
 
 
 @pytest.mark.asyncio
@@ -1986,6 +2601,18 @@ async def test_scanned_pdf_creates_recorded_ocr_derivative_and_retries_grobid(
         "docling_document",
         "alignment_overlay",
     ]
+    canonical_run = next(
+        run
+        for run in result.processing_runs
+        if run.component_id == "canonical-document-view"
+    )
+    assert [product.name for product in canonical_run.inputs] == [
+        "docling_document",
+        "content_spans",
+        "grobid_tei",
+        "alignment_overlay",
+        "content_integrity_overlay",
+    ]
     assert any(
         diagnostic.code == "GROBID_TEXT_INSUFFICIENT"
         for diagnostic in result.diagnostics
@@ -2629,6 +3256,16 @@ async def test_alignment_failure_is_explicit_and_makes_result_partial(tmp_path) 
         == ["docling_document", "grobid_tei"]
         for run in result.processing_runs
     )
+    canonical_run = next(
+        run
+        for run in result.processing_runs
+        if run.component_id == "canonical-document-view"
+    )
+    assert [product.name for product in canonical_run.inputs] == [
+        "docling_document",
+        "content_spans",
+        "content_integrity_overlay",
+    ]
     assert any(
         diagnostic.code == "DOCLING_GROBID_ALIGNER_FAILED"
         for diagnostic in result.diagnostics
@@ -2665,6 +3302,16 @@ async def test_jats_unaligned_locators_are_persisted_and_diagnosed(tmp_path) -> 
         if run.component_id == "jats-locator-adapter"
     )
     assert docling_run.inputs == (adapter_run.require_output("native_locator_overlay"),)
+    canonical_run = next(
+        run
+        for run in result.processing_runs
+        if run.component_id == "canonical-document-view"
+    )
+    assert [product.name for product in canonical_run.inputs] == [
+        "docling_document",
+        "content_spans",
+        "content_integrity_overlay",
+    ]
     assert any(
         diagnostic.code == "JATS_LOCATORS_UNALIGNED"
         for diagnostic in result.diagnostics
@@ -2811,6 +3458,16 @@ async def test_bioc_pipeline_persists_native_content_spans(tmp_path) -> None:
     }
     assert spans[1]["source_locator"]["document_index"] == 1
     assert spans[1]["source_locator"]["length"] == len(second_passage.text)
+    canonical_run = next(
+        run
+        for run in result.processing_runs
+        if run.component_id == "canonical-document-view"
+    )
+    assert [product.name for product in canonical_run.inputs] == [
+        "docling_document",
+        "content_spans",
+        "content_integrity_overlay",
+    ]
 
     resumed = await processor.process_artifact(artifact.artifact_id)
 

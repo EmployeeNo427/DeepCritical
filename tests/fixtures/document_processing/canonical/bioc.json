@@ -1,8 +1,8 @@
 {
   "schema_version": "deepcritical-canonical-document-view-v1",
   "metadata_title": "APOE4 pathway",
-  "block_kinds": ["group", "title", "section", "paragraph", "citation", "reference", "table", "figure", "formula", "caption", "caption"],
-  "root_kinds": ["group", "table", "figure", "formula", "caption", "caption"],
+  "block_kinds": ["group", "title", "section", "paragraph", "citation", "reference", "table", "caption", "figure", "caption", "formula"],
+  "root_kinds": ["group", "table", "figure", "formula"],
   "relationship_kinds": ["has_caption", "has_caption", "cites"],
   "relationship_statuses": ["resolved", "resolved", "resolved"],
   "source_locator_kinds": ["bioc"],

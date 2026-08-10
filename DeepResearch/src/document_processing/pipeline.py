@@ -2409,42 +2409,53 @@ class DocumentProcessor:
     def _run_canonicalization(
         self,
         artifact: DocumentArtifact,
-        docling_stage: _DoclingStage,
+        docling_run: ProcessingRun,
         *,
         selected_grobid_run: ProcessingRun | None,
-        scholarly_overlay: ScholarlyAlignmentOverlay | None,
         scholarly_alignment_product: DataProductRef | None,
         integrity_run: ProcessingRun,
         configuration: CanonicalizationConfig,
     ) -> tuple[ProcessingRun, CanonicalDocumentView] | None:
-        """Persist a project-owned view without mutating parser-native products."""
+        """Build a project-owned view exclusively from verified durable products."""
 
-        docling_product = docling_stage.run.require_output("docling_document")
-        content_spans_product = docling_stage.run.require_output("content_spans")
-        integrity_product = integrity_run.require_output("content_integrity_overlay")
-        inputs: list[DataProductRef] = [docling_product, content_spans_product]
-        for name in (
-            "native_locator_overlay",
-            "jats_locator_alignment",
-            "bioc_locator_alignment",
-        ):
-            product = docling_stage.run.output(name)
-            if product is not None:
-                inputs.append(product)
-        if selected_grobid_run is not None:
-            grobid_product = selected_grobid_run.output("grobid_tei")
-            if grobid_product is not None:
-                inputs.append(grobid_product)
-        if scholarly_alignment_product is not None:
-            inputs.append(scholarly_alignment_product)
-        inputs.append(integrity_product)
-        unique_inputs = tuple(
-            {product.product_id: product for product in inputs}.values()
-        )
-        invocation_configuration = {
+        invocation_configuration: dict[str, Any] = {
             "adapter_version": "1",
             "policy": configuration.model_dump(mode="json"),
-            "input_products": [
+            "input_products": [],
+        }
+        started = utc_now()
+        started_clock = time.perf_counter()
+        verified_inputs: list[DataProductRef] = []
+        try:
+            docling_product = docling_run.require_output("docling_document")
+            content_spans_product = docling_run.require_output("content_spans")
+            integrity_product = integrity_run.require_output(
+                "content_integrity_overlay"
+            )
+            inputs: list[DataProductRef] = [docling_product, content_spans_product]
+            alignment_edge: (
+                tuple[
+                    DataProductRef,
+                    tuple[DataProductRef, DataProductRef],
+                ]
+                | None
+            ) = None
+            if scholarly_alignment_product is not None:
+                if selected_grobid_run is None:
+                    raise ValueError(
+                        "a scholarly alignment requires its selected GROBID run"
+                    )
+                grobid_product = selected_grobid_run.require_output("grobid_tei")
+                inputs.extend((grobid_product, scholarly_alignment_product))
+                alignment_edge = (
+                    scholarly_alignment_product,
+                    (docling_product, grobid_product),
+                )
+            inputs.append(integrity_product)
+            unique_inputs = tuple(
+                {product.product_id: product for product in inputs}.values()
+            )
+            invocation_configuration["input_products"] = [
                 {
                     "name": product.name,
                     "product_id": product.product_id,
@@ -2452,37 +2463,106 @@ class DocumentProcessor:
                     "payload_schema_version": product.payload_schema_version,
                 }
                 for product in unique_inputs
-            ],
-        }
-        reusable = self._reusable_run(
-            artifact,
-            "canonical-document-view",
-            invocation_configuration,
-        )
-        if (
-            reusable is not None
-            and reusable.output("canonical_document_view") is not None
-        ):
-            self._reconcile_run_diagnostics(artifact, reusable)
-            view = self.store.read_canonical_document(
-                reusable.require_output("canonical_document_view")
-            )
-            return reusable, view
+            ]
 
-        started = utc_now()
-        started_clock = time.perf_counter()
-        try:
+            persisted_inputs: dict[str, bytes] = {}
+            for product in unique_inputs:
+                persisted_inputs[product.product_id] = (
+                    self.store.read_data_product_bytes(product)
+                )
+                verified_inputs.append(product)
+
+            if alignment_edge is not None:
+                alignment_product, expected_alignment_inputs = alignment_edge
+                alignment_run = self.store.get_processing_run(
+                    alignment_product.producer_run_id
+                )
+                if alignment_run.inputs != expected_alignment_inputs:
+                    raise ValueError(
+                        "scholarly alignment producer inputs must exactly match "
+                        "the current Docling and GROBID products"
+                    )
+
+            durable_integrity_run = self.store.get_processing_run(
+                integrity_product.producer_run_id
+            )
+            expected_integrity_inputs = (docling_product,) + (
+                (scholarly_alignment_product,)
+                if scholarly_alignment_product is not None
+                else ()
+            )
+            if durable_integrity_run.inputs != expected_integrity_inputs:
+                raise ValueError(
+                    "content-integrity producer inputs must exactly match the "
+                    "current Docling and optional scholarly alignment products"
+                )
+
+            docling_payload = json.loads(persisted_inputs[docling_product.product_id])
+            if not isinstance(docling_payload, dict):
+                raise ValueError("Docling product must contain an object")
             span_set = ContentSpanSet.model_validate_json(
-                self.store.read_blob(content_spans_product.blob_sha256)
+                persisted_inputs[content_spans_product.product_id]
             )
             integrity_payload = json.loads(
-                self.store.read_blob(integrity_product.blob_sha256)
+                persisted_inputs[integrity_product.product_id]
             )
             if not isinstance(integrity_payload, dict):
                 raise ValueError("content-integrity product must contain an object")
+            durable_docling_sha256 = sha256_bytes(
+                persisted_inputs[docling_product.product_id]
+            )
+            if integrity_payload.get("document_sha256") != durable_docling_sha256:
+                raise ValueError(
+                    "content-integrity document hash must match the durable "
+                    "Docling product"
+                )
+            expected_scholarly_overlay = scholarly_alignment_product is not None
+            if (
+                integrity_payload.get("scholarly_overlay_present")
+                is not expected_scholarly_overlay
+            ):
+                raise ValueError(
+                    "content-integrity scholarly overlay presence must match "
+                    "canonical source products"
+                )
+            scholarly_overlay = None
+            if scholarly_alignment_product is not None:
+                alignment_payload = json.loads(
+                    persisted_inputs[scholarly_alignment_product.product_id]
+                )
+                if not isinstance(alignment_payload, dict):
+                    raise ValueError(
+                        "scholarly alignment product must contain an object"
+                    )
+                scholarly_overlay = ScholarlyAlignmentOverlay.from_dict(
+                    alignment_payload
+                )
+
+            reusable = self._reusable_run(
+                artifact,
+                "canonical-document-view",
+                invocation_configuration,
+            )
+            if (
+                reusable is not None
+                and reusable.output("canonical_document_view") is not None
+            ):
+                self._reconcile_run_diagnostics(artifact, reusable)
+                view = self.store.read_canonical_document(
+                    reusable.require_output("canonical_document_view")
+                )
+                if (
+                    reusable.inputs != unique_inputs
+                    or view.source_products != unique_inputs
+                ):
+                    raise ValueError(
+                        "reused canonical source products must exactly match run inputs"
+                    )
+                return reusable, view
+
             view = build_canonical_document_view(
                 artifact=artifact,
-                docling_document=docling_stage.document,
+                docling_document=docling_payload,
                 docling_product=docling_product,
                 content_span_set=span_set,
                 source_products=unique_inputs,
@@ -2490,6 +2570,10 @@ class DocumentProcessor:
                 scholarly_overlay=scholarly_overlay,
                 integrity_report=integrity_payload,
             )
+            if view.source_products != unique_inputs:
+                raise ValueError(
+                    "canonical view source products must exactly match run inputs"
+                )
             view_blob = self.store.put_canonical_document(view)
             run_id = _run_id()
             has_errors = any(
@@ -2518,7 +2602,7 @@ class DocumentProcessor:
                 warnings=tuple(
                     dict.fromkeys(diagnostic.code for diagnostic in view.diagnostics)
                 ),
-                inputs=unique_inputs,
+                inputs=view.source_products,
                 outputs=self.store.data_product_refs(
                     {"canonical_document_view": view_blob.sha256},
                     producer_run_id=run_id,
@@ -2545,7 +2629,7 @@ class DocumentProcessor:
                 started_at=started,
                 started_clock=started_clock,
                 error=exc,
-                inputs=unique_inputs,
+                inputs=tuple(verified_inputs),
             )
             return None
 

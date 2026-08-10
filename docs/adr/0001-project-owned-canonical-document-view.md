@@ -31,8 +31,11 @@ creates an immutable `canonical_document_view` product containing:
   content hash;
 - exact anchors to immutable parser-native products, including character ranges
   and PDF, JATS, or BioC source locators where available;
-- normalized tables and source-level metadata;
-- resolved, partial, or unresolved caption and citation relationships; and
+- normalized tables whose authoritative structured cells retain coordinates,
+  spans, header/section flags, fillable state, and rich-cell references, plus
+  source-level metadata;
+- caption and citation relationships whose `resolved`, `partial`, or
+  `unresolved` status is derived from their immutable mapping evidence; and
 - stable mapping diagnostics whenever native structure cannot be represented
   without ambiguity.
 
@@ -41,7 +44,12 @@ Version 1 accepts only the persisted normalization policy
 `source-spans-and-native-nodes-v1`. Unknown fields and policy names fail
 configuration validation. Loaders dispatch on `schema_version` before model
 validation, and every block, relationship, diagnostic, and complete view
-revalidates its content-derived identity.
+revalidates its content-derived identity. Parent and child declarations from
+all native node collections are reconciled into one ordered hierarchy;
+conflicting declarations, cycles, and missing nodes produce diagnostics.
+Immutable tuples and read-only metadata mappings protect nested state, and the
+store rebuilds the complete model immediately before deterministic
+serialization so unvalidated copies or stale identities cannot become durable.
 
 Native products remain immutable after the canonical view is introduced.
 `docling_document` remains a native Docling product rather than being relabelled
@@ -62,7 +70,10 @@ Downstream code must use adapters when it needs a processor-independent view,
 while audit and debugging code can retain full access to native representations.
 The compiled reference pipeline now includes this explicit conversion stage and
 records its non-empty normalization and anchoring configuration in pipeline and
-output-policy provenance. A mapping gap produces inspectable diagnostics rather
-than an invented coordinate. This adds one durable product and processing run,
-but avoids a repository-wide migration whenever Docling or another processor
-changes its native schema.
+output-policy provenance. The stage reconstructs the view exclusively from
+persisted inputs after verifying each product's CAS bytes, source-artifact
+lineage, and exact declaration on its durable producer run; its recorded inputs
+must exactly equal the view's `source_products`. A mapping gap produces
+inspectable diagnostics rather than an invented coordinate. This adds one
+durable product and processing run, but avoids a repository-wide migration
+whenever Docling or another processor changes its native schema.

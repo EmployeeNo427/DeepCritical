@@ -67,9 +67,11 @@ count as observed runtime identity.
    and figure and every GROBID bibliographic citation. Caption/citation targets
    must resolve to existing Docling items or remain explicitly unaligned.
 9. Build and persist a versioned project-owned `CanonicalDocumentView` from the
-   immutable native products, spans, alignment, and integrity report. Every
-   canonical block retains exact native anchors; mapping gaps remain explicit
-   diagnostics.
+   immutable native products, spans, alignment, and integrity report. The stage
+   re-reads every input from content-addressed storage, verifies the complete
+   `DataProductRef` and producer declaration, and records that exact input tuple
+   as `source_products`. Every canonical block retains exact native anchors;
+   mapping gaps remain explicit diagnostics.
 10. Treat every supplement as its own artifact, linked to its parent and routed
    according to its detected media type.
 
@@ -86,14 +88,29 @@ range. The project-owned `CanonicalDocumentView` described in
 immutable `canonical_document_view` product derived by a deterministic native
 adapter.
 
-Canonical schema v1 preserves document order and hierarchy, normalized text and
-tables, stable content-derived block IDs, source-level metadata, and explicit
-caption/citation relationships. Anchors target immutable native product IDs and
-nodes, with character ranges and PDF, JATS, or BioC locators where available.
-Relationships may be `resolved`, `partial`, or `unresolved`; ambiguous or
-missing mappings are retained as stable diagnostics. The loader dispatches on
-the descriptive schema version before validating hashes, identities, graph
-links, and product references.
+Canonical schema v1 preserves document order and reconciles parent and child
+declarations across all native node collections. Conflicts, cycles, and missing
+nodes become stable diagnostics rather than silently flattening the hierarchy.
+Normalized tables use Docling's structured `table_cells` as the authoritative
+source when present and retain cell coordinates, row and column spans, header
+and section flags, fillable state, and rich-cell references; the scalar grid is
+only a compatibility fallback. Stable content-derived block IDs, source-level
+metadata, and explicit caption/citation relationships complete the structure.
+
+Anchors target immutable native product IDs and nodes, with character ranges
+and PDF, JATS, or BioC locators where available. Relationship status is derived
+from the resolved source, resolved targets, unresolved target references, and
+reason codes; it cannot be persisted inconsistently with that evidence. A
+relationship's evidence and derived status also participate in its
+content-derived identity. Ambiguous or missing mappings remain stable
+diagnostics.
+
+Canonical models use immutable tuples and read-only metadata mappings. The
+store rebuilds and fully revalidates the view immediately before deterministic
+serialization, and loading dispatches on the descriptive schema version before
+revalidating hashes, identities, graph links, anchors, relationships, and
+product references. This closes shallow-copy and nested-mutation paths that
+could otherwise persist stale identities.
 
 The canonical view contains document structure only. Scientific labels must be
 stored in separate immutable `AnnotationSet` products targeting an exact
@@ -103,10 +120,13 @@ part of canonical document identity.
 Durable records use descriptive `schema_version` values and every stage output
 is a typed `DataProductRef`. A product reference carries its content hash, CAS
 URI, byte size, media and payload schema, producer run, and source-artifact
-lineage. Record loading dispatches on the schema version before model
-validation. Stores containing the old unversioned `records/parser_runs`
-prototype layout are rejected explicitly rather than guessed into the new
-contract.
+lineage. Reading a stage input verifies that reference against the CAS bytes,
+the durable source-artifact records, and an exact output declaration on the
+durable producer run. A valid-looking or hash-correct reference alone is not
+sufficient provenance. Record loading dispatches on the schema version before
+model validation. Stores containing the old unversioned
+`records/parser_runs` prototype layout are rejected explicitly rather than
+guessed into the new contract.
 
 The current configuration schema is
 `deepcritical-document-processing-config-v2`, and its default is in

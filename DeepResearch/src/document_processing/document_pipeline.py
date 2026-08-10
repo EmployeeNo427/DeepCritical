@@ -782,11 +782,8 @@ class _DocumentStagePlugins:
         routed = scholarly.parsed.prepared.routed
         canonicalized = self.processor._run_canonicalization(
             routed.artifact,
-            scholarly.parsed.docling_stage,
+            scholarly.parsed.docling_stage.run,
             selected_grobid_run=scholarly.selected_grobid_run,
-            scholarly_overlay=(
-                integrity.alignment.overlay if integrity.alignment is not None else None
-            ),
             scholarly_alignment_product=(
                 integrity.alignment.run.output("alignment_overlay")
                 if integrity.alignment is not None
@@ -809,7 +806,11 @@ class _DocumentStagePlugins:
             )
         run, view = canonicalized
         return StageResult(
-            status=StageExecutionStatus.COMPLETE,
+            status=(
+                StageExecutionStatus.PARTIAL
+                if run.status is ProcessingRunStatus.PARTIAL
+                else StageExecutionStatus.COMPLETE
+            ),
             outputs={
                 "outcome": _CanonicalOutcome(
                     integrity=integrity,

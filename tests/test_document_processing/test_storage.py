@@ -9,10 +9,24 @@ import pytest
 from pydantic import ValidationError
 
 from DeepResearch.src.document_processing import storage as storage_module
+from DeepResearch.src.document_processing.canonical import (
+    CANONICAL_ANCHORING_POLICY,
+    CANONICAL_TEXT_NORMALIZATION,
+    CanonicalAnchorRole,
+    CanonicalBlock,
+    CanonicalBlockKind,
+    CanonicalDocumentMetadata,
+    CanonicalDocumentView,
+    CanonicalSourceAnchor,
+    canonical_block_content_sha256,
+    canonical_block_id,
+    canonical_view_id,
+)
 from DeepResearch.src.document_processing.models import (
     ArtifactLocationRole,
     ArtifactRelationship,
     ComponentDescriptor,
+    DataProductRef,
     DiagnosticSeverity,
     DocumentArtifact,
     ExecutionCheckpoint,
@@ -30,6 +44,7 @@ from DeepResearch.src.document_processing.storage import (
     HashMismatchError,
     RecordConflictError,
     RecordNotFoundError,
+    StorageError,
     UnsupportedSchemaVersionError,
 )
 
@@ -70,11 +85,24 @@ def make_run(
     status: ProcessingRunStatus,
     *,
     minute: int = 0,
+    inputs: tuple[DataProductRef, ...] = (),
     outputs: dict[str, str] | None = None,
     output_policy_snapshot: dict[str, object] | None = None,
 ) -> ProcessingRun:
     config = {"do_ocr": True}
     started_at = datetime(2026, 7, 17, 12, minute, tzinfo=UTC)
+    source_artifact_ids = tuple(
+        dict.fromkeys(
+            (
+                artifact_id,
+                *(
+                    source_artifact_id
+                    for product in inputs
+                    for source_artifact_id in product.source_artifact_ids
+                ),
+            )
+        )
+    )
     product_refs = tuple(
         build_data_product_ref(
             name=name,
@@ -86,7 +114,7 @@ def make_run(
                 else 0
             ),
             producer_run_id=run_id,
-            source_artifact_ids=(artifact_id,),
+            source_artifact_ids=source_artifact_ids,
         )
         for name, digest in (outputs or {}).items()
     )
@@ -110,8 +138,142 @@ def make_run(
         started_at=started_at,
         finished_at=started_at + timedelta(seconds=2),
         status=status,
+        inputs=inputs,
         outputs=product_refs,
     )
+
+
+def make_canonical_view(
+    *,
+    source_artifact_id: str = "canonical-source",
+    source_sha256: str = "a" * 64,
+    source_products: tuple[DataProductRef, DataProductRef] | None = None,
+) -> CanonicalDocumentView:
+    """Build the smallest valid canonical view for persistence tests."""
+
+    if source_products is None:
+        docling_product = build_data_product_ref(
+            name="docling_document",
+            blob_sha256="b" * 64,
+            uri=f"cas://sha256/{'b' * 64}",
+            byte_size=10,
+            producer_run_id="docling-canonical",
+            source_artifact_ids=(source_artifact_id,),
+        )
+        spans_product = build_data_product_ref(
+            name="content_spans",
+            blob_sha256="c" * 64,
+            uri=f"cas://sha256/{'c' * 64}",
+            byte_size=10,
+            producer_run_id="docling-canonical",
+            source_artifact_ids=(source_artifact_id,),
+        )
+    else:
+        docling_product, spans_product = source_products
+    content_sha256 = canonical_block_content_sha256(
+        kind=CanonicalBlockKind.PARAGRAPH,
+        text="Canonical content",
+        table=None,
+    )
+    block = CanonicalBlock(
+        block_id=canonical_block_id(
+            native_node_id="#/texts/0",
+            kind=CanonicalBlockKind.PARAGRAPH,
+            content_sha256=content_sha256,
+        ),
+        native_node_id="#/texts/0",
+        native_label="paragraph",
+        kind=CanonicalBlockKind.PARAGRAPH,
+        ordinal=0,
+        text="Canonical content",
+        content_sha256=content_sha256,
+        source_anchors=(
+            CanonicalSourceAnchor(
+                role=CanonicalAnchorRole.PRIMARY,
+                product_id=docling_product.product_id,
+                node_id="#/texts/0",
+            ),
+        ),
+    )
+    payload = {
+        "schema_version": "deepcritical-canonical-document-view-v1",
+        "view_id": "pending",
+        "artifact_id": source_artifact_id,
+        "source_sha256": source_sha256,
+        "normalization_policy": CANONICAL_TEXT_NORMALIZATION,
+        "anchoring_policy": CANONICAL_ANCHORING_POLICY,
+        "metadata": CanonicalDocumentMetadata(
+            title="Canonical persistence",
+            media_type="application/pdf",
+            identifiers={"pmc": "PMC-CANONICAL"},
+        ).model_dump(mode="json"),
+        "source_products": [
+            docling_product.model_dump(mode="json"),
+            spans_product.model_dump(mode="json"),
+        ],
+        "root_block_ids": [block.block_id],
+        "blocks": [block.model_dump(mode="json")],
+        "relationships": [],
+        "diagnostics": [],
+    }
+    payload["view_id"] = canonical_view_id(payload)
+    return CanonicalDocumentView.model_validate(payload)
+
+
+def make_durable_canonical_view(
+    store: ContentAddressedStore,
+    artifact: DocumentArtifact,
+) -> tuple[CanonicalDocumentView, ProcessingRun]:
+    """Persist both source products used by one canonical test view."""
+
+    docling_blob = store.put_blob(b'{"docling": "canonical source"}')
+    spans_blob = store.put_blob(b'{"spans": []}')
+    source_run = make_run(
+        store,
+        artifact.artifact_id,
+        f"{artifact.artifact_id}-canonical-source-run",
+        ProcessingRunStatus.COMPLETE,
+        outputs={
+            "docling_document": docling_blob.sha256,
+            "content_spans": spans_blob.sha256,
+        },
+    )
+    store.save_processing_run(source_run)
+    source_products = (
+        source_run.require_output("docling_document"),
+        source_run.require_output("content_spans"),
+    )
+    return (
+        make_canonical_view(
+            source_artifact_id=artifact.artifact_id,
+            source_sha256=artifact.source_sha256,
+            source_products=source_products,
+        ),
+        source_run,
+    )
+
+
+def save_canonical_view_product(
+    store: ContentAddressedStore,
+    artifact: DocumentArtifact,
+    view: CanonicalDocumentView,
+    *,
+    inputs: tuple[DataProductRef, ...] | None = None,
+    run_id: str = "canonical-view-run",
+) -> tuple[ProcessingRun, DataProductRef]:
+    """Persist a canonical view and its producer record with durable inputs."""
+
+    blob = store.put_canonical_document(view)
+    producer = make_run(
+        store,
+        artifact.artifact_id,
+        run_id,
+        ProcessingRunStatus.COMPLETE,
+        inputs=view.source_products if inputs is None else inputs,
+        outputs={"canonical_document_view": blob.sha256},
+    )
+    store.save_processing_run(producer)
+    return producer, producer.require_output("canonical_document_view")
 
 
 def test_blob_write_is_content_addressed_verified_and_idempotent(
@@ -195,6 +357,537 @@ def test_streaming_blob_limit_never_publishes_oversized_content(
 def test_missing_blob_is_explicit(store: ContentAddressedStore) -> None:
     with pytest.raises(BlobNotFoundError, match="blob not found"):
         store.read_blob("f" * 64)
+
+
+def test_verified_data_product_reader_returns_exact_declared_bytes(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "verified-product")
+    blob = store.put_blob(b'{"document": "verified"}')
+    producer = make_run(
+        store,
+        artifact.artifact_id,
+        "verified-product-run",
+        ProcessingRunStatus.COMPLETE,
+        outputs={"docling_document": blob.sha256},
+    )
+    store.save_processing_run(producer)
+
+    assert (
+        store.read_data_product_bytes(producer.require_output("docling_document"))
+        == b'{"document": "verified"}'
+    )
+
+
+def test_output_lineage_deduplicates_inherited_artifacts_in_stable_order(
+    store: ContentAddressedStore,
+) -> None:
+    main = save_artifact(store, "deduplicated-main")
+    inherited = save_artifact(store, "deduplicated-inherited")
+    main_source_blob = store.put_blob(b"main source product")
+    main_source_run = make_run(
+        store,
+        main.artifact_id,
+        "deduplicated-main-source-run",
+        ProcessingRunStatus.COMPLETE,
+        outputs={"docling_document": main_source_blob.sha256},
+    )
+    store.save_processing_run(main_source_run)
+    inherited_blob = store.put_blob(b"inherited product")
+    inherited_run = make_run(
+        store,
+        inherited.artifact_id,
+        "deduplicated-inherited-run",
+        ProcessingRunStatus.COMPLETE,
+        inputs=(main_source_run.require_output("docling_document"),),
+        outputs={"content_spans": inherited_blob.sha256},
+    )
+    store.save_processing_run(inherited_run)
+    final_blob = store.put_blob(b"deduplicated final product")
+    final_run = make_run(
+        store,
+        main.artifact_id,
+        "deduplicated-final-run",
+        ProcessingRunStatus.COMPLETE,
+        inputs=(inherited_run.require_output("content_spans"),),
+        outputs={"content_integrity_overlay": final_blob.sha256},
+    )
+    store.save_processing_run(final_run)
+    final_product = final_run.require_output("content_integrity_overlay")
+
+    assert inherited_run.outputs[0].source_artifact_ids == (
+        inherited.artifact_id,
+        main.artifact_id,
+    )
+    assert final_product.source_artifact_ids == (
+        main.artifact_id,
+        inherited.artifact_id,
+    )
+    assert store.read_data_product_bytes(final_product) == final_blob.path.read_bytes()
+
+
+def test_transitive_product_verification_rejects_missing_input_producer(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "missing-transitive-producer")
+    source_blob = store.put_blob(b"transitive source")
+    source_run = make_run(
+        store,
+        artifact.artifact_id,
+        "transitive-source-run",
+        ProcessingRunStatus.COMPLETE,
+        outputs={"docling_document": source_blob.sha256},
+    )
+    store.save_processing_run(source_run)
+    output_blob = store.put_blob(b"transitive output")
+    producer = make_run(
+        store,
+        artifact.artifact_id,
+        "transitive-output-run",
+        ProcessingRunStatus.COMPLETE,
+        inputs=(source_run.require_output("docling_document"),),
+        outputs={"content_spans": output_blob.sha256},
+    )
+    producer_path = store.save_processing_run(producer)
+    missing_input = build_data_product_ref(
+        name="docling_document",
+        blob_sha256=source_blob.sha256,
+        uri=source_blob.uri,
+        byte_size=source_blob.byte_size,
+        producer_run_id="missing-input-producer-run",
+        source_artifact_ids=(artifact.artifact_id,),
+    )
+    producer_record = json.loads(producer_path.read_text(encoding="utf-8"))
+    producer_record["inputs"] = [missing_input.model_dump(mode="json")]
+    producer_path.write_text(json.dumps(producer_record), encoding="utf-8")
+    output = producer.require_output("content_spans")
+
+    with pytest.raises(RecordNotFoundError, match="missing-input-producer-run"):
+        store.read_data_product_bytes(output)
+
+    consumer = make_run(
+        store,
+        artifact.artifact_id,
+        "transitive-consumer-run",
+        ProcessingRunStatus.PARTIAL,
+        inputs=(output,),
+    )
+    with pytest.raises(RecordNotFoundError, match="missing-input-producer-run"):
+        store.save_processing_run(consumer)
+
+
+def test_transitive_product_verification_rejects_undeclared_input(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "undeclared-transitive-input")
+    source_blob = store.put_blob(b"declared transitive source")
+    source_run = make_run(
+        store,
+        artifact.artifact_id,
+        "declared-transitive-source-run",
+        ProcessingRunStatus.COMPLETE,
+        outputs={"docling_document": source_blob.sha256},
+    )
+    source_path = store.save_processing_run(source_run)
+    output_blob = store.put_blob(b"dependent transitive output")
+    producer = make_run(
+        store,
+        artifact.artifact_id,
+        "dependent-transitive-run",
+        ProcessingRunStatus.COMPLETE,
+        inputs=(source_run.require_output("docling_document"),),
+        outputs={"content_spans": output_blob.sha256},
+    )
+    store.save_processing_run(producer)
+    source_record = json.loads(source_path.read_text(encoding="utf-8"))
+    source_record["outputs"] = []
+    source_path.write_text(json.dumps(source_record), encoding="utf-8")
+
+    with pytest.raises(RecordConflictError, match="is not declared"):
+        store.read_data_product_bytes(producer.require_output("content_spans"))
+
+
+def test_transitive_product_verification_rejects_cycles_without_recursion(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "cyclic-transitive-inputs")
+    first_blob = store.put_blob(b"first cyclic output")
+    first_run = make_run(
+        store,
+        artifact.artifact_id,
+        "first-cyclic-run",
+        ProcessingRunStatus.COMPLETE,
+        outputs={"docling_document": first_blob.sha256},
+    )
+    first_path = store.save_processing_run(first_run)
+    second_blob = store.put_blob(b"second cyclic output")
+    second_run = make_run(
+        store,
+        artifact.artifact_id,
+        "second-cyclic-run",
+        ProcessingRunStatus.COMPLETE,
+        outputs={"content_spans": second_blob.sha256},
+    )
+    second_path = store.save_processing_run(second_run)
+    first_record = json.loads(first_path.read_text(encoding="utf-8"))
+    first_record["inputs"] = [
+        second_run.require_output("content_spans").model_dump(mode="json")
+    ]
+    first_path.write_text(json.dumps(first_record), encoding="utf-8")
+    second_record = json.loads(second_path.read_text(encoding="utf-8"))
+    second_record["inputs"] = [
+        first_run.require_output("docling_document").model_dump(mode="json")
+    ]
+    second_path.write_text(json.dumps(second_record), encoding="utf-8")
+
+    with pytest.raises(RecordConflictError, match="provenance contains a cycle"):
+        store.read_data_product_bytes(first_run.require_output("docling_document"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error_type", "message"),
+    [
+        (
+            "uri",
+            f"cas://sha256/{'f' * 64}",
+            HashMismatchError,
+            "URI does not match",
+        ),
+        ("byte_size", 999, HashMismatchError, "size does not match"),
+        (
+            "media_type",
+            "text/plain",
+            RecordConflictError,
+            "registered contract",
+        ),
+        (
+            "blob_sha256",
+            "not-a-sha256",
+            RecordConflictError,
+            "reference is invalid",
+        ),
+    ],
+)
+def test_verified_data_product_reader_rejects_invalid_reference_fields(
+    store: ContentAddressedStore,
+    field: str,
+    value: object,
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    artifact = save_artifact(store, f"invalid-{field}")
+    blob = store.put_blob(b"declared bytes")
+    producer = make_run(
+        store,
+        artifact.artifact_id,
+        f"invalid-{field}-run",
+        ProcessingRunStatus.COMPLETE,
+        outputs={"docling_document": blob.sha256},
+    )
+    store.save_processing_run(producer)
+    invalid = producer.require_output("docling_document").model_copy(
+        update={field: value}
+    )
+
+    with pytest.raises(error_type, match=message):
+        store.read_data_product_bytes(invalid)
+
+
+def test_verified_data_product_reader_detects_blob_hash_corruption(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "corrupt-product")
+    blob = store.put_blob(b"original product bytes")
+    producer = make_run(
+        store,
+        artifact.artifact_id,
+        "corrupt-product-run",
+        ProcessingRunStatus.COMPLETE,
+        outputs={"docling_document": blob.sha256},
+    )
+    store.save_processing_run(producer)
+    blob.path.write_bytes(b"corrupted product bytes")
+
+    with pytest.raises(HashMismatchError, match="hashes to"):
+        store.read_data_product_bytes(producer.require_output("docling_document"))
+
+
+def test_verified_data_product_reader_requires_artifact_and_producer_lineage(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "product-lineage")
+    other_artifact = save_artifact(store, "other-product-lineage")
+    blob = store.put_blob(b"lineage product")
+    producer = make_run(
+        store,
+        artifact.artifact_id,
+        "product-lineage-run",
+        ProcessingRunStatus.COMPLETE,
+        outputs={"docling_document": blob.sha256},
+    )
+    store.save_processing_run(producer)
+
+    missing_artifact = build_data_product_ref(
+        name="docling_document",
+        blob_sha256=blob.sha256,
+        uri=blob.uri,
+        byte_size=blob.byte_size,
+        producer_run_id=producer.run_id,
+        source_artifact_ids=("missing-lineage-artifact",),
+    )
+    with pytest.raises(RecordNotFoundError, match="missing-lineage-artifact"):
+        store.read_data_product_bytes(missing_artifact)
+
+    missing_producer = build_data_product_ref(
+        name="docling_document",
+        blob_sha256=blob.sha256,
+        uri=blob.uri,
+        byte_size=blob.byte_size,
+        producer_run_id="missing-product-run",
+        source_artifact_ids=(artifact.artifact_id,),
+    )
+    with pytest.raises(RecordNotFoundError, match="missing-product-run"):
+        store.read_data_product_bytes(missing_producer)
+
+    wrong_artifact = build_data_product_ref(
+        name="docling_document",
+        blob_sha256=blob.sha256,
+        uri=blob.uri,
+        byte_size=blob.byte_size,
+        producer_run_id=producer.run_id,
+        source_artifact_ids=(other_artifact.artifact_id,),
+    )
+    with pytest.raises(RecordConflictError, match="lineage must exactly equal"):
+        store.read_data_product_bytes(wrong_artifact)
+
+
+@pytest.mark.parametrize(
+    "invalid_lineage",
+    [
+        ("lineage-main",),
+        ("lineage-main", "lineage-source", "lineage-extra"),
+        ("lineage-source", "lineage-main"),
+    ],
+    ids=("missing-inherited", "extra", "wrong-order"),
+)
+def test_processing_run_save_requires_exact_ordered_inherited_output_lineage(
+    store: ContentAddressedStore,
+    invalid_lineage: tuple[str, ...],
+) -> None:
+    main = save_artifact(store, "lineage-main")
+    source = save_artifact(store, "lineage-source")
+    save_artifact(store, "lineage-extra")
+    source_blob = store.put_blob(b"inherited source product")
+    source_run = make_run(
+        store,
+        source.artifact_id,
+        "lineage-source-run",
+        ProcessingRunStatus.COMPLETE,
+        outputs={"content_spans": source_blob.sha256},
+    )
+    store.save_processing_run(source_run)
+    output_blob = store.put_blob(b"product with inherited lineage")
+    valid_run = make_run(
+        store,
+        main.artifact_id,
+        "lineage-main-run",
+        ProcessingRunStatus.COMPLETE,
+        inputs=(source_run.require_output("content_spans"),),
+        outputs={"docling_document": output_blob.sha256},
+    )
+    invalid_output = valid_run.require_output("docling_document").model_copy(
+        update={"source_artifact_ids": invalid_lineage}
+    )
+
+    with pytest.raises(RecordConflictError, match="lineage must exactly equal"):
+        store.save_processing_run(
+            valid_run.model_copy(update={"outputs": (invalid_output,)})
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_lineage",
+    [
+        ("read-lineage-main",),
+        ("read-lineage-main", "read-lineage-source", "read-lineage-extra"),
+    ],
+    ids=("missing-inherited", "extra"),
+)
+def test_verified_reader_rejects_corrupt_durable_inherited_lineage(
+    store: ContentAddressedStore,
+    invalid_lineage: tuple[str, ...],
+) -> None:
+    main = save_artifact(store, "read-lineage-main")
+    source = save_artifact(store, "read-lineage-source")
+    save_artifact(store, "read-lineage-extra")
+    source_blob = store.put_blob(b"durable inherited source")
+    source_run = make_run(
+        store,
+        source.artifact_id,
+        "read-lineage-source-run",
+        ProcessingRunStatus.COMPLETE,
+        outputs={"content_spans": source_blob.sha256},
+    )
+    store.save_processing_run(source_run)
+    output_blob = store.put_blob(b"durable inherited output")
+    producer = make_run(
+        store,
+        main.artifact_id,
+        "read-lineage-main-run",
+        ProcessingRunStatus.COMPLETE,
+        inputs=(source_run.require_output("content_spans"),),
+        outputs={"docling_document": output_blob.sha256},
+    )
+    record_path = store.save_processing_run(producer)
+    invalid_output = producer.require_output("docling_document").model_copy(
+        update={"source_artifact_ids": invalid_lineage}
+    )
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["outputs"] = [invalid_output.model_dump(mode="json")]
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(RecordConflictError, match="lineage must exactly equal"):
+        store.read_data_product_bytes(invalid_output)
+
+
+def test_verified_data_product_reader_requires_exact_output_declaration(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "undeclared-product")
+    blob = store.put_blob(b"declared under a different product name")
+    producer = make_run(
+        store,
+        artifact.artifact_id,
+        "undeclared-product-run",
+        ProcessingRunStatus.COMPLETE,
+        outputs={"docling_document": blob.sha256},
+    )
+    store.save_processing_run(producer)
+    undeclared = build_data_product_ref(
+        name="content_spans",
+        blob_sha256=blob.sha256,
+        uri=blob.uri,
+        byte_size=blob.byte_size,
+        producer_run_id=producer.run_id,
+        source_artifact_ids=(artifact.artifact_id,),
+    )
+
+    with pytest.raises(RecordConflictError, match="is not declared"):
+        store.read_data_product_bytes(undeclared)
+
+
+def test_canonical_persistence_revalidates_model_copy(
+    store: ContentAddressedStore,
+) -> None:
+    valid = make_canonical_view()
+    invalid = valid.model_copy(update={"root_block_ids": ("missing-block",)})
+
+    with pytest.raises(ValidationError, match="canonical roots"):
+        store.put_canonical_document(invalid)
+    assert not any(
+        path.is_file() for path in (store.root / "blobs" / "sha256").rglob("*")
+    )
+
+
+def test_canonical_persistence_and_verified_read_round_trip(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "canonical-round-trip")
+    view, source_run = make_durable_canonical_view(store, artifact)
+    producer, product = save_canonical_view_product(
+        store,
+        artifact,
+        view,
+        run_id="canonical-round-trip-run",
+    )
+
+    assert producer.inputs == source_run.outputs == view.source_products
+    assert store.read_canonical_document(product) == view
+
+
+def test_canonical_read_requires_exact_producer_inputs(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "canonical-input-mismatch")
+    view, _ = make_durable_canonical_view(store, artifact)
+    _, product = save_canonical_view_product(
+        store,
+        artifact,
+        view,
+        inputs=tuple(reversed(view.source_products)),
+        run_id="canonical-input-mismatch-run",
+    )
+
+    with pytest.raises(RecordConflictError, match="source products do not exactly"):
+        store.read_canonical_document(product)
+
+
+def test_canonical_read_binds_view_to_producer_artifact(
+    store: ContentAddressedStore,
+) -> None:
+    producer_artifact = save_artifact(store, "canonical-producer-artifact")
+    view_artifact = save_artifact(store, "canonical-view-artifact")
+    view, _ = make_durable_canonical_view(store, view_artifact)
+    _, product = save_canonical_view_product(
+        store,
+        producer_artifact,
+        view,
+        run_id="canonical-wrong-artifact-run",
+    )
+
+    with pytest.raises(RecordConflictError, match="artifact does not match"):
+        store.read_canonical_document(product)
+
+
+def test_canonical_read_binds_source_hash_to_producer_artifact(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "canonical-forged-source-hash")
+    _, source_run = make_durable_canonical_view(store, artifact)
+    forged_view = make_canonical_view(
+        source_artifact_id=artifact.artifact_id,
+        source_sha256="f" * 64,
+        source_products=(
+            source_run.require_output("docling_document"),
+            source_run.require_output("content_spans"),
+        ),
+    )
+    _, product = save_canonical_view_product(
+        store,
+        artifact,
+        forged_view,
+        run_id="canonical-forged-source-hash-run",
+    )
+
+    with pytest.raises(RecordConflictError, match="source hash does not match"):
+        store.read_canonical_document(product)
+
+
+@pytest.mark.parametrize("damage", ["corrupt", "missing"])
+def test_canonical_read_fully_verifies_every_embedded_source_product(
+    store: ContentAddressedStore,
+    damage: str,
+) -> None:
+    artifact = save_artifact(store, f"canonical-embedded-{damage}")
+    view, _ = make_durable_canonical_view(store, artifact)
+    _, product = save_canonical_view_product(
+        store,
+        artifact,
+        view,
+        run_id=f"canonical-embedded-{damage}-run",
+    )
+    embedded_path = store.blob_path(view.source_products[-1].blob_sha256)
+    if damage == "corrupt":
+        embedded_path.write_bytes(b"corrupt embedded source")
+        expected_error: type[StorageError] = HashMismatchError
+        message = "hashes to"
+    else:
+        embedded_path.unlink()
+        expected_error = BlobNotFoundError
+        message = "blob not found"
+
+    with pytest.raises(expected_error, match=message):
+        store.read_canonical_document(product)
 
 
 def test_artifact_records_are_idempotent_and_conflicts_never_overwrite(
