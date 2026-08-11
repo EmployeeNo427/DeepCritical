@@ -390,6 +390,7 @@ class StageContext:
     pipeline_id: str
     pipeline_version: str
     pipeline_run_id: str
+    stage_invocation_id: str
     stage_id: str
     inputs: Mapping[str, object]
     prior_results: Mapping[str, StageResult]
@@ -940,11 +941,13 @@ class StageFailure:
     pipeline_id: str
     pipeline_version: str
     pipeline_run_id: str
+    stage_invocation_id: str
     stage_id: str
     component: ComponentDescriptor
     configuration: Mapping[str, Any]
     configuration_sha256: str
     input_identity: Mapping[str, str]
+    stage_inputs: Mapping[str, object]
     exception: Exception
     started_at: datetime
     started_clock: float
@@ -959,6 +962,11 @@ class StageFailure:
             self,
             "input_identity",
             MappingProxyType(dict(self.input_identity)),
+        )
+        object.__setattr__(
+            self,
+            "stage_inputs",
+            MappingProxyType(dict(self.stage_inputs)),
         )
 
 
@@ -1128,7 +1136,8 @@ class PipelineOrchestrator:
                 )
                 continue
             runtime_inputs: dict[str, object] = {}
-            blocked_by_terminal_dependency = False
+            terminal_missing_inputs: list[tuple[str, StageOutputRef]] = []
+            invalid_missing_inputs: list[tuple[str, StageOutputRef]] = []
             for port_name, binding in stage.spec.inputs.items():
                 if isinstance(binding, PipelineInputRef):
                     runtime_inputs[port_name] = inputs[binding.input_name]
@@ -1144,13 +1153,20 @@ class PipelineOrchestrator:
                         StageExecutionStatus.QUARANTINED,
                         StageExecutionStatus.SKIPPED,
                     }:
-                        blocked_by_terminal_dependency = True
-                        break
-                    raise PipelineExecutionError(
-                        f"stage {stage.spec.stage_id!r} required input {port_name!r} "
-                        f"was not produced by {binding.stage_id}.{binding.output_name}"
+                        terminal_missing_inputs.append((port_name, binding))
+                    else:
+                        invalid_missing_inputs.append((port_name, binding))
+            if invalid_missing_inputs:
+                details = "; ".join(
+                    f"required input {port_name!r} was not produced by "
+                    f"{binding.stage_id}.{binding.output_name}"
+                    for port_name, binding in sorted(
+                        invalid_missing_inputs,
+                        key=lambda item: item[0],
                     )
-            if blocked_by_terminal_dependency:
+                )
+                raise PipelineExecutionError(f"stage {stage.spec.stage_id!r} {details}")
+            if terminal_missing_inputs:
                 results[stage.spec.stage_id] = StageResult(
                     status=StageExecutionStatus.SKIPPED
                 )
@@ -1159,6 +1175,7 @@ class PipelineOrchestrator:
                 pipeline_id=pipeline.spec.pipeline_id,
                 pipeline_version=pipeline.spec.pipeline_version,
                 pipeline_run_id=execution_id,
+                stage_invocation_id=f"stage-invocation-{uuid.uuid4()}",
                 stage_id=stage.spec.stage_id,
                 inputs=runtime_inputs,
                 prior_results=results,
@@ -1177,11 +1194,13 @@ class PipelineOrchestrator:
                         pipeline_id=pipeline.spec.pipeline_id,
                         pipeline_version=pipeline.spec.pipeline_version,
                         pipeline_run_id=execution_id,
+                        stage_invocation_id=context.stage_invocation_id,
                         stage_id=stage.spec.stage_id,
                         component=stage.registration.descriptor,
                         configuration=stage.configuration.model_dump(mode="python"),
                         configuration_sha256=stage.configuration_sha256,
                         input_identity=resolved_input_identity,
+                        stage_inputs=runtime_inputs,
                         exception=exc,
                         started_at=started_at,
                         started_clock=started_clock,

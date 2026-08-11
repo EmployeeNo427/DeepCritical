@@ -19,8 +19,10 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     StringConstraints,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -581,6 +583,7 @@ class ProcessingRun(FrozenModel):
     run_id: str
     artifact_id: str
     pipeline_run_id: str | None = None
+    stage_invocation_id: str | None = None
     repetition_group_id: str | None = None
     stage_id: str
     component: ComponentDescriptor
@@ -614,6 +617,7 @@ class ProcessingRun(FrozenModel):
         "run_id",
         "artifact_id",
         "pipeline_run_id",
+        "stage_invocation_id",
         "repetition_group_id",
         "stage_id",
         "component_invocation_id",
@@ -627,6 +631,16 @@ class ProcessingRun(FrozenModel):
         if not normalized:
             raise ValueError("processing run values must not be empty")
         return normalized
+
+    @model_serializer(mode="wrap")
+    def _serialize_processing_run(
+        self,
+        handler: SerializerFunctionWrapHandler,
+    ) -> dict[str, Any]:
+        payload = handler(self)
+        if self.stage_invocation_id is None:
+            payload.pop("stage_invocation_id", None)
+        return payload
 
     @field_validator("started_at", "finished_at")
     @classmethod

@@ -2514,17 +2514,28 @@ class DocumentProcessor:
         from .orchestration import _active_stage_context
 
         stage_context = _active_stage_context()
-        active_stage_id = (
-            stage_context.stage_id
+        active_stage_context = (
+            stage_context
             if stage_context is not None
             and pipeline_context is not None
             and stage_context.pipeline_run_id == pipeline_context.pipeline_run_id
+            else None
+        )
+        active_stage_id = (
+            active_stage_context.stage_id
+            if active_stage_context is not None
             else run.stage_id
+        )
+        active_stage_invocation_id = (
+            active_stage_context.stage_invocation_id
+            if active_stage_context is not None
+            else run.stage_invocation_id
         )
         run_payload.update(
             {
                 "status": committed_status,
                 "stage_id": active_stage_id,
+                "stage_invocation_id": active_stage_invocation_id,
                 "pipeline_run_id": (
                     pipeline_context.pipeline_run_id
                     if pipeline_context is not None
@@ -2738,6 +2749,7 @@ class DocumentProcessor:
         error: Exception,
         component_descriptor: ComponentDescriptor | None = None,
         stage_id: str | None = None,
+        stage_invocation_id: str | None = None,
         container_image: str | None = None,
         container_digest: OciDigest | None = None,
         component_versions: dict[str, str] | None = None,
@@ -2755,12 +2767,18 @@ class DocumentProcessor:
             or stage_id
             or component_id
         )
+        resolved_stage_invocation_id = (
+            active_stage.stage_invocation_id
+            if active_stage is not None
+            else stage_invocation_id
+        )
         memory_measurement = getattr(error, "memory_measurement", None)
         resolved_run_id = run_id or _run_id()
         run = ProcessingRun(
             run_id=resolved_run_id,
             artifact_id=artifact.artifact_id,
             stage_id=resolved_stage_id,
+            stage_invocation_id=resolved_stage_invocation_id,
             component=component_descriptor
             or _component_descriptor(component_id, component_version),
             runtime_identity_required=runtime_identity_required,

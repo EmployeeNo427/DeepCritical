@@ -419,9 +419,13 @@ docker compose -f docker/document-processing/compose.yaml --profile tools run --
 For every processing run, retain ordered typed inputs and outputs, the source
 artifact lineage, exact configuration and policy hashes, component descriptor,
 container image reference and observed image digest, component/model versions,
-timestamps, warnings, resource usage, and transformation lineage. Component
-scratch files and RQ results are staging data only; copy raw outputs to
-content-addressed storage before acknowledging completion.
+timestamps, warnings, resource usage, and transformation lineage. For every
+orchestrated run, also retain the workflow-resume ID and a unique
+stage-invocation ID. The latter correlates one in-memory graph invocation with
+its durable success or failure records; it must not be reused as the
+workflow-resume identity. Component scratch files and RQ results are staging
+data only; copy raw outputs to content-addressed storage before acknowledging
+completion.
 
 The persisted static output policy also records the effective GROBID coordinates
 and consolidation flags, OCR languages/rotation/deskew/jobs/optimization, and

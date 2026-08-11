@@ -215,6 +215,26 @@ def test_artifact_records_are_idempotent_and_conflicts_never_overwrite(
     assert store.get_artifact(artifact.artifact_id) == artifact
 
 
+def test_legacy_processing_run_without_stage_invocation_id_remains_idempotent(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "legacy-stage-invocation")
+    run = make_run(
+        store,
+        artifact.artifact_id,
+        "run-legacy-stage-invocation",
+        ProcessingRunStatus.COMPLETE,
+    )
+
+    record_path = store.save_processing_run(run)
+    payload = json.loads(record_path.read_text(encoding="utf-8"))
+    restored = store.get_processing_run(run.run_id)
+
+    assert "stage_invocation_id" not in payload
+    assert restored.stage_invocation_id is None
+    assert store.save_processing_run(restored) == record_path
+
+
 def test_record_loading_dispatches_schema_versions_before_validation(
     store: ContentAddressedStore,
 ) -> None:
