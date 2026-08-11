@@ -1,0 +1,28 @@
+{
+  "source": "PMC",
+  "date": "20260811",
+  "key": "deepcritical-canonical-v1",
+  "infons": {},
+  "documents": [
+    {
+      "id": "PMC-CANONICAL",
+      "infons": {},
+      "passages": [
+        {"offset": 0, "infons": {"section": "title"}, "text": "APOE4 pathway", "sentences": [], "annotations": [], "relations": []},
+        {"offset": 100, "infons": {"section": "heading"}, "text": "Methods", "sentences": [], "annotations": [], "relations": []},
+        {"offset": 200, "infons": {"section": "methods"}, "text": "Endosomal pH was measured.", "sentences": [], "annotations": [], "relations": []},
+        {"offset": 300, "infons": {"section": "table-caption"}, "text": "Table 1. Cohort.", "sentences": [], "annotations": [], "relations": []},
+        {"offset": 320, "infons": {"section": "table-column-header"}, "text": "Group", "sentences": [], "annotations": [], "relations": []},
+        {"offset": 330, "infons": {"section": "table-column-header"}, "text": "N", "sentences": [], "annotations": [], "relations": []},
+        {"offset": 340, "infons": {"section": "table-row-header"}, "text": "APOE4", "sentences": [], "annotations": [], "relations": []},
+        {"offset": 350, "infons": {"section": "table-cell"}, "text": "12", "sentences": [], "annotations": [], "relations": []},
+        {"offset": 400, "infons": {"section": "figure-caption"}, "text": "Figure 1. Endosomes.", "sentences": [], "annotations": [], "relations": []},
+        {"offset": 500, "infons": {"section": "citation"}, "text": "[1]", "sentences": [], "annotations": [], "relations": []},
+        {"offset": 600, "infons": {"section": "references"}, "text": "Smith 2026 endosomal study.", "sentences": [], "annotations": [], "relations": []},
+        {"offset": 700, "infons": {"section": "formula"}, "text": "pH = -log10[H+]", "sentences": [], "annotations": [], "relations": []}
+      ],
+      "annotations": [],
+      "relations": []
+    }
+  ]
+}

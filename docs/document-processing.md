@@ -97,6 +97,29 @@ and section flags, fillable state, and rich-cell references; the scalar grid is
 only a compatibility fallback. Stable content-derived block IDs, source-level
 metadata, and explicit caption/citation relationships complete the structure.
 
+Schema v1 bounds each canonical table to 100,000 cells and each row/column
+axis to 1,000,000 positions. Cell-overlap validation uses half-open rectangle
+extents and a bounded sweep rather than materializing every covered grid
+coordinate, so a large valid span cannot cause memory use proportional to its
+area. Exceeding a fixed bound, conflicting cells, or overlapping extents
+rejects canonicalization. Cell-count, axis, coordinate, span, and extent limit
+overages fail with `TABLE_LIMIT_EXCEEDED`; ill-typed, negative, or understated
+declared dimensions fail with
+`INVALID_TABLE_DIMENSIONS`; these are hard failures because accepting a
+truncated or invented grid would make canonical content ambiguous. Malformed
+but recoverable native table data is never silently dropped or assigned
+invented coordinates: it produces a stable
+`ERROR` mapping diagnostic, retains only independently valid structure, and
+makes the canonical run and compiled stage `partial`.
+
+Persisted content-integrity overlays are parsed as the registered v1 contract
+without type coercion, unknown record kinds, omitted fields, or extra fields.
+Record identities, derived statuses, report counts, and the complete decoded
+payload must replay exactly. A malformed or non-replayable overlay fails
+canonicalization without producing a canonical product. Issues in a valid
+overlay are copied into the canonical diagnostics; an upstream integrity
+`ERROR` therefore also makes the canonical run `partial`.
+
 Anchors target immutable native product IDs and nodes, with character ranges
 and PDF, JATS, or BioC locators where available. Relationship status is derived
 from the resolved source, resolved targets, unresolved target references, and
@@ -127,6 +150,25 @@ sufficient provenance. Record loading dispatches on the schema version before
 model validation. Stores containing the old unversioned
 `records/parser_runs` prototype layout are rejected explicitly rather than
 guessed into the new contract.
+
+Canonical schema v1 admits native evidence only through its pinned producer
+contracts. The Docling document and `content_spans` must be canonically encoded
+outputs of the same `docling` 2.113.0 / `document.parse` run, using Docling
+Serve 1.21.0 and the exact format-specific invocation schema (including
+`provenance-charspan-v2` for PDFs). JATS and BioC inputs must come from the
+version-1 project adapters with exact artifact and configuration lineage.
+Scholarly TEI must come from a usable `grobid` 0.9.0 /
+`document.parse.scholarly` run whose input hash and parser options replay
+against the source artifact or its direct OCR derivative. Conflicting runtime
+attestation is never accepted. A `partial` native run remains admissible when
+identity evidence is absent or an unrelated system diagnostic caused the
+downgrade, but `complete` cannot mask replayed semantic errors.
+
+The content-integrity overlay remains optional in canonical schema v1 so a
+lower-level structure-only view can still be built. When present, its producer,
+inputs, configuration, bytes, and issue-dependent status are replayed exactly;
+omitting it therefore means consumers do not receive the stronger explicit
+table, figure, and citation-resolution contract.
 
 The current configuration schema is
 `deepcritical-document-processing-config-v2`, and its default is in
@@ -464,9 +506,13 @@ docker compose -f docker/document-processing/compose.yaml --profile tools run --
 For every processing run, retain ordered typed inputs and outputs, the source
 artifact lineage, exact configuration and policy hashes, component descriptor,
 container image reference and observed image digest, component/model versions,
-timestamps, warnings, resource usage, and transformation lineage. Component
-scratch files and RQ results are staging data only; copy raw outputs to
-content-addressed storage before acknowledging completion.
+timestamps, warnings, resource usage, and transformation lineage. For every
+orchestrated run, also retain the workflow-resume ID and a unique
+stage-invocation ID. The latter correlates one in-memory graph invocation with
+its durable success or failure records; it must not be reused as the
+workflow-resume identity. Component scratch files and RQ results are staging
+data only; copy raw outputs to content-addressed storage before acknowledging
+completion.
 
 The persisted static output policy also records the effective GROBID coordinates
 and consolidation flags, OCR languages/rotation/deskew/jobs/optimization, and

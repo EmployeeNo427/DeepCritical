@@ -20,6 +20,7 @@ from DeepResearch.src.document_processing.models import (
 from DeepResearch.src.document_processing.orchestration import (
     AllCondition,
     AnyCondition,
+    CompiledPipeline,
     CompiledStage,
     ComponentInstanceSpec,
     ComponentRegistration,
@@ -804,6 +805,139 @@ async def test_terminal_producer_without_required_output_skips_dependents(
     assert execution.result_for("finish").status is StageExecutionStatus.SKIPPED
 
 
+def _compile_two_source_missing_output_pipeline(
+    input_order: tuple[str, str],
+) -> CompiledPipeline:
+    async def unreachable(_: StageContext, __: BaseModel) -> StageResult:
+        raise AssertionError("the registered plugin must not run through this executor")
+
+    registry = ComponentRegistry()
+    for component_id in ("first", "second"):
+        registry.register(
+            _registration(
+                component_id,
+                input_ports={"text": TEXT},
+                output_ports={"text": TEXT},
+                handler=unreachable,
+            )
+        )
+    registry.register(
+        _registration(
+            "consume",
+            input_ports={"first_text": TEXT, "second_text": TEXT},
+            output_ports={"text": TEXT},
+            handler=unreachable,
+        )
+    )
+    bindings = {
+        port_name: StageOutputRef(
+            stage_id=port_name.removesuffix("_text"),
+            output_name="text",
+        )
+        for port_name in input_order
+    }
+    return PipelineCompiler(registry).compile(
+        _pipeline(
+            components=tuple(
+                ComponentInstanceSpec(
+                    instance_id=component_id,
+                    component_id=component_id,
+                )
+                for component_id in ("first", "second", "consume")
+            ),
+            stages=(
+                StageSpec(
+                    stage_id="first",
+                    component="first",
+                    inputs={"text": PipelineInputRef(input_name="text")},
+                    outputs=("text",),
+                ),
+                StageSpec(
+                    stage_id="second",
+                    component="second",
+                    inputs={"text": PipelineInputRef(input_name="text")},
+                    outputs=("text",),
+                ),
+                StageSpec(
+                    stage_id="consume",
+                    component="consume",
+                    depends_on=("first", "second"),
+                    inputs=bindings,
+                    outputs=("text",),
+                ),
+            ),
+        )
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "input_order",
+    [
+        ("first_text", "second_text"),
+        ("second_text", "first_text"),
+    ],
+)
+async def test_invalid_missing_required_input_wins_over_terminal_skip_in_any_order(
+    input_order: tuple[str, str],
+) -> None:
+    class MixedMissingOutputExecutor:
+        async def execute(
+            self,
+            stage: CompiledStage,
+            context: StageContext,
+        ) -> StageResult:
+            del context
+            if stage.spec.stage_id == "first":
+                return StageResult(status=StageExecutionStatus.FAILED)
+            if stage.spec.stage_id == "second":
+                return StageResult(status=StageExecutionStatus.COMPLETE)
+            raise AssertionError("consumer must not run with missing required inputs")
+
+    compiled = _compile_two_source_missing_output_pipeline(input_order)
+
+    with pytest.raises(
+        PipelineExecutionError,
+        match=r"required input 'second_text'.*second\.text",
+    ):
+        await PipelineOrchestrator(MixedMissingOutputExecutor()).execute(
+            compiled,
+            {"text": "input"},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "input_order",
+    [
+        ("first_text", "second_text"),
+        ("second_text", "first_text"),
+    ],
+)
+async def test_all_terminal_missing_required_inputs_skip_in_any_order(
+    input_order: tuple[str, str],
+) -> None:
+    class TerminalMissingOutputExecutor:
+        async def execute(
+            self,
+            stage: CompiledStage,
+            context: StageContext,
+        ) -> StageResult:
+            del context
+            if stage.spec.stage_id == "first":
+                return StageResult(status=StageExecutionStatus.FAILED)
+            if stage.spec.stage_id == "second":
+                return StageResult(status=StageExecutionStatus.QUARANTINED)
+            raise AssertionError("consumer must not run after terminal dependencies")
+
+    execution = await PipelineOrchestrator(TerminalMissingOutputExecutor()).execute(
+        _compile_two_source_missing_output_pipeline(input_order),
+        {"text": "input"},
+    )
+
+    assert execution.result_for("consume").status is StageExecutionStatus.SKIPPED
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "producer_status",
@@ -914,6 +1048,61 @@ def test_all_and_any_presence_proofs_are_conservative() -> None:
         consumer_condition=AnyCondition(conditions=(present,))
     )
     PipelineCompiler(registry).compile(any_exact)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "input_identity",
+    [
+        {},
+        {"": "artifact-123"},
+        {"document": ""},
+        {1: "artifact-123"},
+        {"document": 1},
+    ],
+)
+async def test_failure_observer_requires_nonempty_string_identity(
+    input_identity: dict[object, object],
+) -> None:
+    async def passthrough(context: StageContext, _: BaseModel) -> StageResult:
+        return StageResult(
+            status=StageExecutionStatus.COMPLETE,
+            outputs={"text": context.require_input("text", str)},
+        )
+
+    registry = ComponentRegistry()
+    registry.register(
+        _registration(
+            "pass",
+            input_ports={"text": TEXT},
+            output_ports={"text": TEXT},
+            handler=passthrough,
+        )
+    )
+    pipeline = PipelineCompiler(registry).compile(
+        _pipeline(
+            components=(
+                ComponentInstanceSpec(instance_id="pass", component_id="pass"),
+            ),
+            stages=(
+                StageSpec(
+                    stage_id="pass",
+                    component="pass",
+                    inputs={"text": PipelineInputRef(input_name="text")},
+                    outputs=("text",),
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(PipelineExecutionError, match="input_identity"):
+        await PipelineOrchestrator(
+            failure_observer=_RecordingFailureObserver()
+        ).execute(
+            pipeline,
+            {"text": "input"},
+            input_identity=input_identity,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.asyncio
@@ -1079,11 +1268,13 @@ async def test_failure_observer_receives_typed_context_and_original_error() -> N
     assert failure.pipeline_id == "test-pipeline"
     assert failure.pipeline_version == "1"
     assert failure.pipeline_run_id == "pipeline-run-failure"
+    assert failure.stage_invocation_id.startswith("stage-invocation-")
     assert failure.stage_id == "fail"
     assert failure.component.component_id == "fail"
     assert failure.configuration == {}
     assert failure.configuration_sha256 == configuration_sha256({})
     assert failure.input_identity == {"document": "artifact-123"}
+    assert failure.stage_inputs == {"text": "input"}
     assert failure.exception is error
 
 
@@ -1106,6 +1297,7 @@ async def test_failure_observer_error_preserves_original_and_resets_context() ->
             context = _active_stage_context()
             assert context is not None
             assert context.pipeline_run_id == failure.pipeline_run_id
+            assert context.stage_invocation_id == failure.stage_invocation_id
             assert context.stage_id == failure.stage_id
             raise observer_error
 

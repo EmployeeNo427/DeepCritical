@@ -8,6 +8,7 @@ annotations or replacing the native products used to build it.
 from __future__ import annotations
 
 import json
+import math
 import re
 import unicodedata
 from collections.abc import Mapping
@@ -36,11 +37,23 @@ from .models import (
     SourceLocator,
     sha256_bytes,
 )
-from .validation import docling_document_sha256
+from .validation import (
+    ContentIntegrityKind,
+    ContentIntegrityReport,
+    QualitySeverity,
+    docling_document_sha256,
+    parse_content_integrity_report,
+)
 
 CANONICAL_DOCUMENT_SCHEMA_VERSION = "deepcritical-canonical-document-view-v1"
 CANONICAL_TEXT_NORMALIZATION = "unicode-nfc-collapse-whitespace-v1"
 CANONICAL_ANCHORING_POLICY = "source-spans-and-native-nodes-v1"
+CANONICAL_COMPONENT_ID = "canonical-document-view"
+CANONICAL_COMPONENT_VERSION = "1"
+CANONICAL_COMPONENT_CAPABILITY = "document.canonicalize"
+CANONICAL_ADAPTER_VERSION = "1"
+MAX_CANONICAL_TABLE_CELLS = 100_000
+MAX_CANONICAL_TABLE_AXIS = 1_000_000
 _NATIVE_NODE_COLLECTIONS = (
     "texts",
     "tables",
@@ -173,6 +186,27 @@ class CanonicalizationConfig(BaseModel):
     )
 
 
+def canonical_invocation_configuration(
+    configuration: CanonicalizationConfig,
+    source_products: tuple[DataProductRef, ...],
+) -> dict[str, Any]:
+    """Return the complete persisted invocation contract for canonicalization."""
+
+    return {
+        "adapter_version": CANONICAL_ADAPTER_VERSION,
+        "policy": configuration.model_dump(mode="json"),
+        "input_products": [
+            {
+                "name": product.name,
+                "product_id": product.product_id,
+                "blob_sha256": product.blob_sha256,
+                "payload_schema_version": product.payload_schema_version,
+            }
+            for product in source_products
+        ],
+    }
+
+
 class CanonicalSourceAnchor(FrozenModel):
     """Exact node or character range in one immutable native product."""
 
@@ -202,14 +236,24 @@ class CanonicalTableCell(FrozenModel):
     """One normalized table cell with its source grid extent."""
 
     text: str
-    row_index: int = Field(ge=0)
-    column_index: int = Field(ge=0)
-    row_span: int = Field(default=1, ge=1)
-    column_span: int = Field(default=1, ge=1)
-    column_header: bool = False
-    row_header: bool = False
-    row_section: bool = False
-    fillable: bool = False
+    row_index: int = Field(ge=0, lt=MAX_CANONICAL_TABLE_AXIS, strict=True)
+    column_index: int = Field(ge=0, lt=MAX_CANONICAL_TABLE_AXIS, strict=True)
+    row_span: int = Field(
+        default=1,
+        ge=1,
+        le=MAX_CANONICAL_TABLE_AXIS,
+        strict=True,
+    )
+    column_span: int = Field(
+        default=1,
+        ge=1,
+        le=MAX_CANONICAL_TABLE_AXIS,
+        strict=True,
+    )
+    column_header: bool = Field(default=False, strict=True)
+    row_header: bool = Field(default=False, strict=True)
+    row_section: bool = Field(default=False, strict=True)
+    fillable: bool = Field(default=False, strict=True)
     native_ref: str | None = None
 
     @field_validator("text")
@@ -232,14 +276,26 @@ class CanonicalTableCell(FrozenModel):
 class CanonicalTable(FrozenModel):
     """Normalized table cells with exact row, column, and span structure."""
 
-    row_count: int = Field(default=0, ge=0)
-    column_count: int = Field(default=0, ge=0)
-    cells: tuple[CanonicalTableCell, ...] = ()
+    row_count: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_CANONICAL_TABLE_AXIS,
+        strict=True,
+    )
+    column_count: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_CANONICAL_TABLE_AXIS,
+        strict=True,
+    )
+    cells: tuple[CanonicalTableCell, ...] = Field(
+        default=(),
+        max_length=MAX_CANONICAL_TABLE_CELLS,
+    )
 
     @model_validator(mode="after")
     def _validate_grid(self) -> CanonicalTable:
         coordinates: set[tuple[int, int]] = set()
-        occupied: set[tuple[int, int]] = set()
         for cell in self.cells:
             coordinate = (cell.row_index, cell.column_index)
             if coordinate in coordinates:
@@ -249,16 +305,8 @@ class CanonicalTable(FrozenModel):
                 raise ValueError("canonical table cell exceeds row_count")
             if cell.column_index + cell.column_span > self.column_count:
                 raise ValueError("canonical table cell exceeds column_count")
-            extent = {
-                (row, column)
-                for row in range(cell.row_index, cell.row_index + cell.row_span)
-                for column in range(
-                    cell.column_index, cell.column_index + cell.column_span
-                )
-            }
-            if occupied.intersection(extent):
-                raise ValueError("canonical table cell extents must not overlap")
-            occupied.update(extent)
+        if _table_cells_overlap(self.cells):
+            raise ValueError("canonical table cell extents must not overlap")
         if not self.cells and (self.row_count or self.column_count):
             raise ValueError("empty canonical tables must have zero dimensions")
         return self
@@ -871,6 +919,7 @@ def build_canonical_document_view(
     integrity_products = tuple(
         product for product in products if product.name == "content_integrity_overlay"
     )
+    parsed_integrity_report: ContentIntegrityReport | None = None
     if integrity_report is None:
         if integrity_products:
             raise CanonicalDocumentError(
@@ -881,13 +930,19 @@ def build_canonical_document_view(
             raise CanonicalDocumentError(
                 "an integrity report requires exactly one integrity source product"
             )
-        if integrity_report.get("document_sha256") != docling_document_sha256(
+        try:
+            parsed_integrity_report = parse_content_integrity_report(integrity_report)
+        except ValueError as exc:
+            raise CanonicalDocumentError(
+                "content-integrity report contract is invalid"
+            ) from exc
+        if parsed_integrity_report.document_sha256 != docling_document_sha256(
             docling_document
         ):
             raise CanonicalDocumentError(
                 "integrity report targets a different Docling document"
             )
-        if integrity_report.get("scholarly_overlay_present") is not (
+        if parsed_integrity_report.scholarly_overlay_present is not (
             scholarly_overlay is not None
         ):
             raise CanonicalDocumentError(
@@ -895,6 +950,22 @@ def build_canonical_document_view(
             )
 
     diagnostics: list[CanonicalMappingDiagnostic] = []
+    if parsed_integrity_report is not None:
+        integrity_product = integrity_products[0]
+        diagnostics.extend(
+            _diagnostic(
+                severity=(
+                    CanonicalDiagnosticSeverity.ERROR
+                    if issue.severity is QualitySeverity.ERROR
+                    else CanonicalDiagnosticSeverity.WARNING
+                ),
+                code=issue.code,
+                message=issue.message,
+                product_id=integrity_product.product_id,
+                native_node_ids=(issue.item_ref,) if issue.item_ref is not None else (),
+            )
+            for issue in parsed_integrity_report.issues
+        )
     nodes = _collect_native_nodes(docling_document, diagnostics, docling_product)
     canonical_index = {node.canonical_ref: node for node in nodes}
     declared_index: dict[str, list[_NativeNode]] = {}
@@ -990,7 +1061,7 @@ def build_canonical_document_view(
     explicit_parent_by_ref: dict[str, str | None] = {}
     declared_child_order: dict[str, list[str]] = {}
     for parent in nodes:
-        for child_reference in _child_references(parent.item):
+        for child_reference in _child_references(parent.item, table=parent.table):
             child = resolve(child_reference, context="document hierarchy child")
             if child is not None:
                 declared_parents[child.canonical_ref].append(parent.canonical_ref)
@@ -1245,7 +1316,7 @@ def build_canonical_document_view(
     )
 
     relationships = _build_relationships(
-        integrity_report or {},
+        parsed_integrity_report,
         resolve=resolve,
         block_id_by_ref=block_id_by_ref,
         scholarly_overlay=scholarly_overlay,
@@ -1329,7 +1400,16 @@ def _collect_native_nodes(
             kind = _block_kind(collection, native_label)
             raw_text = _native_text(item)
             text = normalize_canonical_text(raw_text) or None
-            table = _canonical_table(item) if kind is CanonicalBlockKind.TABLE else None
+            table = (
+                _canonical_table(
+                    item,
+                    native_node_id=canonical_ref,
+                    diagnostics=diagnostics,
+                    docling_product=docling_product,
+                )
+                if kind is CanonicalBlockKind.TABLE
+                else None
+            )
             nodes.append(
                 _NativeNode(
                     canonical_ref=canonical_ref,
@@ -1379,62 +1459,325 @@ def _native_text(item: Mapping[str, Any]) -> str:
     return ""
 
 
-def _canonical_table(item: Mapping[str, Any]) -> CanonicalTable:
+class _RangeMaximumTree:
+    """Range-add/range-maximum tree used by the table rectangle sweep."""
+
+    __slots__ = ("_lazy", "_maximum", "_size")
+
+    def __init__(self, size: int) -> None:
+        self._size = size
+        self._maximum = [0] * (4 * size)
+        self._lazy = [0] * (4 * size)
+
+    def add(self, left: int, right: int, delta: int) -> None:
+        self._add(1, 0, self._size - 1, left, right, delta)
+
+    def maximum(self, left: int, right: int) -> int:
+        return self._query(1, 0, self._size - 1, left, right)
+
+    def _add(
+        self,
+        node: int,
+        node_left: int,
+        node_right: int,
+        query_left: int,
+        query_right: int,
+        delta: int,
+    ) -> None:
+        if query_left <= node_left and node_right <= query_right:
+            self._maximum[node] += delta
+            self._lazy[node] += delta
+            return
+        midpoint = (node_left + node_right) // 2
+        if query_left <= midpoint:
+            self._add(
+                node * 2,
+                node_left,
+                midpoint,
+                query_left,
+                query_right,
+                delta,
+            )
+        if query_right > midpoint:
+            self._add(
+                node * 2 + 1,
+                midpoint + 1,
+                node_right,
+                query_left,
+                query_right,
+                delta,
+            )
+        self._maximum[node] = self._lazy[node] + max(
+            self._maximum[node * 2],
+            self._maximum[node * 2 + 1],
+        )
+
+    def _query(
+        self,
+        node: int,
+        node_left: int,
+        node_right: int,
+        query_left: int,
+        query_right: int,
+    ) -> int:
+        if query_left <= node_left and node_right <= query_right:
+            return self._maximum[node]
+        midpoint = (node_left + node_right) // 2
+        result = 0
+        if query_left <= midpoint:
+            result = self._query(
+                node * 2,
+                node_left,
+                midpoint,
+                query_left,
+                query_right,
+            )
+        if query_right > midpoint:
+            result = max(
+                result,
+                self._query(
+                    node * 2 + 1,
+                    midpoint + 1,
+                    node_right,
+                    query_left,
+                    query_right,
+                ),
+            )
+        return self._lazy[node] + result
+
+
+def _table_cells_overlap(cells: tuple[CanonicalTableCell, ...]) -> bool:
+    """Detect overlap among half-open cell rectangles without expanding spans."""
+
+    if len(cells) < 2:
+        return False
+    column_boundaries = sorted(
+        {
+            boundary
+            for cell in cells
+            for boundary in (
+                cell.column_index,
+                cell.column_index + cell.column_span,
+            )
+        }
+    )
+    column_positions = {
+        boundary: index for index, boundary in enumerate(column_boundaries)
+    }
+    events: list[tuple[int, int, int, int]] = []
+    for cell in cells:
+        left = column_positions[cell.column_index]
+        right = column_positions[cell.column_index + cell.column_span] - 1
+        events.append((cell.row_index, 1, left, right))
+        events.append((cell.row_index + cell.row_span, 0, left, right))
+    tree = _RangeMaximumTree(len(column_boundaries) - 1)
+    for _, event_kind, left, right in sorted(events):
+        if event_kind == 0:
+            tree.add(left, right, -1)
+        else:
+            if tree.maximum(left, right) > 0:
+                return True
+            tree.add(left, right, 1)
+    return False
+
+
+class _TableCellError(ValueError):
+    pass
+
+
+def _canonical_table(
+    item: Mapping[str, Any],
+    *,
+    native_node_id: str,
+    diagnostics: list[CanonicalMappingDiagnostic],
+    docling_product: DataProductRef,
+) -> CanonicalTable:
     data = item.get("data")
     if not isinstance(data, Mapping):
-        return CanonicalTable()
-    raw_cells = [
-        _canonical_table_cell(
-            raw_cell,
-            fallback_row=fallback_row,
-            fallback_column=fallback_column,
+        _append_table_diagnostic(
+            diagnostics,
+            docling_product=docling_product,
+            native_node_id=native_node_id,
+            code="INVALID_TABLE_DATA",
+            message="Docling table data is missing or is not an object",
         )
-        for raw_cell, fallback_row, fallback_column in _table_cell_entries(data)
-    ]
-    if not raw_cells:
+        return CanonicalTable()
+
+    row_count = _declared_table_dimension(data, "num_rows")
+    column_count = _declared_table_dimension(data, "num_cols")
+    entries: list[tuple[Any, int, int, bool, str]] = []
+    authoritative_cells = "table_cells" in data
+    if authoritative_cells:
+        table_cells = data["table_cells"]
+        if not isinstance(table_cells, list):
+            _append_table_diagnostic(
+                diagnostics,
+                docling_product=docling_product,
+                native_node_id=native_node_id,
+                code="INVALID_TABLE_CELLS",
+                message="Docling table_cells is not a list",
+            )
+            return CanonicalTable()
+        _enforce_table_cell_limit(len(table_cells))
+        entries.extend(
+            (raw_cell, 0, 0, True, f"table_cells[{index}]")
+            for index, raw_cell in enumerate(table_cells)
+        )
+    else:
+        grid = data.get("grid")
+        if not isinstance(grid, list):
+            _append_table_diagnostic(
+                diagnostics,
+                docling_product=docling_product,
+                native_node_id=native_node_id,
+                code="INVALID_TABLE_GRID",
+                message="Docling table grid is missing or is not a list",
+            )
+            return CanonicalTable()
+        if len(grid) > MAX_CANONICAL_TABLE_AXIS:
+            raise CanonicalDocumentError(
+                "TABLE_LIMIT_EXCEEDED: structured table exceeds the row limit"
+            )
+        total_cells = 0
+        for row_index, raw_row in enumerate(grid):
+            if not isinstance(raw_row, list):
+                _append_table_diagnostic(
+                    diagnostics,
+                    docling_product=docling_product,
+                    native_node_id=native_node_id,
+                    code="INVALID_TABLE_GRID_ROW",
+                    message=f"Docling table grid row {row_index} is not a list",
+                )
+                continue
+            if len(raw_row) > MAX_CANONICAL_TABLE_AXIS:
+                raise CanonicalDocumentError(
+                    "TABLE_LIMIT_EXCEEDED: structured table exceeds the column limit"
+                )
+            total_cells += len(raw_row)
+            _enforce_table_cell_limit(total_cells)
+            entries.extend(
+                (
+                    raw_cell,
+                    row_index,
+                    column_index,
+                    False,
+                    f"grid[{row_index}][{column_index}]",
+                )
+                for column_index, raw_cell in enumerate(raw_row)
+            )
+
+    parsed_cells: list[CanonicalTableCell] = []
+    for raw_cell, fallback_row, fallback_column, authoritative, context in entries:
+        try:
+            parsed_cells.append(
+                _canonical_table_cell(
+                    raw_cell,
+                    fallback_row=fallback_row,
+                    fallback_column=fallback_column,
+                    authoritative=authoritative,
+                )
+            )
+        except _TableCellError as exc:
+            _append_table_diagnostic(
+                diagnostics,
+                docling_product=docling_product,
+                native_node_id=native_node_id,
+                code="INVALID_TABLE_CELL",
+                message=f"Docling {context} is invalid: {exc}",
+            )
+
+    if not parsed_cells:
+        _append_table_diagnostic(
+            diagnostics,
+            docling_product=docling_product,
+            native_node_id=native_node_id,
+            code="EMPTY_TABLE_DATA",
+            message="Docling table contains no valid structured cells",
+        )
         return CanonicalTable()
 
     unique_cells: dict[tuple[int, int], CanonicalTableCell] = {}
-    occupied: set[tuple[int, int]] = set()
-    for cell in raw_cells:
+    for cell in parsed_cells:
         coordinate = (cell.row_index, cell.column_index)
         existing = unique_cells.get(coordinate)
-        if existing == cell:
+        if existing == cell and not authoritative_cells:
             continue
         if existing is not None:
             raise CanonicalDocumentError(
                 "structured table contains conflicting cells at one coordinate"
             )
-        extent = {
-            (row, column)
-            for row in range(cell.row_index, cell.row_index + cell.row_span)
-            for column in range(cell.column_index, cell.column_index + cell.column_span)
-        }
-        if occupied.intersection(extent):
-            raise CanonicalDocumentError(
-                "structured table contains overlapping cell extents"
-            )
         unique_cells[coordinate] = cell
-        occupied.update(extent)
     cells = tuple(
         sorted(
             unique_cells.values(),
             key=lambda cell: (cell.row_index, cell.column_index),
         )
     )
-    row_count = max(
-        _nonnegative_int(data.get("num_rows")),
-        *(cell.row_index + cell.row_span for cell in cells),
-    )
-    column_count = max(
-        _nonnegative_int(data.get("num_cols")),
-        *(cell.column_index + cell.column_span for cell in cells),
-    )
+    if _table_cells_overlap(cells):
+        raise CanonicalDocumentError(
+            "structured table contains overlapping cell extents"
+        )
+
+    inferred_rows = max(cell.row_index + cell.row_span for cell in cells)
+    inferred_columns = max(cell.column_index + cell.column_span for cell in cells)
+    if row_count is not None and row_count < inferred_rows:
+        raise CanonicalDocumentError(
+            "INVALID_TABLE_DIMENSIONS: structured table cells exceed the "
+            "declared row dimension"
+        )
+    if column_count is not None and column_count < inferred_columns:
+        raise CanonicalDocumentError(
+            "INVALID_TABLE_DIMENSIONS: structured table cells exceed the "
+            "declared column dimension"
+        )
     return CanonicalTable(
-        row_count=row_count,
-        column_count=column_count,
+        row_count=inferred_rows if row_count is None else row_count,
+        column_count=inferred_columns if column_count is None else column_count,
         cells=cells,
     )
+
+
+def _append_table_diagnostic(
+    diagnostics: list[CanonicalMappingDiagnostic],
+    *,
+    docling_product: DataProductRef,
+    native_node_id: str,
+    code: str,
+    message: str,
+) -> None:
+    diagnostics.append(
+        _diagnostic(
+            severity=CanonicalDiagnosticSeverity.ERROR,
+            code=code,
+            message=message,
+            product_id=docling_product.product_id,
+            native_node_ids=(native_node_id,),
+        )
+    )
+
+
+def _enforce_table_cell_limit(count: int) -> None:
+    if count > MAX_CANONICAL_TABLE_CELLS:
+        raise CanonicalDocumentError(
+            "TABLE_LIMIT_EXCEEDED: structured table exceeds the cell limit"
+        )
+
+
+def _declared_table_dimension(data: Mapping[str, Any], field_name: str) -> int | None:
+    if field_name not in data:
+        return None
+    value = data[field_name]
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise CanonicalDocumentError(
+            "INVALID_TABLE_DIMENSIONS: structured table "
+            f"{field_name} is not a non-negative integer"
+        )
+    if value > MAX_CANONICAL_TABLE_AXIS:
+        raise CanonicalDocumentError(
+            "TABLE_LIMIT_EXCEEDED: structured table declared dimension exceeds "
+            "the axis limit"
+        )
+    return value
 
 
 def _canonical_table_cell(
@@ -1442,97 +1785,152 @@ def _canonical_table_cell(
     *,
     fallback_row: int,
     fallback_column: int,
+    authoritative: bool,
 ) -> CanonicalTableCell:
     if not isinstance(value, Mapping):
+        if authoritative:
+            raise _TableCellError("authoritative cells must be objects")
+        if value is None:
+            text = ""
+        elif isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            if isinstance(value, float) and not math.isfinite(value):
+                raise _TableCellError("scalar cell values must be finite")
+            text = str(value)
+        else:
+            raise _TableCellError("grid cells must be objects or scalar values")
         return CanonicalTableCell(
-            text=normalize_canonical_text(str(value)),
+            text=normalize_canonical_text(text),
             row_index=fallback_row,
             column_index=fallback_column,
         )
+
     raw_text = value.get("text")
-    text = normalize_canonical_text(raw_text) if isinstance(raw_text, str) else ""
-    row_index = _nonnegative_int(
-        value.get("start_row_offset_idx"),
-        fallback=fallback_row,
+    if not isinstance(raw_text, str):
+        raise _TableCellError("cell text must be a string")
+    row_index = _table_coordinate(
+        value,
+        "start_row_offset_idx",
+        fallback=None if authoritative else fallback_row,
     )
-    column_index = _nonnegative_int(
-        value.get("start_col_offset_idx"),
-        fallback=fallback_column,
+    column_index = _table_coordinate(
+        value,
+        "start_col_offset_idx",
+        fallback=None if authoritative else fallback_column,
     )
-    row_end = _nonnegative_int(value.get("end_row_offset_idx"))
-    column_end = _nonnegative_int(value.get("end_col_offset_idx"))
-    row_span = (
-        row_end - row_index
-        if row_end > row_index
-        else _positive_int(value.get("row_span"))
+    row_span = _table_span(
+        value,
+        start=row_index,
+        end_field="end_row_offset_idx",
+        span_fields=("row_span",),
     )
-    column_span = (
-        column_end - column_index
-        if column_end > column_index
-        else _positive_int(value.get("column_span", value.get("col_span")))
+    column_span = _table_span(
+        value,
+        start=column_index,
+        end_field="end_col_offset_idx",
+        span_fields=("column_span", "col_span"),
     )
+    flags: dict[str, bool] = {}
+    for flag in ("column_header", "row_header", "row_section", "fillable"):
+        flag_value = value.get(flag, False)
+        if not isinstance(flag_value, bool):
+            raise _TableCellError(f"{flag} must be a boolean")
+        flags[flag] = flag_value
+    native_ref = None
+    if "ref" in value and value["ref"] is not None:
+        native_ref = _reference_value(value["ref"])
+        if native_ref is None or not native_ref.strip():
+            raise _TableCellError("ref must contain a non-empty native reference")
     return CanonicalTableCell(
-        text=text,
+        text=normalize_canonical_text(raw_text),
         row_index=row_index,
         column_index=column_index,
         row_span=row_span,
         column_span=column_span,
-        column_header=value.get("column_header") is True,
-        row_header=value.get("row_header") is True,
-        row_section=value.get("row_section") is True,
-        fillable=value.get("fillable") is True,
-        native_ref=_reference_value(value.get("ref")),
+        native_ref=native_ref,
+        **flags,
     )
 
 
-def _table_cell_entries(
-    data: Mapping[str, Any],
-) -> tuple[tuple[Any, int, int], ...]:
-    table_cells = data.get("table_cells")
-    if isinstance(table_cells, list):
-        return tuple(
-            (raw_cell, index, 0)
-            for index, raw_cell in enumerate(table_cells)
-            if isinstance(raw_cell, Mapping)
+def _table_coordinate(
+    value: Mapping[str, Any],
+    field_name: str,
+    *,
+    fallback: int | None,
+) -> int:
+    if field_name not in value:
+        if fallback is None:
+            raise _TableCellError(f"{field_name} is required")
+        return fallback
+    coordinate = value[field_name]
+    if (
+        not isinstance(coordinate, int)
+        or isinstance(coordinate, bool)
+        or coordinate < 0
+    ):
+        raise _TableCellError(f"{field_name} must be a non-negative integer")
+    if coordinate >= MAX_CANONICAL_TABLE_AXIS:
+        raise CanonicalDocumentError(
+            "TABLE_LIMIT_EXCEEDED: structured table cell coordinate exceeds "
+            "the axis limit"
         )
-
-    grid = data.get("grid")
-    if not isinstance(grid, list):
-        return ()
-    return tuple(
-        (raw_cell, row_index, column_index)
-        for row_index, raw_row in enumerate(grid)
-        if isinstance(raw_row, list)
-        for column_index, raw_cell in enumerate(raw_row)
-    )
+    return coordinate
 
 
-def _nonnegative_int(value: Any, *, fallback: int = 0) -> int:
-    return (
-        value
-        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
-        else fallback
-    )
+def _table_span(
+    value: Mapping[str, Any],
+    *,
+    start: int,
+    end_field: str,
+    span_fields: tuple[str, ...],
+) -> int:
+    raw_spans = [value[field] for field in span_fields if field in value]
+    if len(raw_spans) > 1 and any(item != raw_spans[0] for item in raw_spans[1:]):
+        raise _TableCellError(f"{span_fields!r} disagree")
+    explicit_span = None
+    if raw_spans:
+        candidate = raw_spans[0]
+        if (
+            not isinstance(candidate, int)
+            or isinstance(candidate, bool)
+            or candidate <= 0
+        ):
+            raise _TableCellError(f"{span_fields[0]} must be a positive integer")
+        if candidate > MAX_CANONICAL_TABLE_AXIS:
+            raise CanonicalDocumentError(
+                "TABLE_LIMIT_EXCEEDED: structured table cell span exceeds "
+                "the axis limit"
+            )
+        explicit_span = candidate
+    end_span = None
+    if end_field in value:
+        end = value[end_field]
+        if not isinstance(end, int) or isinstance(end, bool) or end <= start:
+            raise _TableCellError(f"{end_field} must be an exclusive integer end")
+        if end > MAX_CANONICAL_TABLE_AXIS:
+            raise CanonicalDocumentError(
+                "TABLE_LIMIT_EXCEEDED: structured table cell end exceeds the axis limit"
+            )
+        end_span = end - start
+    if explicit_span is not None and end_span is not None and explicit_span != end_span:
+        raise _TableCellError(f"{end_field} disagrees with {span_fields[0]}")
+    span = end_span or explicit_span or 1
+    if start + span > MAX_CANONICAL_TABLE_AXIS:
+        raise CanonicalDocumentError(
+            "TABLE_LIMIT_EXCEEDED: structured table cell extent exceeds the axis limit"
+        )
+    return span
 
 
-def _positive_int(value: Any) -> int:
-    return (
-        value
-        if isinstance(value, int) and not isinstance(value, bool) and value > 0
-        else 1
-    )
-
-
-def _child_references(item: Mapping[str, Any]) -> tuple[str, ...]:
+def _child_references(
+    item: Mapping[str, Any],
+    *,
+    table: CanonicalTable | None,
+) -> tuple[str, ...]:
     references = list(_reference_values(item.get("children")))
-    data = item.get("data")
-    if isinstance(data, Mapping):
-        for raw_cell, _, _ in _table_cell_entries(data):
-            if not isinstance(raw_cell, Mapping):
-                continue
-            reference = _reference_value(raw_cell.get("ref"))
-            if reference is not None:
-                references.append(reference)
+    if table is not None:
+        references.extend(
+            cell.native_ref for cell in table.cells if cell.native_ref is not None
+        )
     return tuple(dict.fromkeys(references))
 
 
@@ -1564,7 +1962,7 @@ def _reference_value(value: Any) -> str | None:
 
 
 def _build_relationships(
-    integrity_report: Mapping[str, Any],
+    integrity_report: ContentIntegrityReport | None,
     *,
     resolve: Any,
     block_id_by_ref: Mapping[str, str],
@@ -1572,16 +1970,7 @@ def _build_relationships(
     grobid_product: DataProductRef | None,
     diagnostics: list[CanonicalMappingDiagnostic],
 ) -> tuple[CanonicalRelationship, ...]:
-    records = integrity_report.get("records", [])
-    if not isinstance(records, list):
-        diagnostics.append(
-            _diagnostic(
-                severity=CanonicalDiagnosticSeverity.ERROR,
-                code="INVALID_INTEGRITY_RELATIONSHIPS",
-                message="Content-integrity records are not a list",
-            )
-        )
-        return ()
+    records = integrity_report.records if integrity_report is not None else ()
     annotation_by_id = (
         {
             record.annotation.annotation_id: record.annotation
@@ -1591,25 +1980,14 @@ def _build_relationships(
         else {}
     )
     relationships: list[CanonicalRelationship] = []
-    for raw_record in records:
-        if not isinstance(raw_record, Mapping):
-            continue
-        kind_value = raw_record.get("kind")
-        if kind_value not in {"table", "figure", "citation"}:
-            continue
+    for record in records:
         relation_kind = (
             CanonicalRelationshipKind.CITES
-            if kind_value == "citation"
+            if record.kind is ContentIntegrityKind.CITATION
             else CanonicalRelationshipKind.HAS_CAPTION
         )
-        source_ref = raw_record.get("source_docling_item_ref") or raw_record.get(
-            "source_ref"
-        )
-        source_node = (
-            resolve(str(source_ref), context="relationship source")
-            if source_ref
-            else None
-        )
+        source_ref = record.source_docling_item_ref or record.source_ref
+        source_node = resolve(source_ref, context="relationship source")
         source_block_id = (
             block_id_by_ref.get(source_node.canonical_ref)
             if source_node is not None
@@ -1617,22 +1995,22 @@ def _build_relationships(
         )
         target_ids: list[str] = []
         failed_target_refs: list[str] = []
-        for target_ref in _string_tuple(raw_record.get("resolved_docling_item_refs")):
+        for target_ref in record.resolved_docling_item_refs:
             target_node = resolve(target_ref, context="relationship target")
             if target_node is not None:
                 target_ids.append(block_id_by_ref[target_node.canonical_ref])
                 continue
             failed_target_refs.append(target_ref)
-        declared = _string_tuple(raw_record.get("declared_target_refs"))
+        declared = record.declared_target_refs
         unresolved = tuple(
             dict.fromkeys(
                 (
-                    *_string_tuple(raw_record.get("unresolved_target_refs")),
+                    *record.unresolved_target_refs,
                     *failed_target_refs,
                 )
             )
         )
-        reasons = _string_tuple(raw_record.get("reason_codes"))
+        reasons = record.reason_codes
         unique_target_ids = tuple(dict.fromkeys(target_ids))
         missing_declared_refs, _ = _declared_target_accounting(
             declared_target_refs=declared,
@@ -1648,7 +2026,7 @@ def _build_relationships(
             reason_codes=reasons,
         )
         source_anchor = None
-        annotation_id = raw_record.get("source_ref")
+        annotation_id = record.source_ref
         annotation = annotation_by_id.get(annotation_id)
         if annotation is not None and grobid_product is not None:
             source_anchor = CanonicalSourceAnchor(
@@ -1746,12 +2124,6 @@ def _unique_diagnostics(
     )
 
 
-def _string_tuple(value: Any) -> tuple[str, ...]:
-    if not isinstance(value, (list, tuple)):
-        return ()
-    return tuple(str(item) for item in value if isinstance(item, str) and item)
-
-
 def _json_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return cast(
         "dict[str, Any]",
@@ -1781,9 +2153,15 @@ def _canonical_hash(payload: Mapping[str, Any]) -> str:
 
 
 __all__ = [
+    "CANONICAL_ADAPTER_VERSION",
     "CANONICAL_ANCHORING_POLICY",
+    "CANONICAL_COMPONENT_CAPABILITY",
+    "CANONICAL_COMPONENT_ID",
+    "CANONICAL_COMPONENT_VERSION",
     "CANONICAL_DOCUMENT_SCHEMA_VERSION",
     "CANONICAL_TEXT_NORMALIZATION",
+    "MAX_CANONICAL_TABLE_AXIS",
+    "MAX_CANONICAL_TABLE_CELLS",
     "CanonicalAnchorRole",
     "CanonicalBlock",
     "CanonicalBlockKind",
@@ -1805,6 +2183,7 @@ __all__ = [
     "canonical_block_content_sha256",
     "canonical_block_id",
     "canonical_document_bytes",
+    "canonical_invocation_configuration",
     "canonical_relationship_id",
     "canonical_relationship_status",
     "canonical_view_id",

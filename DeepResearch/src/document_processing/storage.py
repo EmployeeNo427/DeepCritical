@@ -8,18 +8,33 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Mapping, TypeVar
+from typing import Any, BinaryIO, Mapping, TypeVar
 
+from defusedxml import ElementTree
+from defusedxml.common import DefusedXmlException
 from pydantic import BaseModel, ValidationError
 
+from .alignment import (
+    ScholarlyAlignmentOverlay,
+    verify_scholarly_alignment_overlay,
+)
 from .canonical import (
+    CANONICAL_COMPONENT_CAPABILITY,
+    CANONICAL_COMPONENT_ID,
+    CANONICAL_COMPONENT_VERSION,
+    CanonicalDiagnosticSeverity,
     CanonicalDocumentView,
+    CanonicalizationConfig,
+    build_canonical_document_view,
     canonical_document_bytes,
+    canonical_invocation_configuration,
     load_canonical_document,
 )
 from .models import (
     ArtifactLocation,
     ArtifactLocationRole,
+    ArtifactRelationship,
+    ContentSpanSet,
     DataProductRef,
     DocumentArtifact,
     ExecutionCheckpoint,
@@ -28,11 +43,89 @@ from .models import (
     ProcessingRun,
     ProcessingRunDiagnosticManifest,
     ProcessingRunStatus,
+    RuntimeAttestationSource,
 )
 from .products import build_data_product_ref, validate_product_contract
+from .routing import InputFormat
+from .span_replay import ContentSpanReplayError, replay_content_span_set
+from .validation import (
+    DoclingQualityValidator,
+    QualitySeverity,
+    validate_content_integrity,
+)
 
 _SHA256_PATTERN = frozenset("0123456789abcdef")
 _RECORD_MODEL = TypeVar("_RECORD_MODEL", bound=BaseModel)
+
+_DOCLING_COMPONENT_VERSION = "2.113.0"
+_DOCLING_SERVE_VERSION = "1.21.0"
+_DOCLING_IMAGE_TAG = "docling-serve-cpu:v1.21.0"
+_GROBID_COMPONENT_VERSION = "0.9.0"
+_GROBID_IMAGE_TAG = "0.9.0-full-p0-c2"
+_OCR_COMPONENT_VERSION = "17.4.1"
+_OCR_IMAGE_TAG = "ocrmypdf:v17.4.1"
+_REMOTE_ATTESTATION_SOURCE = RuntimeAttestationSource.AUTHENTICATED_DEPLOYMENT_REPORTER
+
+_DOCLING_CONFIGURATION_KEYS = frozenset(
+    {
+        "serve_version",
+        "expected_docling_version",
+        "container_image",
+        "container_digest",
+        "model_versions",
+        "model_hashes",
+        "input_sha256",
+        "input_format",
+        "options",
+        "minimum_pdf_locator_coverage",
+        "quality_validator_version",
+        "content_span_schema_version",
+    }
+)
+_DOCLING_LOCATOR_CONFIGURATION_KEYS = {
+    InputFormat.PDF: frozenset({"pdf_span_algorithm"}),
+    InputFormat.JATS: frozenset(
+        {"jats_locator_alignment_algorithm", "native_locator_overlay_sha256"}
+    ),
+    InputFormat.BIOC_JSON: frozenset(
+        {"bioc_locator_alignment_algorithm", "native_locator_overlay_sha256"}
+    ),
+    InputFormat.BIOC_XML: frozenset(
+        {"bioc_locator_alignment_algorithm", "native_locator_overlay_sha256"}
+    ),
+}
+_GROBID_CONFIGURATION_KEYS = frozenset(
+    {
+        "input_sha256",
+        "expected_grobid_version",
+        "container_image",
+        "container_digest",
+        "model_versions",
+        "model_hashes",
+        "coordinates",
+        "consolidate_header",
+        "consolidate_citations",
+        "segment_sentences",
+        "minimum_text_characters",
+    }
+)
+_OCR_CONFIGURATION_KEYS = frozenset(
+    {
+        "input_sha256",
+        "fallback_reason",
+        "expected_ocrmypdf_version",
+        "mode",
+        "container_image",
+        "container_digest",
+        "languages",
+        "rotate_pages",
+        "deskew",
+        "jobs",
+        "optimize",
+        "skip_text",
+        "output_type",
+    }
+)
 
 
 class StorageError(RuntimeError):
@@ -236,7 +329,12 @@ class ContentAddressedStore:
         return path.read_bytes()
 
     def put_canonical_document(self, view: CanonicalDocumentView) -> StoredBlob:
-        """Persist one validated canonical view as deterministic CAS bytes."""
+        """Stage schema-valid canonical bytes pending producer-run admission.
+
+        CAS blob presence alone does not make a trusted data product.  The
+        producer identity and exact native-source semantics are verified when
+        the corresponding processing run is admitted.
+        """
 
         # ``FrozenModel`` only provides shallow immutability and
         # ``model_copy(update=...)`` deliberately skips validation.  Rebuild the
@@ -260,32 +358,15 @@ class ContentAddressedStore:
         return self.read_blob(validated_product.blob_sha256)
 
     def read_canonical_document(self, product: DataProductRef) -> CanonicalDocumentView:
-        """Load a canonical product with schema dispatch before validation."""
+        """Load and deterministically reproduce a durable canonical product."""
 
-        validate_product_contract(product)
-        if product.name != "canonical_document_view":
+        validated_product = self._revalidate_product(product)
+        validate_product_contract(validated_product)
+        if validated_product.name != "canonical_document_view":
             raise ValueError("data product is not a canonical document view")
-        view = load_canonical_document(self.read_data_product_bytes(product))
-        producer = self.get_processing_run(product.producer_run_id)
-        artifact = self.get_artifact(producer.artifact_id)
-        if view.artifact_id != artifact.artifact_id:
-            raise RecordConflictError(
-                f"canonical product {product.product_id!r} artifact does not match "
-                f"producer artifact {artifact.artifact_id!r}"
-            )
-        if view.source_sha256 != artifact.source_sha256:
-            raise RecordConflictError(
-                f"canonical product {product.product_id!r} source hash does not "
-                f"match producer artifact {artifact.artifact_id!r}"
-            )
-        if producer.inputs != view.source_products:
-            raise RecordConflictError(
-                f"canonical product {product.product_id!r} source products do not "
-                f"exactly match producer run {producer.run_id!r} inputs"
-            )
-        for source_product in view.source_products:
-            self.read_data_product_bytes(source_product)
-        return view
+        self._verify_durable_product_chain((validated_product,))
+        producer = self.get_processing_run(validated_product.producer_run_id)
+        return self._verify_canonical_product(validated_product, producer)
 
     def verify_blob(self, sha256: str) -> Path:
         """Verify that a blob exists and matches its content address."""
@@ -395,11 +476,16 @@ class ContentAddressedStore:
     def save_processing_run(self, processing_run: ProcessingRun) -> Path:
         """Persist a processing run after validating every typed product."""
 
+        processing_run = ProcessingRun.model_validate(
+            processing_run.model_dump(mode="python")
+        )
         self.get_artifact(processing_run.artifact_id)
         self._verify_durable_product_chain(processing_run.inputs)
         for product in processing_run.outputs:
             self._verify_product(product)
             self._verify_output_lineage(product, processing_run)
+            if product.name == "canonical_document_view":
+                self._verify_canonical_product(product, processing_run)
         return self._save_record(
             "processing_runs", processing_run.run_id, processing_run
         )
@@ -676,6 +762,1021 @@ class ContentAddressedStore:
                 f"location size for {location.sha256} does not match stored blob"
             )
 
+    def _verify_docling_native_sources(
+        self,
+        *,
+        canonical_artifact: DocumentArtifact,
+        docling_product: DataProductRef,
+        spans_product: DataProductRef,
+        docling_payload: dict[str, Any],
+        span_set: ContentSpanSet,
+    ) -> ProcessingRun:
+        """Verify the native Docling pair and the invocation that owns it."""
+
+        if docling_product.producer_run_id != spans_product.producer_run_id:
+            raise RecordConflictError(
+                "canonical Docling document and content spans must share one producer"
+            )
+        producer = self.get_processing_run(docling_product.producer_run_id)
+        self._require_component_contract(
+            producer,
+            component_id="docling",
+            component_version=_DOCLING_COMPONENT_VERSION,
+            capability="document.parse",
+            statuses=frozenset(
+                {ProcessingRunStatus.COMPLETE, ProcessingRunStatus.PARTIAL}
+            ),
+            purpose="Docling native source",
+        )
+        if producer.artifact_id != canonical_artifact.artifact_id:
+            raise RecordConflictError(
+                "Docling native-source producer does not own the canonical artifact"
+            )
+        if (
+            docling_product not in producer.outputs
+            or spans_product not in producer.outputs
+        ):
+            raise RecordConflictError(
+                "Docling native-source producer does not declare the exact document/span pair"
+            )
+
+        configuration = producer.configuration
+        try:
+            input_format = InputFormat(configuration.get("input_format"))
+        except (TypeError, ValueError) as exc:
+            raise RecordConflictError(
+                "Docling producer input format is not supported"
+            ) from exc
+        if input_format is InputFormat.UNKNOWN:
+            raise RecordConflictError("Docling producer input format cannot be unknown")
+        expected_keys = _DOCLING_CONFIGURATION_KEYS | (
+            _DOCLING_LOCATOR_CONFIGURATION_KEYS.get(input_format, frozenset())
+        )
+        if configuration.keys() != expected_keys:
+            raise RecordConflictError(
+                "Docling producer configuration does not match the production schema"
+            )
+        if (
+            configuration["serve_version"] != _DOCLING_SERVE_VERSION
+            or configuration["expected_docling_version"] != _DOCLING_COMPONENT_VERSION
+            or configuration["quality_validator_version"] != "docling-quality-v2"
+            or configuration["content_span_schema_version"] != "1"
+        ):
+            raise RecordConflictError(
+                "Docling producer version configuration is not approved"
+            )
+        if (
+            input_format is InputFormat.PDF
+            and configuration["pdf_span_algorithm"] != "provenance-charspan-v2"
+        ):
+            raise RecordConflictError("Docling PDF span algorithm is not approved")
+        self._verify_container_configuration(
+            producer,
+            purpose="Docling",
+            expected_image_tag=_DOCLING_IMAGE_TAG,
+            expected_component_versions={
+                "docling": _DOCLING_COMPONENT_VERSION,
+                "docling_serve": _DOCLING_SERVE_VERSION,
+            },
+        )
+
+        options = configuration["options"]
+        if not isinstance(options, dict):
+            raise RecordConflictError("Docling producer options must be an object")
+        to_formats = options.get("to_formats")
+        if (
+            not isinstance(to_formats, list)
+            or any(not isinstance(item, str) for item in to_formats)
+            or "json" not in to_formats
+        ):
+            raise RecordConflictError(
+                "Docling producer options must request serialized JSON"
+            )
+        minimum_coverage = configuration["minimum_pdf_locator_coverage"]
+        if (
+            isinstance(minimum_coverage, bool)
+            or not isinstance(minimum_coverage, (int, float))
+            or not 0.95 <= minimum_coverage <= 1
+        ):
+            raise RecordConflictError(
+                "Docling producer PDF locator coverage threshold is invalid"
+            )
+
+        expected_direct_inputs = self._native_artifact_inputs(canonical_artifact)
+        if input_format in {InputFormat.BIOC_JSON, InputFormat.BIOC_XML}:
+            html_product, locator_product = self._verify_adapter_inputs(
+                artifact=canonical_artifact,
+                input_format=input_format,
+                products=producer.inputs,
+                expected_direct_inputs=expected_direct_inputs,
+            )
+            expected_input_sha256 = html_product.blob_sha256
+        elif input_format is InputFormat.JATS:
+            if len(producer.inputs) != len(expected_direct_inputs) + 1:
+                raise RecordConflictError(
+                    "JATS Docling inputs do not match source and locator provenance"
+                )
+            if producer.inputs[: len(expected_direct_inputs)] != expected_direct_inputs:
+                raise RecordConflictError(
+                    "JATS Docling source inputs do not match artifact provenance"
+                )
+            locator_product = producer.inputs[-1]
+            self._verify_adapter_product(
+                artifact=canonical_artifact,
+                input_format=input_format,
+                product=locator_product,
+                expected_direct_inputs=expected_direct_inputs,
+            )
+            expected_input_sha256 = canonical_artifact.source_sha256
+        else:
+            if producer.inputs != expected_direct_inputs:
+                raise RecordConflictError(
+                    "Docling producer inputs do not match artifact provenance"
+                )
+            locator_product = None
+            expected_input_sha256 = canonical_artifact.source_sha256
+
+        if configuration["input_sha256"] != expected_input_sha256:
+            raise RecordConflictError(
+                "Docling producer input hash does not match its exact input bytes"
+            )
+        if input_format in {
+            InputFormat.JATS,
+            InputFormat.BIOC_JSON,
+            InputFormat.BIOC_XML,
+        }:
+            if locator_product is None:  # pragma: no cover - branch construction guard
+                raise RecordConflictError(
+                    "structured Docling source is missing its native locator input"
+                )
+            alignment_key = (
+                "jats_locator_alignment_algorithm"
+                if input_format is InputFormat.JATS
+                else "bioc_locator_alignment_algorithm"
+            )
+            expected_locator_sha256 = self._docling_locator_configuration_sha256(
+                locator_product
+            )
+            if (
+                configuration[alignment_key] != "normalized-exact-v1"
+                or configuration["native_locator_overlay_sha256"]
+                != expected_locator_sha256
+            ):
+                raise RecordConflictError(
+                    "Docling native-locator configuration does not match its adapter input"
+                )
+
+        if (
+            span_set.artifact_id != producer.artifact_id
+            or span_set.processing_run_id != producer.run_id
+            or span_set.representation_product_id != docling_product.product_id
+        ):
+            raise RecordConflictError(
+                "content spans are not bound to their Docling producer and representation"
+            )
+
+        quality = DoclingQualityValidator(float(minimum_coverage)).validate(
+            docling_payload,
+            require_pdf_geometry=input_format is InputFormat.PDF,
+        )
+        fatal_empty = any(
+            issue.code in {"NO_TEXT_ITEMS", "NO_NONEMPTY_TEXT_ITEMS"}
+            for issue in quality.issues
+        )
+        if fatal_empty:
+            raise RecordConflictError(
+                "Docling native source is not semantically usable"
+            )
+        has_errors = any(
+            issue.severity is QualitySeverity.ERROR for issue in quality.issues
+        )
+        if has_errors and producer.status is ProcessingRunStatus.COMPLETE:
+            raise RecordConflictError(
+                "complete Docling producer masks semantic validation errors"
+            )
+        return producer
+
+    def _docling_locator_configuration_sha256(self, product: DataProductRef) -> str:
+        payload_bytes = self.read_blob(product.blob_sha256)
+        try:
+            payload = json.loads(payload_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RecordConflictError(
+                "native-locator adapter product is not valid JSON"
+            ) from exc
+        if not isinstance(payload, list) or any(
+            not isinstance(item, dict) for item in payload
+        ):
+            raise RecordConflictError(
+                "native-locator adapter product must be a list of objects"
+            )
+        if payload_bytes != _canonical_json_bytes(payload):
+            raise RecordConflictError(
+                "native-locator adapter product is not deterministically serialized"
+            )
+        return product.blob_sha256
+
+    def _verify_adapter_inputs(
+        self,
+        *,
+        artifact: DocumentArtifact,
+        input_format: InputFormat,
+        products: tuple[DataProductRef, ...],
+        expected_direct_inputs: tuple[DataProductRef, ...],
+    ) -> tuple[DataProductRef, DataProductRef]:
+        if len(products) != 2:
+            raise RecordConflictError(
+                "BioC Docling inputs must be the adapter HTML and locator products"
+            )
+        html_product, locator_product = products
+        if html_product.name != "html_projection":
+            raise RecordConflictError("BioC Docling input is not an HTML projection")
+        adapter = self._verify_adapter_product(
+            artifact=artifact,
+            input_format=input_format,
+            product=locator_product,
+            expected_direct_inputs=expected_direct_inputs,
+        )
+        if (
+            html_product.producer_run_id != adapter.run_id
+            or html_product not in adapter.outputs
+        ):
+            raise RecordConflictError(
+                "BioC HTML and locator inputs must share the approved adapter producer"
+            )
+        return html_product, locator_product
+
+    def _verify_adapter_product(
+        self,
+        *,
+        artifact: DocumentArtifact,
+        input_format: InputFormat,
+        product: DataProductRef,
+        expected_direct_inputs: tuple[DataProductRef, ...],
+    ) -> ProcessingRun:
+        if product.name != "native_locator_overlay":
+            raise RecordConflictError(
+                "Docling native-locator input has the wrong product contract"
+            )
+        adapter = self.get_processing_run(product.producer_run_id)
+        component_id = (
+            "jats-locator-adapter"
+            if input_format is InputFormat.JATS
+            else "bioc-adapter"
+        )
+        self._require_component_contract(
+            adapter,
+            component_id=component_id,
+            component_version="1",
+            capability="document.adapt",
+            statuses=frozenset(
+                {ProcessingRunStatus.COMPLETE, ProcessingRunStatus.PARTIAL}
+            ),
+            purpose=f"{input_format.value} locator adapter",
+        )
+        if adapter.artifact_id != artifact.artifact_id:
+            raise RecordConflictError(
+                "native-locator adapter does not own the Docling artifact"
+            )
+        expected_configuration = {
+            "adapter_version": "1",
+            "input_format": input_format.value,
+            "input_sha256": artifact.source_sha256,
+        }
+        if adapter.configuration != expected_configuration:
+            raise RecordConflictError(
+                "native-locator adapter configuration does not match its artifact"
+            )
+        if adapter.inputs != expected_direct_inputs or product not in adapter.outputs:
+            raise RecordConflictError(
+                "native-locator adapter lineage does not match its artifact"
+            )
+        return adapter
+
+    def _verify_grobid_native_source(
+        self,
+        *,
+        canonical_artifact: DocumentArtifact,
+        product: DataProductRef,
+        tei_xml: bytes,
+    ) -> ProcessingRun:
+        producer = self.get_processing_run(product.producer_run_id)
+        self._require_component_contract(
+            producer,
+            component_id="grobid",
+            component_version=_GROBID_COMPONENT_VERSION,
+            capability="document.parse.scholarly",
+            statuses=frozenset(
+                {ProcessingRunStatus.COMPLETE, ProcessingRunStatus.PARTIAL}
+            ),
+            purpose="GROBID native source",
+        )
+        if product not in producer.outputs:
+            raise RecordConflictError(
+                "GROBID native-source producer does not declare the exact TEI product"
+            )
+        grobid_artifact = self.get_artifact(producer.artifact_id)
+        expected_grobid_inputs = self._verify_grobid_artifact_lineage(
+            canonical_artifact=canonical_artifact,
+            grobid_artifact=grobid_artifact,
+        )
+
+        configuration = producer.configuration
+        if configuration.keys() != _GROBID_CONFIGURATION_KEYS:
+            raise RecordConflictError(
+                "GROBID producer configuration does not match the production schema"
+            )
+        if configuration["expected_grobid_version"] != _GROBID_COMPONENT_VERSION:
+            raise RecordConflictError(
+                "GROBID producer version configuration is not approved"
+            )
+        self._verify_container_configuration(
+            producer,
+            purpose="GROBID",
+            expected_image_tag=_GROBID_IMAGE_TAG,
+            expected_component_versions={"grobid": _GROBID_COMPONENT_VERSION},
+        )
+        if producer.inputs != expected_grobid_inputs:
+            raise RecordConflictError(
+                "GROBID producer inputs do not match artifact provenance"
+            )
+        if configuration["input_sha256"] != grobid_artifact.source_sha256:
+            raise RecordConflictError(
+                "GROBID producer input hash does not match its artifact bytes"
+            )
+        for option in ("consolidate_header", "consolidate_citations"):
+            if type(configuration[option]) is not int or configuration[option] not in {
+                0,
+                1,
+            }:
+                raise RecordConflictError(f"GROBID {option} must be 0 or 1")
+        if not isinstance(configuration["segment_sentences"], bool):
+            raise RecordConflictError("GROBID segment_sentences must be a boolean")
+        coordinates = configuration["coordinates"]
+        if not isinstance(coordinates, list) or any(
+            not isinstance(value, str) or not value.strip() for value in coordinates
+        ):
+            raise RecordConflictError("GROBID coordinates must be a string list")
+        minimum_characters = configuration["minimum_text_characters"]
+        if (
+            isinstance(minimum_characters, bool)
+            or not isinstance(minimum_characters, int)
+            or minimum_characters < 0
+        ):
+            raise RecordConflictError(
+                "GROBID minimum text characters must be a non-negative integer"
+            )
+        try:
+            root = ElementTree.fromstring(tei_xml)
+        except (DefusedXmlException, ElementTree.ParseError) as exc:
+            raise RecordConflictError("GROBID source is not usable TEI XML") from exc
+        if root.tag != "{http://www.tei-c.org/ns/1.0}TEI":
+            raise RecordConflictError(
+                "GROBID source root is not TEI in the canonical namespace"
+            )
+        text_length = len(" ".join("".join(root.itertext()).split()))
+        if text_length == 0 or text_length < minimum_characters:
+            raise RecordConflictError(
+                "GROBID source does not satisfy its recorded usability threshold"
+            )
+        return producer
+
+    def _verify_grobid_artifact_lineage(
+        self,
+        *,
+        canonical_artifact: DocumentArtifact,
+        grobid_artifact: DocumentArtifact,
+    ) -> tuple[DataProductRef, ...]:
+        """Bind GROBID to the canonical source or one exact OCR derivative."""
+
+        if grobid_artifact.artifact_id == canonical_artifact.artifact_id:
+            return self._native_artifact_inputs(grobid_artifact)
+        if (
+            grobid_artifact.relationship is not ArtifactRelationship.DERIVATIVE
+            or grobid_artifact.parent_artifact_id != canonical_artifact.artifact_id
+            or grobid_artifact.media_type != "application/pdf"
+        ):
+            raise RecordConflictError(
+                "GROBID native source is not a direct PDF derivative of the "
+                "canonical artifact"
+            )
+
+        creator_run_id = grobid_artifact.raw_location.created_by_run_id
+        if creator_run_id is None:  # guarded by durable artifact admission
+            raise RecordConflictError("GROBID OCR derivative has no creator run")
+        creator = self.get_processing_run(creator_run_id)
+        self._require_component_contract(
+            creator,
+            component_id="ocrmypdf",
+            component_version=_OCR_COMPONENT_VERSION,
+            capability="document.ocr",
+            statuses=frozenset(
+                {ProcessingRunStatus.COMPLETE, ProcessingRunStatus.PARTIAL}
+            ),
+            purpose="GROBID OCR derivative",
+        )
+        if creator.artifact_id != canonical_artifact.artifact_id:
+            raise RecordConflictError(
+                "GROBID OCR derivative creator does not own the canonical artifact"
+            )
+        creator_products = tuple(
+            output
+            for output in creator.outputs
+            if output.name == "searchable_pdf"
+            and output.blob_sha256 == grobid_artifact.source_sha256
+        )
+        if len(creator_products) != 1:
+            raise RecordConflictError(
+                "GROBID OCR derivative does not resolve to one searchable-PDF product"
+            )
+        creator_product = creator_products[0]
+        if creator.inputs != self._native_artifact_inputs(canonical_artifact):
+            raise RecordConflictError(
+                "GROBID OCR derivative creator inputs do not match source provenance"
+            )
+        self._verify_ocr_configuration(creator, canonical_artifact)
+        return (creator_product,)
+
+    def _verify_ocr_configuration(
+        self,
+        producer: ProcessingRun,
+        source_artifact: DocumentArtifact,
+    ) -> None:
+        configuration = producer.configuration
+        if configuration.keys() != _OCR_CONFIGURATION_KEYS:
+            raise RecordConflictError(
+                "GROBID OCR derivative configuration does not match the production schema"
+            )
+        if (
+            configuration["input_sha256"] != source_artifact.source_sha256
+            or configuration["expected_ocrmypdf_version"] != _OCR_COMPONENT_VERSION
+        ):
+            raise RecordConflictError(
+                "GROBID OCR derivative configuration does not match its exact source"
+            )
+        fallback_reason = configuration["fallback_reason"]
+        if not isinstance(fallback_reason, str) or not fallback_reason.strip():
+            raise RecordConflictError("GROBID OCR fallback reason is invalid")
+
+        mode = configuration["mode"]
+        image = configuration["container_image"]
+        digest = configuration["container_digest"]
+        if mode == "container_cli":
+            if (
+                not isinstance(image, str)
+                or not image.strip()
+                or not image.split("@", maxsplit=1)[0].endswith(_OCR_IMAGE_TAG)
+                or (digest is not None and not _is_oci_sha256(digest))
+            ):
+                raise RecordConflictError(
+                    "GROBID OCR derivative container identity is not approved"
+                )
+        elif mode == "local_cli":
+            if image is not None or digest is not None:
+                raise RecordConflictError(
+                    "local GROBID OCR derivative cannot claim a container identity"
+                )
+        else:
+            raise RecordConflictError("GROBID OCR derivative mode is not approved")
+
+        languages = configuration["languages"]
+        if (
+            not isinstance(languages, list)
+            or not languages
+            or any(
+                not isinstance(value, str) or not value.strip() for value in languages
+            )
+        ):
+            raise RecordConflictError("GROBID OCR derivative languages are invalid")
+        for option in ("rotate_pages", "deskew", "skip_text"):
+            if not isinstance(configuration[option], bool):
+                raise RecordConflictError(
+                    f"GROBID OCR derivative {option} must be a boolean"
+                )
+        if configuration["skip_text"] is not True:
+            raise RecordConflictError(
+                "GROBID OCR derivative must preserve existing text with skip_text"
+            )
+        jobs = configuration["jobs"]
+        optimize = configuration["optimize"]
+        if isinstance(jobs, bool) or not isinstance(jobs, int) or jobs < 1:
+            raise RecordConflictError("GROBID OCR derivative jobs are invalid")
+        if (
+            isinstance(optimize, bool)
+            or not isinstance(optimize, int)
+            or not 0 <= optimize <= 3
+        ):
+            raise RecordConflictError("GROBID OCR derivative optimize is invalid")
+        if configuration["output_type"] != "pdf":
+            raise RecordConflictError("GROBID OCR derivative output type is invalid")
+
+        attestation = producer.runtime_attestation
+        if attestation is None:
+            return
+        component_versions = attestation.component_versions
+        if (
+            attestation.source
+            is not RuntimeAttestationSource.DIGEST_ADDRESSED_OCI_INVOCATION
+            or component_versions.keys() != {"ocrmypdf", "tesseract"}
+            or component_versions["ocrmypdf"] != _OCR_COMPONENT_VERSION
+            or not isinstance(component_versions["tesseract"], str)
+            or not component_versions["tesseract"].strip()
+            or digest != attestation.container_digest
+            or not isinstance(image, str)
+            or image.split("@", maxsplit=1)[0]
+            != attestation.container_reference.split("@", maxsplit=1)[0]
+        ):
+            raise RecordConflictError(
+                "GROBID OCR derivative runtime attestation conflicts with configuration"
+            )
+        attestation_bytes = _canonical_json_bytes(attestation.model_dump(mode="json"))
+        if (
+            self.read_blob(producer.runtime_attestation_sha256 or "")
+            != attestation_bytes
+        ):  # pragma: no cover - canonical SHA-256 output makes inequality unreachable
+            raise RecordConflictError(
+                "GROBID OCR derivative runtime attestation bytes are not canonical"
+            )
+
+    def _verify_container_configuration(
+        self,
+        run: ProcessingRun,
+        *,
+        purpose: str,
+        expected_image_tag: str,
+        expected_component_versions: dict[str, str],
+    ) -> None:
+        configuration = run.configuration
+        image = configuration.get("container_image")
+        digest = configuration.get("container_digest")
+        model_versions = configuration.get("model_versions")
+        model_hashes = configuration.get("model_hashes")
+        if (
+            not isinstance(image, str)
+            or not image.strip()
+            or not image.split("@", maxsplit=1)[0].endswith(expected_image_tag)
+        ):
+            raise RecordConflictError(f"{purpose} container image is not approved")
+        if digest is not None and not _is_oci_sha256(digest):
+            raise RecordConflictError(f"{purpose} container digest is invalid")
+        if (
+            not isinstance(model_versions, dict)
+            or not isinstance(model_hashes, dict)
+            or not _valid_version_mapping(model_versions)
+            or not _valid_hash_mapping(model_hashes)
+        ):
+            raise RecordConflictError(f"{purpose} model inventory is invalid")
+        if model_versions.keys() != model_hashes.keys():
+            raise RecordConflictError(
+                f"{purpose} model version/hash inventories do not match"
+            )
+
+        attestation = run.runtime_attestation
+        if attestation is None:
+            if (
+                run.status is ProcessingRunStatus.COMPLETE
+                and run.runtime_identity_required
+            ):
+                raise RecordConflictError(
+                    f"complete {purpose} producer lacks required runtime attestation"
+                )
+            return
+        if attestation.source is not _REMOTE_ATTESTATION_SOURCE:
+            raise RecordConflictError(
+                f"{purpose} runtime attestation source is not approved"
+            )
+        if attestation.component_versions != expected_component_versions:
+            raise RecordConflictError(
+                f"{purpose} runtime-attested component versions are not approved"
+            )
+        if (
+            digest != attestation.container_digest
+            or image.split("@", maxsplit=1)[0]
+            != attestation.container_reference.split("@", maxsplit=1)[0]
+            or model_versions != attestation.model_versions
+            or model_hashes != attestation.model_hashes
+        ):
+            raise RecordConflictError(
+                f"{purpose} runtime attestation conflicts with its production configuration"
+            )
+        attestation_bytes = _canonical_json_bytes(attestation.model_dump(mode="json"))
+        if (  # pragma: no cover - canonical SHA-256 output makes inequality unreachable
+            self.read_blob(run.runtime_attestation_sha256 or "") != attestation_bytes
+        ):
+            raise RecordConflictError(
+                f"{purpose} runtime attestation bytes are not canonical"
+            )
+
+    def _native_artifact_inputs(
+        self, artifact: DocumentArtifact
+    ) -> tuple[DataProductRef, ...]:
+        creator_run_id = artifact.raw_location.created_by_run_id
+        if creator_run_id is None:
+            return ()
+        creator = self.get_processing_run(creator_run_id)
+        products = tuple(
+            product
+            for product in creator.outputs
+            if product.blob_sha256 == artifact.source_sha256
+        )
+        if len(products) != 1:
+            raise RecordConflictError(
+                "derived native artifact does not resolve to exactly one creator product"
+            )
+        return products
+
+    def _verify_canonical_product(
+        self,
+        product: DataProductRef,
+        producer: ProcessingRun,
+    ) -> CanonicalDocumentView:
+        """Reproduce one canonical product from its exact durable inputs."""
+
+        expected_component = (
+            CANONICAL_COMPONENT_ID,
+            CANONICAL_COMPONENT_VERSION,
+            CANONICAL_COMPONENT_CAPABILITY,
+        )
+        actual_component = (
+            producer.component_id,
+            producer.component_version,
+            producer.component.capability,
+        )
+        if actual_component != expected_component:
+            raise RecordConflictError(
+                "canonical product producer identity does not match the "
+                "canonicalization contract"
+            )
+        if producer.status not in {
+            ProcessingRunStatus.COMPLETE,
+            ProcessingRunStatus.PARTIAL,
+        }:
+            raise RecordConflictError(
+                "canonical product producer must have a complete or partial status"
+            )
+        if product not in producer.outputs:
+            raise RecordConflictError(
+                f"canonical product {product.product_id!r} is not declared by "
+                f"producer run {producer.run_id!r}"
+            )
+
+        try:
+            configuration = CanonicalizationConfig.model_validate(
+                producer.configuration.get("policy")
+            )
+        except ValidationError as exc:
+            raise RecordConflictError("canonical producer policy is invalid") from exc
+        expected_configuration = canonical_invocation_configuration(
+            configuration,
+            producer.inputs,
+        )
+        if producer.configuration != expected_configuration:
+            raise RecordConflictError(
+                "canonical producer configuration does not match its exact inputs"
+            )
+
+        artifact = self.get_artifact(producer.artifact_id)
+        stored_bytes = self.read_blob(product.blob_sha256)
+        stored_view = load_canonical_document(stored_bytes)
+        if stored_view.artifact_id != artifact.artifact_id:
+            raise RecordConflictError(
+                f"canonical product {product.product_id!r} artifact does not match "
+                f"producer artifact {artifact.artifact_id!r}"
+            )
+        if stored_view.source_sha256 != artifact.source_sha256:
+            raise RecordConflictError(
+                f"canonical product {product.product_id!r} source hash does not "
+                f"match producer artifact {artifact.artifact_id!r}"
+            )
+        if stored_view.source_products != producer.inputs:
+            raise RecordConflictError(
+                f"canonical product {product.product_id!r} source products do not "
+                f"exactly match producer run {producer.run_id!r} inputs"
+            )
+
+        products_by_name: dict[str, list[DataProductRef]] = {}
+        for source_product in producer.inputs:
+            products_by_name.setdefault(source_product.name, []).append(source_product)
+
+        docling_product = _require_single_product(
+            products_by_name,
+            "docling_document",
+        )
+        spans_product = _require_single_product(products_by_name, "content_spans")
+        docling_bytes = self.read_blob(docling_product.blob_sha256)
+        docling_payload = _strict_canonical_json_object(
+            docling_bytes,
+            purpose="canonical Docling source",
+        )
+        span_bytes = self.read_blob(spans_product.blob_sha256)
+        try:
+            span_payload = _strict_canonical_json_object(
+                span_bytes,
+                purpose="canonical content-span source",
+            )
+            validated_span_set = ContentSpanSet.model_validate(span_payload)
+        except ValidationError as exc:
+            raise RecordConflictError(
+                "canonical content-span source is invalid"
+            ) from exc
+        if span_bytes != _canonical_json_bytes(
+            validated_span_set.model_dump(mode="json")
+        ):
+            raise RecordConflictError(
+                "canonical content-span source is not deterministically serialized"
+            )
+        span_producer = self._verify_docling_native_sources(
+            canonical_artifact=artifact,
+            docling_product=docling_product,
+            spans_product=spans_product,
+            docling_payload=docling_payload,
+            span_set=validated_span_set,
+        )
+        native_outputs = tuple(
+            output
+            for output in span_producer.outputs
+            if output.name == "native_locator_overlay"
+        )
+        native_product = native_outputs[0] if native_outputs else None
+        native_bytes: bytes | None = None
+        if native_product is not None:
+            self._verify_product(native_product)
+            self._verify_output_lineage(native_product, span_producer)
+            native_bytes = self.read_blob(native_product.blob_sha256)
+
+        adapter_inputs = tuple(
+            input_product
+            for input_product in span_producer.inputs
+            if input_product.name == "native_locator_overlay"
+        )
+        adapter_producer = (
+            self.get_processing_run(adapter_inputs[0].producer_run_id)
+            if adapter_inputs
+            else None
+        )
+        html_inputs = tuple(
+            input_product
+            for input_product in span_producer.inputs
+            if input_product.name == "html_projection"
+        )
+        html_projection_bytes = (
+            self.read_blob(html_inputs[0].blob_sha256) if html_inputs else None
+        )
+        native_alignment_outputs = tuple(
+            output
+            for output in span_producer.outputs
+            if output.name in {"jats_locator_alignment", "bioc_locator_alignment"}
+        )
+        native_alignment_product = (
+            native_alignment_outputs[0] if native_alignment_outputs else None
+        )
+        native_alignment_bytes: bytes | None = None
+        if native_alignment_product is not None:
+            self._verify_product(native_alignment_product)
+            self._verify_output_lineage(native_alignment_product, span_producer)
+            native_alignment_bytes = self.read_blob(
+                native_alignment_product.blob_sha256
+            )
+        try:
+            span_set = replay_content_span_set(
+                artifact=artifact,
+                source_bytes=self.read_blob(artifact.raw_location.sha256),
+                producer=span_producer,
+                docling_product=docling_product,
+                docling_bytes=docling_bytes,
+                docling_document=docling_payload,
+                content_spans_product=spans_product,
+                content_spans_bytes=span_bytes,
+                native_locator_product=native_product,
+                native_locator_bytes=native_bytes,
+                adapter_producer=adapter_producer,
+                html_projection_bytes=html_projection_bytes,
+                native_alignment_product=native_alignment_product,
+                native_alignment_bytes=native_alignment_bytes,
+            )
+        except ContentSpanReplayError as exc:
+            raise RecordConflictError(
+                "canonical content-span source does not reproduce from its "
+                "exact Docling invocation"
+            ) from exc
+
+        grobid_products = tuple(products_by_name.get("grobid_tei", ()))
+        alignment_products = tuple(products_by_name.get("alignment_overlay", ()))
+        if bool(grobid_products) != bool(alignment_products):  # pragma: no cover
+            # CanonicalDocumentView rejects unpaired scholarly sources before
+            # an admitted product can reach this defense-in-depth boundary.
+            raise RecordConflictError(
+                "canonical scholarly sources require paired GROBID and alignment products"
+            )
+        if (  # pragma: no cover
+            len(grobid_products) > 1 or len(alignment_products) > 1
+        ):
+            # CanonicalDocumentView also enforces exact scholarly uniqueness.
+            raise RecordConflictError("canonical scholarly sources must be unique")
+
+        scholarly_overlay: ScholarlyAlignmentOverlay | None = None
+        alignment_product: DataProductRef | None = None
+        if grobid_products:
+            grobid_product = grobid_products[0]
+            alignment_product = alignment_products[0]
+            grobid_bytes = self.read_blob(grobid_product.blob_sha256)
+            self._verify_grobid_native_source(
+                canonical_artifact=artifact,
+                product=grobid_product,
+                tei_xml=grobid_bytes,
+            )
+            alignment_run = self.get_processing_run(alignment_product.producer_run_id)
+            self._require_component_contract(
+                alignment_run,
+                component_id="docling-grobid-aligner",
+                component_version="2",
+                capability="document.align",
+                statuses=frozenset({ProcessingRunStatus.COMPLETE}),
+                purpose="scholarly alignment",
+            )
+            if alignment_run.inputs != (docling_product, grobid_product):
+                raise RecordConflictError(
+                    "scholarly alignment inputs do not match the canonical sources"
+                )
+            if alignment_run.artifact_id != artifact.artifact_id:
+                raise RecordConflictError(
+                    "scholarly alignment producer does not own the canonical artifact"
+                )
+            minimum_score = alignment_run.configuration.get("minimum_score")
+            if (
+                isinstance(minimum_score, bool)
+                or not isinstance(minimum_score, (int, float))
+                or not 0 <= minimum_score <= 1
+            ):
+                raise RecordConflictError(
+                    "scholarly alignment minimum score is invalid"
+                )
+            expected_alignment_configuration = {
+                "algorithm": "token-sequence-v2",
+                "minimum_score": minimum_score,
+                "docling_document_sha256": docling_product.blob_sha256,
+                "grobid_tei_sha256": grobid_product.blob_sha256,
+            }
+            if alignment_run.configuration != expected_alignment_configuration:
+                raise RecordConflictError(
+                    "scholarly alignment configuration does not match its inputs"
+                )
+            alignment_bytes = self.read_blob(alignment_product.blob_sha256)
+            try:
+                alignment_payload = json.loads(alignment_bytes)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RecordConflictError(
+                    "scholarly alignment product is not valid JSON"
+                ) from exc
+            if not isinstance(alignment_payload, dict):
+                raise RecordConflictError(
+                    "scholarly alignment product must be a JSON object"
+                )
+            try:
+                scholarly_overlay = ScholarlyAlignmentOverlay.from_dict(
+                    alignment_payload
+                )
+                verify_scholarly_alignment_overlay(
+                    docling_payload,
+                    grobid_bytes,
+                    scholarly_overlay,
+                    minimum_score=float(minimum_score),
+                )
+            except ValueError as exc:
+                raise RecordConflictError(
+                    "scholarly alignment product does not reproduce from its inputs"
+                ) from exc
+            if alignment_bytes != _canonical_json_bytes(scholarly_overlay.to_dict()):
+                raise RecordConflictError(
+                    "scholarly alignment product is not deterministically serialized"
+                )
+
+        integrity_products = tuple(
+            products_by_name.get("content_integrity_overlay", ())
+        )
+        if len(integrity_products) > 1:  # pragma: no cover
+            # CanonicalDocumentView permits at most one integrity product.
+            raise RecordConflictError(
+                "canonical content-integrity source must be unique"
+            )
+        integrity_payload: dict[str, object] | None = None
+        if integrity_products:
+            integrity_product = integrity_products[0]
+            integrity_run = self.get_processing_run(integrity_product.producer_run_id)
+            self._require_component_contract(
+                integrity_run,
+                component_id="docling-content-integrity",
+                component_version="1",
+                capability="document.validate",
+                statuses=frozenset(
+                    {
+                        ProcessingRunStatus.COMPLETE,
+                        ProcessingRunStatus.PARTIAL,
+                    }
+                ),
+                purpose="content integrity",
+            )
+            expected_integrity_inputs = (docling_product,) + (
+                (alignment_product,) if alignment_product is not None else ()
+            )
+            if integrity_run.inputs != expected_integrity_inputs:
+                raise RecordConflictError(
+                    "content-integrity inputs do not match the canonical sources"
+                )
+            if integrity_run.artifact_id != artifact.artifact_id:
+                raise RecordConflictError(
+                    "content-integrity producer does not own the canonical artifact"
+                )
+            expected_integrity_configuration = {
+                "algorithm": "explicit-content-integrity-v1",
+                "docling_document_sha256": docling_product.blob_sha256,
+                "scholarly_alignment_sha256": (
+                    alignment_product.blob_sha256
+                    if alignment_product is not None
+                    else None
+                ),
+            }
+            if integrity_run.configuration != expected_integrity_configuration:
+                raise RecordConflictError(
+                    "content-integrity configuration does not match its inputs"
+                )
+            expected_integrity_payload = validate_content_integrity(
+                docling_payload,
+                scholarly_overlay=scholarly_overlay,
+            ).to_dict()
+            if (
+                expected_integrity_payload["issues"]
+                and integrity_run.status is ProcessingRunStatus.COMPLETE
+            ):
+                raise RecordConflictError(
+                    "complete content-integrity producer masks replayed issues"
+                )
+            integrity_bytes = self.read_blob(integrity_product.blob_sha256)
+            if integrity_bytes != _canonical_json_bytes(expected_integrity_payload):
+                raise RecordConflictError(
+                    "content-integrity product does not reproduce from its inputs"
+                )
+            integrity_payload = expected_integrity_payload
+
+        try:
+            rebuilt_view = build_canonical_document_view(
+                artifact=artifact,
+                docling_document=docling_payload,
+                docling_product=docling_product,
+                content_span_set=span_set,
+                source_products=producer.inputs,
+                configuration=configuration,
+                scholarly_overlay=scholarly_overlay,
+                integrity_report=integrity_payload,
+            )
+        except ValueError as exc:
+            raise RecordConflictError(
+                "canonical product cannot be rebuilt from its exact sources"
+            ) from exc
+        rebuilt_bytes = canonical_document_bytes(rebuilt_view)
+        if (
+            any(
+                diagnostic.severity is CanonicalDiagnosticSeverity.ERROR
+                for diagnostic in rebuilt_view.diagnostics
+            )
+            and producer.status is ProcessingRunStatus.COMPLETE
+        ):
+            raise RecordConflictError(
+                "complete canonical producer masks replayed semantic errors"
+            )
+        if stored_view.view_id != rebuilt_view.view_id:
+            raise RecordConflictError(
+                "canonical view identity does not match its exact sources"
+            )
+        if stored_bytes != rebuilt_bytes:
+            raise RecordConflictError(
+                "canonical document bytes do not match their deterministic rebuild"
+            )
+        return stored_view
+
+    @staticmethod
+    def _require_component_contract(
+        run: ProcessingRun,
+        *,
+        component_id: str,
+        component_version: str,
+        capability: str,
+        statuses: frozenset[ProcessingRunStatus],
+        purpose: str,
+    ) -> None:
+        if (
+            run.component_id,
+            run.component_version,
+            run.component.capability,
+        ) != (component_id, component_version, capability):
+            raise RecordConflictError(
+                f"{purpose} producer identity does not match its contract"
+            )
+        if run.status not in statuses:
+            raise RecordConflictError(
+                f"{purpose} producer status does not permit durable reuse"
+            )
+
     def _verify_product(self, product: DataProductRef) -> None:
         try:
             validate_product_contract(product)
@@ -923,6 +2024,95 @@ def _canonical_record_bytes(record: BaseModel) -> bytes:
         )
         + "\n"
     ).encode("utf-8")
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _strict_canonical_json_object(
+    payload: bytes,
+    *,
+    purpose: str,
+) -> dict[str, Any]:
+    """Decode one canonical JSON object without accepting ambiguous syntax."""
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def reject_nonfinite(value: str) -> None:
+        raise ValueError(f"non-finite JSON number: {value}")
+
+    try:
+        decoded = json.loads(
+            payload,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonfinite,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise RecordConflictError(f"{purpose} is not strict JSON") from exc
+    if not isinstance(decoded, dict):
+        raise RecordConflictError(f"{purpose} must be a JSON object")
+    try:
+        canonical_bytes = _canonical_json_bytes(decoded)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - parser defense
+        raise RecordConflictError(f"{purpose} is not canonical JSON") from exc
+    if payload != canonical_bytes:
+        raise RecordConflictError(f"{purpose} is not deterministically serialized")
+    return decoded
+
+
+def _is_oci_sha256(value: object) -> bool:
+    if not isinstance(value, str) or not value.startswith("sha256:"):
+        return False
+    digest = value.removeprefix("sha256:")
+    return len(digest) == 64 and all(
+        character in _SHA256_PATTERN for character in digest
+    )
+
+
+def _valid_version_mapping(value: object) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(key, str)
+        and bool(key.strip())
+        and isinstance(version, str)
+        and bool(version.strip())
+        for key, version in value.items()
+    )
+
+
+def _valid_hash_mapping(value: object) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(key, str)
+        and bool(key.strip())
+        and isinstance(digest, str)
+        and len(digest) == 64
+        and all(character in _SHA256_PATTERN for character in digest)
+        for key, digest in value.items()
+    )
+
+
+def _require_single_product(
+    products_by_name: Mapping[str, list[DataProductRef]],
+    name: str,
+) -> DataProductRef:
+    products = products_by_name.get(name)
+    if products is None or len(products) != 1:
+        raise RecordConflictError(
+            f"canonical sources require exactly one {name!r} product"
+        )
+    return products[0]
 
 
 def _validate_sha256(value: str) -> None:

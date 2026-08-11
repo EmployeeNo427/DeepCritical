@@ -51,6 +51,17 @@ Immutable tuples and read-only metadata mappings protect nested state, and the
 store rebuilds the complete model immediately before deterministic
 serialization so unvalidated copies or stale identities cannot become durable.
 
+CAS blob publication is only staging, not semantic admission. A
+`canonical_document_view` becomes a trusted product only when its producer run
+is saved with the exact `canonical-document-view` component identity, version,
+capability, complete-or-partial status, closed policy, and input manifest. At
+that boundary—and again on every verified read—the store decodes the exact
+durable Docling and content-span products, replays any GROBID alignment from
+the exact TEI and recorded threshold, replays the content-integrity report,
+rebuilds the complete view, and requires identical `view_id` and deterministic
+bytes. A rejected admission may leave an unreferenced CAS blob, but it cannot
+leave a trusted processing-run output.
+
 Native products remain immutable after the canonical view is introduced.
 `docling_document` remains a native Docling product rather than being relabelled
 as canonical. `ContentSpan.representation_anchor` still identifies the exact
@@ -77,3 +88,8 @@ must exactly equal the view's `source_products`. A mapping gap produces
 inspectable diagnostics rather than an invented coordinate. This adds one
 durable product and processing run, but avoids a repository-wide migration
 whenever Docling or another processor changes its native schema.
+Semantic admission and verified reads are therefore linear in the native
+document and overlay sizes. This deliberate replay cost prevents a hash-correct
+but semantically fabricated node, range, scholarly anchor, or metadata value
+from being accepted. Any future cache must be keyed only by immutable product
+and configuration identities and must preserve the same verification result.

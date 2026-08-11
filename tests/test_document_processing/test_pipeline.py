@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import time
@@ -13,6 +14,10 @@ from pypdf import PdfWriter
 
 from DeepResearch.src.document_processing import pipeline as pipeline_module
 from DeepResearch.src.document_processing import preflight as preflight_module
+from DeepResearch.src.document_processing.canonical import (
+    CanonicalDocumentView,
+    canonical_view_id,
+)
 from DeepResearch.src.document_processing.clients import (
     DoclingConversionResult,
     GrobidResult,
@@ -20,6 +25,8 @@ from DeepResearch.src.document_processing.clients import (
     ParserServiceError,
 )
 from DeepResearch.src.document_processing.document_pipeline import (
+    DocumentProcessingFailureRecorder,
+    _DocumentStagePlugins,
     default_document_pipeline_spec,
 )
 from DeepResearch.src.document_processing.models import (
@@ -40,10 +47,13 @@ from DeepResearch.src.document_processing.models import (
 )
 from DeepResearch.src.document_processing.orchestration import (
     CompiledStage,
+    EmptyComponentConfig,
     LocalStageExecutor,
     StageContext,
     StageExecutionStatus,
+    StageFailure,
     StageResult,
+    _active_stage_context,
 )
 from DeepResearch.src.document_processing.pipeline import (
     ArtifactMetadataConflictError,
@@ -243,6 +253,45 @@ class BrokenHierarchyDocling(FakeDocling):
     async def convert(self, *args: Any, **kwargs: Any) -> DoclingConversionResult:
         result = await super().convert(*args, **kwargs)
         result.document["body"]["children"].append({"$ref": "#/texts/404"})
+        return result
+
+
+class MalformedTableDocling(FakeDocling):
+    async def convert(self, *args: Any, **kwargs: Any) -> DoclingConversionResult:
+        result = await super().convert(*args, **kwargs)
+        result.document["tables"] = [
+            {
+                "self_ref": "#/tables/0",
+                "label": "table",
+                "captions": [],
+                "data": {
+                    "table_cells": [
+                        {
+                            "text": "valid",
+                            "start_row_offset_idx": 0,
+                            "start_col_offset_idx": 0,
+                        },
+                        42,
+                    ]
+                },
+            }
+        ]
+        result.document["body"]["children"].append({"$ref": "#/tables/0"})
+        return result
+
+
+class InvalidCaptionCollectionDocling(FakeDocling):
+    async def convert(self, *args: Any, **kwargs: Any) -> DoclingConversionResult:
+        result = await super().convert(*args, **kwargs)
+        result.document["tables"] = [
+            {
+                "self_ref": "#/tables/0",
+                "label": "table",
+                "captions": "not-a-list",
+                "data": {"grid": [["valid"]]},
+            }
+        ]
+        result.document["body"]["children"].append({"$ref": "#/tables/0"})
         return result
 
 
@@ -667,6 +716,98 @@ class _RaiseAfterStageExecutor:
         if stage.spec.stage_id == self.stage_id:
             raise RuntimeError(f"unexpected failure after {self.stage_id}")
         return result
+
+
+class _ConcurrentRouteFailureExecutor:
+    """Order two same-workflow failures so the later invocation persists first."""
+
+    def __init__(self) -> None:
+        self.local = LocalStageExecutor()
+        self.route_contexts: list[StageContext] = []
+        self.route_barrier = asyncio.Barrier(2)
+        self.second_recorded = asyncio.Event()
+
+    async def execute(
+        self,
+        stage: CompiledStage,
+        context: StageContext,
+    ) -> StageResult:
+        if stage.spec.stage_id != "route":
+            return await self.local.execute(stage, context)
+        self.route_contexts.append(context)
+        invocation_position = len(self.route_contexts)
+        await self.route_barrier.wait()
+        if invocation_position == 1:
+            await self.second_recorded.wait()
+            raise RuntimeError("first concurrent route failure")
+        if invocation_position == 2:
+            raise RuntimeError("second concurrent route failure")
+        raise AssertionError("expected exactly two concurrent route invocations")
+
+
+class _CoordinatedFailureRecorder:
+    def __init__(
+        self,
+        processor: DocumentProcessor,
+        executor: _ConcurrentRouteFailureExecutor,
+    ) -> None:
+        self.delegate = DocumentProcessingFailureRecorder(processor)
+        self.executor = executor
+
+    async def record_failure(self, failure: StageFailure) -> None:
+        await self.delegate.record_failure(failure)
+        if (
+            len(self.executor.route_contexts) == 2
+            and failure.stage_invocation_id
+            == self.executor.route_contexts[1].stage_invocation_id
+        ):
+            self.executor.second_recorded.set()
+
+
+class _CapturingFailureRecorder:
+    def __init__(self, processor: DocumentProcessor) -> None:
+        self.delegate = DocumentProcessingFailureRecorder(processor)
+        self.failures: list[StageFailure] = []
+
+    async def record_failure(self, failure: StageFailure) -> None:
+        self.failures.append(failure)
+        await self.delegate.record_failure(failure)
+
+
+class _MissingDerivativeInputFailureExecutor:
+    """Persist a same-invocation derivative poison without its source input."""
+
+    def __init__(self, store: ContentAddressedStore) -> None:
+        self.store = store
+        self.local = LocalStageExecutor()
+
+    async def execute(
+        self,
+        stage: CompiledStage,
+        context: StageContext,
+    ) -> StageResult:
+        if stage.spec.stage_id != "fallback-grobid":
+            return await self.local.execute(stage, context)
+        ocr: Any = context.inputs["ocr"]
+        derivative = ocr.stage.derivative
+        assert derivative is not None
+        now = utc_now()
+        self.store.save_processing_run(
+            ProcessingRun(
+                run_id="poison-missing-derivative-input",
+                artifact_id=derivative.artifact_id,
+                pipeline_run_id=context.pipeline_run_id,
+                stage_invocation_id=context.stage_invocation_id,
+                stage_id=context.stage_id,
+                component=stage.registration.descriptor,
+                configuration=stage.configuration.model_dump(mode="python"),
+                configuration_sha256=stage.configuration_sha256,
+                started_at=now,
+                finished_at=now,
+                status=ProcessingRunStatus.FAILED,
+            )
+        )
+        raise RuntimeError("fallback poison omitted its derivative input")
 
 
 @pytest.mark.asyncio
@@ -1168,6 +1309,88 @@ async def test_canonicalization_rejects_builder_source_product_drift(
 
 
 @pytest.mark.asyncio
+async def test_canonical_admission_failure_persists_failed_run(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    artifact = processor.ingest_bytes(
+        b"<html><body>canonical admission drift</body></html>",
+        acquisition_uri="https://example.test/canonical-admission-drift.html",
+        media_type="text/html",
+        identifiers={"filename": "canonical-admission-drift.html"},
+    )
+    original_put = store.put_canonical_document
+
+    def stage_drifted_view(view: CanonicalDocumentView):
+        payload = view.model_dump(mode="json")
+        payload["metadata"]["title"] = "Invented after canonical construction"
+        payload["view_id"] = "pending"
+        payload["view_id"] = canonical_view_id(payload)
+        return original_put(CanonicalDocumentView.model_validate(payload))
+
+    monkeypatch.setattr(store, "put_canonical_document", stage_drifted_view)
+
+    result = await processor.process_artifact(artifact.artifact_id)
+
+    assert result.status is ProcessingRunStatus.FAILED
+    assert result.canonical_document_sha256 is None
+    canonical_runs = store.list_processing_runs(
+        artifact_id=artifact.artifact_id,
+        component_id="canonical-document-view",
+    )
+    assert len(canonical_runs) == 1
+    assert canonical_runs[0].status is ProcessingRunStatus.FAILED
+    assert canonical_runs[0].output("canonical_document_view") is None
+    assert "identity does not match" in canonical_runs[0].warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_canonical_commit_incomplete_error_is_not_downgraded(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = DocumentProcessor(
+        ContentAddressedStore(tmp_path / "store"),
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    artifact = processor.ingest_bytes(
+        b"<html><body>canonical commit interruption</body></html>",
+        acquisition_uri="https://example.test/canonical-commit-interruption.html",
+        media_type="text/html",
+        identifiers={"filename": "canonical-commit-interruption.html"},
+    )
+    original_commit = processor._commit_processing_run
+
+    def interrupt_canonical_commit(
+        current_artifact: DocumentArtifact,
+        run: ProcessingRun,
+        diagnostics: tuple[object, ...] = (),
+    ) -> ProcessingRun:
+        if (
+            run.component_id == "canonical-document-view"
+            and run.output("canonical_document_view") is not None
+        ):
+            raise ProcessingRunCommitIncompleteError(run.run_id)
+        return original_commit(current_artifact, run, diagnostics)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(processor, "_commit_processing_run", interrupt_canonical_commit)
+
+    with pytest.raises(ProcessingRunCommitIncompleteError):
+        await processor.process_artifact(artifact.artifact_id)
+
+
+@pytest.mark.asyncio
 async def test_canonicalization_rejects_reused_source_product_drift(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1214,9 +1437,11 @@ async def test_canonicalization_rejects_reused_source_product_drift(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["non_object", "unknown_kind"])
 async def test_canonical_stage_persists_invalid_integrity_payload_as_failure(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    damage: str,
 ) -> None:
     executor = _RecordingExecutor()
     processor = DocumentProcessor(
@@ -1244,7 +1469,23 @@ async def test_canonical_stage_persists_invalid_integrity_payload_as_failure(
 
         def read_blob(sha256: str) -> bytes:
             if sha256 == integrity_sha256:
-                return b"[]"
+                if damage == "non_object":
+                    return b"[]"
+                payload = json.loads(original_read(sha256))
+                payload["records"].append(
+                    {
+                        "record_id": "0" * 64,
+                        "kind": "unknown",
+                        "status": "resolved",
+                        "source_ref": "#/tables/0",
+                        "source_docling_item_ref": "#/tables/0",
+                        "declared_target_refs": [],
+                        "resolved_docling_item_refs": [],
+                        "unresolved_target_refs": [],
+                        "reason_codes": [],
+                    }
+                )
+                return json.dumps(payload).encode()
             return original_read(sha256)
 
         monkeypatch.setattr(processor.store, "read_blob", read_blob)
@@ -1342,6 +1583,171 @@ async def test_canonical_mapping_error_is_persisted_as_partial(
 
 
 @pytest.mark.asyncio
+async def test_malformed_table_mapping_is_persisted_as_canonical_partial(
+    tmp_path,
+) -> None:
+    executor = _RecordingExecutor()
+    processor = DocumentProcessor(
+        ContentAddressedStore(tmp_path / "store"),
+        docling=MalformedTableDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+        stage_executor=executor,
+    )
+    artifact = processor.ingest_bytes(
+        b"<html><body>malformed table mapping</body></html>",
+        acquisition_uri="https://example.test/malformed-table.html",
+        media_type="text/html",
+        identifiers={"filename": "malformed-table.html"},
+    )
+
+    result = await processor.process_artifact(artifact.artifact_id)
+
+    canonical_run = next(
+        run
+        for run in result.processing_runs
+        if run.component_id == "canonical-document-view"
+    )
+    view = processor.store.read_canonical_document(
+        canonical_run.require_output("canonical_document_view")
+    )
+    assert result.status is ProcessingRunStatus.PARTIAL
+    assert canonical_run.status is ProcessingRunStatus.PARTIAL
+    assert executor.results["canonicalize"].status is StageExecutionStatus.PARTIAL
+    assert "INVALID_TABLE_CELL" in canonical_run.warnings
+    assert any(
+        diagnostic.code == "INVALID_TABLE_CELL" and diagnostic.severity.value == "error"
+        for diagnostic in view.diagnostics
+    )
+
+
+@pytest.mark.asyncio
+async def test_integrity_error_forces_canonical_stage_partial(tmp_path) -> None:
+    executor = _RecordingExecutor()
+    processor = DocumentProcessor(
+        ContentAddressedStore(tmp_path / "store"),
+        docling=InvalidCaptionCollectionDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+        stage_executor=executor,
+    )
+    artifact = processor.ingest_bytes(
+        b"<html><body>invalid caption relationship</body></html>",
+        acquisition_uri="https://example.test/invalid-caption.html",
+        media_type="text/html",
+        identifiers={"filename": "invalid-caption.html"},
+    )
+
+    result = await processor.process_artifact(artifact.artifact_id)
+
+    canonical_run = next(
+        run
+        for run in result.processing_runs
+        if run.component_id == "canonical-document-view"
+    )
+    view = processor.store.read_canonical_document(
+        canonical_run.require_output("canonical_document_view")
+    )
+    assert result.status is ProcessingRunStatus.PARTIAL
+    assert canonical_run.status is ProcessingRunStatus.PARTIAL
+    assert executor.results["canonicalize"].status is StageExecutionStatus.PARTIAL
+    assert "UNALIGNED_TABLE" in canonical_run.warnings
+    assert any(
+        diagnostic.code == "UNALIGNED_TABLE" and diagnostic.severity.value == "error"
+        for diagnostic in view.diagnostics
+    )
+
+
+@pytest.mark.asyncio
+async def test_failure_recorder_requires_artifact_identity(tmp_path) -> None:
+    processor = DocumentProcessor(
+        ContentAddressedStore(tmp_path / "store"),
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    now = utc_now()
+    failure = StageFailure(
+        pipeline_id="document-processing",
+        pipeline_version="1",
+        pipeline_run_id="pipeline-run-missing-identity",
+        stage_invocation_id="stage-invocation-missing-identity",
+        stage_id="route",
+        component=processor.component_registry.require("document-router").descriptor,
+        configuration={},
+        configuration_sha256=configuration_sha256({}),
+        input_identity={},
+        stage_inputs={},
+        exception=RuntimeError("route failed"),
+        started_at=now,
+        started_clock=time.perf_counter(),
+    )
+
+    with pytest.raises(ValueError, match="requires artifact_id"):
+        await DocumentProcessingFailureRecorder(processor).record_failure(failure)
+
+
+@pytest.mark.asyncio
+async def test_failure_recorder_rejects_configuration_hash_drift(tmp_path) -> None:
+    processor = DocumentProcessor(
+        ContentAddressedStore(tmp_path / "store"),
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    artifact = processor.ingest_bytes(
+        b"failure configuration drift",
+        acquisition_uri="https://example.test/failure-configuration.html",
+        media_type="text/html",
+        identifiers={"filename": "failure-configuration.html"},
+    )
+    now = utc_now()
+    failure = StageFailure(
+        pipeline_id="document-processing",
+        pipeline_version="1",
+        pipeline_run_id="pipeline-run-configuration-drift",
+        stage_invocation_id="stage-invocation-configuration-drift",
+        stage_id="route",
+        component=processor.component_registry.require("document-router").descriptor,
+        configuration={"unexpected": True},
+        configuration_sha256=configuration_sha256({}),
+        input_identity={"artifact_id": artifact.artifact_id},
+        stage_inputs={},
+        exception=RuntimeError("route failed"),
+        started_at=now,
+        started_clock=time.perf_counter(),
+    )
+
+    with pytest.raises(ValueError, match="does not match its validated hash"):
+        await DocumentProcessingFailureRecorder(processor).record_failure(failure)
+
+
+@pytest.mark.asyncio
+async def test_canonical_stage_rejects_wrong_configuration_model(tmp_path) -> None:
+    processor = DocumentProcessor(
+        ContentAddressedStore(tmp_path / "store"),
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+
+    class StubContext:
+        def require_input(self, *_: object) -> object:
+            return object()
+
+    with pytest.raises(TypeError, match="invalid configuration model"):
+        await _DocumentStagePlugins(processor).canonicalize(
+            StubContext(),  # type: ignore[arg-type]
+            EmptyComponentConfig(),
+        )
+
+
+@pytest.mark.asyncio
 async def test_unexpected_stage_failure_persists_one_failed_run(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1382,6 +1788,7 @@ async def test_unexpected_stage_failure_persists_one_failed_run(
     assert failed.configuration == {}
     assert failed.configuration_sha256 == sha256_bytes(b"{}")
     assert failed.pipeline_run_id is not None
+    assert failed.stage_invocation_id is not None
     assert failed.output("diagnostics_manifest") is not None
     diagnostic = next(
         item
@@ -1390,6 +1797,57 @@ async def test_unexpected_stage_failure_persists_one_failed_run(
     )
     assert diagnostic.stage == "route"
     assert docling.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_named_retry_failures_have_distinct_durable_invocations(
+    tmp_path,
+) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    executor = _ConcurrentRouteFailureExecutor()
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+        stage_executor=executor,
+    )
+    processor.pipeline_orchestrator.failure_observer = _CoordinatedFailureRecorder(
+        processor,
+        executor,
+    )
+    artifact = processor.ingest_bytes(
+        b"<html><body>concurrent named retry failures</body></html>",
+        acquisition_uri="https://example.test/concurrent-retry.html",
+        media_type="text/html",
+        identifiers={"filename": "concurrent-retry.html"},
+    )
+    attempt = {
+        "force_reprocess": True,
+        "repetition_group_id": "concurrent-failure-v1",
+        "pipeline_attempt_id": "attempt-001",
+    }
+
+    failures = await asyncio.gather(
+        processor.process_artifact(artifact.artifact_id, **attempt),
+        processor.process_artifact(artifact.artifact_id, **attempt),
+        return_exceptions=True,
+    )
+
+    assert {str(error) for error in failures} == {
+        "first concurrent route failure",
+        "second concurrent route failure",
+    }
+    assert all(isinstance(error, RuntimeError) for error in failures)
+    runs = store.list_processing_runs(artifact_id=artifact.artifact_id)
+    assert len(runs) == 2
+    assert {run.status for run in runs} == {ProcessingRunStatus.FAILED}
+    assert {run.stage_id for run in runs} == {"route"}
+    assert {run.component_id for run in runs} == {"document-router"}
+    assert len({run.pipeline_run_id for run in runs}) == 1
+    assert None not in {run.stage_invocation_id for run in runs}
+    assert len({run.stage_invocation_id for run in runs}) == 2
 
 
 @pytest.mark.asyncio
@@ -1419,6 +1877,7 @@ async def test_failure_observer_does_not_duplicate_a_terminal_component_run(
     assert len(runs) == 1
     assert runs[0].component_id == "docling"
     assert runs[0].status is ProcessingRunStatus.COMPLETE
+    assert runs[0].stage_invocation_id is not None
 
 
 @pytest.mark.asyncio
@@ -1520,9 +1979,196 @@ async def test_failure_observer_correlates_fallback_grobid_stage_alias(
         "primary-grobid",
         "fallback-grobid",
     }
+    fallback_run = next(run for run in grobid_runs if run.stage_id == "fallback-grobid")
+    assert fallback_run.artifact_id != artifact.artifact_id
+    assert (
+        store.get_artifact(fallback_run.artifact_id).parent_artifact_id
+        == artifact.artifact_id
+    )
     assert all(
         run.component_id != "grobid-fallback" for run in store.list_processing_runs()
     )
+
+
+@pytest.mark.asyncio
+async def test_derivative_run_without_creator_input_does_not_hide_failure(
+    tmp_path,
+) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(scan_first=True),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+        stage_executor=_MissingDerivativeInputFailureExecutor(store),
+    )
+    artifact = processor.ingest_bytes(
+        b"%PDF-1.7\nFALLBACK POISON",
+        acquisition_uri="https://example.test/fallback-poison.pdf",
+        media_type="application/pdf",
+        identifiers={"filename": "fallback-poison.pdf"},
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="fallback poison omitted its derivative input",
+    ):
+        await processor.process_artifact(artifact.artifact_id)
+
+    fallback_runs = [
+        run for run in store.list_processing_runs() if run.stage_id == "fallback-grobid"
+    ]
+    assert len(fallback_runs) == 2
+    poisoned = next(
+        run for run in fallback_runs if run.run_id == "poison-missing-derivative-input"
+    )
+    recorded = next(run for run in fallback_runs if run.run_id != poisoned.run_id)
+    assert poisoned.stage_invocation_id == recorded.stage_invocation_id
+    assert poisoned.artifact_id == recorded.artifact_id
+    assert poisoned.pipeline_run_id == recorded.pipeline_run_id
+    assert poisoned.component.capability == recorded.component.capability
+    assert poisoned.inputs == ()
+    assert len(recorded.inputs) == 1
+    assert recorded.status is ProcessingRunStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_fallback_failure_rejects_unproven_current_artifact_evidence(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(scan_first=True),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+        stage_executor=_RaiseAfterStageExecutor("fallback-grobid"),
+    )
+    observer = _CapturingFailureRecorder(processor)
+    processor.pipeline_orchestrator.failure_observer = observer
+    artifact = processor.ingest_bytes(
+        b"%PDF-1.7\nFALLBACK EVIDENCE",
+        acquisition_uri="https://example.test/fallback-evidence.pdf",
+        media_type="application/pdf",
+        identifiers={"filename": "fallback-evidence.pdf"},
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected failure after fallback-grobid"):
+        await processor.process_artifact(artifact.artifact_id)
+
+    [failure] = observer.failures
+    ocr: Any = failure.stage_inputs["ocr"]
+    assert ocr.stage is not None
+    ocr_stage = ocr.stage
+    assert ocr_stage.derivative is not None
+    derivative = ocr_stage.derivative
+    recorder = observer.delegate
+
+    selected, source_product = recorder._current_artifact(
+        failure,
+        input_artifact=artifact,
+    )
+    assert selected == derivative
+    assert source_product is not None
+
+    with pytest.raises(ValueError, match="no typed OCR stage input"):
+        recorder._current_artifact(
+            replace(failure, stage_inputs={"ocr": object()}),
+            input_artifact=artifact,
+        )
+    assert recorder._current_artifact(
+        replace(failure, stage_inputs={"ocr": replace(ocr, stage=None)}),
+        input_artifact=artifact,
+    ) == (artifact, None)
+    assert recorder._current_artifact(
+        replace(
+            failure,
+            stage_inputs={
+                "ocr": replace(ocr, stage=replace(ocr_stage, derivative=None))
+            },
+        ),
+        input_artifact=artifact,
+    ) == (artifact, None)
+
+    def failure_with_derivative(claimed: DocumentArtifact) -> StageFailure:
+        return replace(
+            failure,
+            stage_inputs={
+                "ocr": replace(
+                    ocr,
+                    stage=replace(ocr_stage, derivative=claimed),
+                )
+            },
+        )
+
+    drifted = derivative.model_copy(update={"identifiers": {"filename": "drifted.pdf"}})
+    with pytest.raises(ValueError, match="differs from durable metadata"):
+        recorder._current_artifact(
+            failure_with_derivative(drifted),
+            input_artifact=artifact,
+        )
+
+    bad_relationship = derivative.model_copy(
+        update={
+            "relationship": ArtifactRelationship.SOURCE,
+            "parent_artifact_id": None,
+        }
+    )
+    with monkeypatch.context() as scoped:
+        scoped.setattr(store, "get_artifact", lambda _: bad_relationship)
+        with pytest.raises(ValueError, match="invalid source lineage"):
+            recorder._current_artifact(
+                failure_with_derivative(bad_relationship),
+                input_artifact=artifact,
+            )
+
+    bad_parent = derivative.model_copy(update={"parent_artifact_id": "artifact-other"})
+    with monkeypatch.context() as scoped:
+        scoped.setattr(store, "get_artifact", lambda _: bad_parent)
+        with pytest.raises(ValueError, match="invalid source lineage"):
+            recorder._current_artifact(
+                failure_with_derivative(bad_parent),
+                input_artifact=artifact,
+            )
+
+    no_creator = derivative.model_copy(
+        update={
+            "raw_location": derivative.raw_location.model_copy(
+                update={"created_by_run_id": None}
+            )
+        }
+    )
+    with monkeypatch.context() as scoped:
+        scoped.setattr(store, "get_artifact", lambda _: no_creator)
+        with pytest.raises(ValueError, match="has no creator run"):
+            recorder._current_artifact(
+                failure_with_derivative(no_creator),
+                input_artifact=artifact,
+            )
+
+    creator_run_id = derivative.raw_location.created_by_run_id
+    assert creator_run_id is not None
+    creator = store.get_processing_run(creator_run_id)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            store,
+            "get_processing_run",
+            lambda _: creator.model_copy(update={"artifact_id": "artifact-other"}),
+        )
+        with pytest.raises(ValueError, match="creator belongs to another artifact"):
+            recorder._current_artifact(failure, input_artifact=artifact)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            store,
+            "get_processing_run",
+            lambda _: creator.model_copy(update={"outputs": ()}),
+        )
+        with pytest.raises(ValueError, match="resolve to one creator product"):
+            recorder._current_artifact(failure, input_artifact=artifact)
 
 
 @pytest.mark.asyncio
@@ -1578,6 +2224,95 @@ async def test_failure_observer_correlates_native_adapter_stage(
     assert len(adapter_runs) == 1
     assert adapter_runs[0].stage_id == "prepare"
     assert all(run.component_id != "document-native-adapter" for run in runs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "poison_kind",
+    ["unrelated_source", "unproven_derivative", "wrong_pipeline", "wrong_stage"],
+)
+async def test_same_capability_poisoned_run_does_not_hide_stage_failure(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    poison_kind: str,
+) -> None:
+    store = ContentAddressedStore(tmp_path / "store")
+    processor = DocumentProcessor(
+        store,
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    artifact = processor.ingest_bytes(
+        b"<html><body>poisoned run then route failure</body></html>",
+        acquisition_uri="https://example.test/poisoned-run.html",
+        media_type="text/html",
+        identifiers={"filename": "poisoned-run.html"},
+    )
+    poison_artifact = artifact
+    if poison_kind == "unrelated_source":
+        poison_artifact = processor.ingest_bytes(
+            b"unrelated source artifact",
+            acquisition_uri="https://example.test/unrelated-source.txt",
+            media_type="text/plain",
+        )
+    elif poison_kind == "unproven_derivative":
+        poison_artifact = processor.ingest_bytes(
+            b"unproven derivative artifact",
+            acquisition_uri="derived://test/unproven",
+            media_type="application/pdf",
+            relationship=ArtifactRelationship.DERIVATIVE,
+            parent_artifact_id=artifact.artifact_id,
+        )
+
+    def persist_poisoned_then_fail(*args: Any, **kwargs: Any) -> None:
+        context = _active_stage_context()
+        assert context is not None
+        now = utc_now()
+        store.save_processing_run(
+            ProcessingRun(
+                run_id=f"poison-{poison_kind}",
+                artifact_id=poison_artifact.artifact_id,
+                pipeline_run_id=(
+                    "workflow-poisoned"
+                    if poison_kind == "wrong_pipeline"
+                    else context.pipeline_run_id
+                ),
+                stage_invocation_id=context.stage_invocation_id,
+                stage_id=(
+                    "prepare" if poison_kind == "wrong_stage" else context.stage_id
+                ),
+                component=ComponentDescriptor(
+                    component_id="poison-router",
+                    component_version="1",
+                    capability="document.route",
+                ),
+                configuration={},
+                configuration_sha256=configuration_sha256({}),
+                started_at=now,
+                finished_at=now,
+                status=ProcessingRunStatus.FAILED,
+            )
+        )
+        raise RuntimeError("unexpected route failure")
+
+    monkeypatch.setattr(processor.router, "route", persist_poisoned_then_fail)
+
+    with pytest.raises(RuntimeError, match="unexpected route failure"):
+        await processor.process_artifact(artifact.artifact_id)
+
+    runs = store.list_processing_runs()
+    assert len(runs) == 2
+    poisoned = next(run for run in runs if run.run_id == f"poison-{poison_kind}")
+    recorded = next(run for run in runs if run.run_id != poisoned.run_id)
+    assert poisoned.component.capability == recorded.component.capability
+    assert recorded.artifact_id == artifact.artifact_id
+    assert recorded.pipeline_run_id is not None
+    assert recorded.stage_invocation_id == poisoned.stage_invocation_id
+    assert recorded.stage_id == "route"
+    assert recorded.component_id == "document-router"
+    assert recorded.status is ProcessingRunStatus.FAILED
 
 
 @pytest.mark.asyncio
@@ -2042,7 +2777,8 @@ async def test_expected_runtime_config_not_transient_probe_controls_reuse(
     assert first.status is ProcessingRunStatus.COMPLETE
     assert second.status is ProcessingRunStatus.COMPLETE
     assert third.status is ProcessingRunStatus.COMPLETE
-    assert fourth.status is ProcessingRunStatus.COMPLETE
+    assert fourth.status is ProcessingRunStatus.FAILED
+    assert fourth.canonical_document_sha256 is None
     assert docling.calls == 2
     first_docling_run = next(
         run for run in first.processing_runs if run.component_id == "docling"
@@ -2282,8 +3018,8 @@ async def test_parser_container_images_are_part_of_reuse_identity(tmp_path) -> N
         ocrmypdf=FakeOCR(),
         config=config.model_copy(
             update={
-                "docling_container_image": "example/docling:changed",
-                "grobid_container_image": "example/grobid:changed",
+                "docling_container_image": ("mirror.example/docling-serve-cpu:v1.21.0"),
+                "grobid_container_image": ("mirror.example/grobid:0.9.0-full-p0-c2"),
             }
         ),
     )
@@ -3196,7 +3932,7 @@ async def test_oversized_docling_result_is_failed_and_clears_checkpoint(
 
 
 @pytest.mark.asyncio
-async def test_jats_locator_failure_is_recorded_and_makes_result_partial(
+async def test_jats_locator_failure_blocks_unreproducible_canonicalization(
     tmp_path,
 ) -> None:
     processor = DocumentProcessor(
@@ -3215,7 +3951,8 @@ async def test_jats_locator_failure_is_recorded_and_makes_result_partial(
 
     result = await processor.process_artifact(artifact.artifact_id)
 
-    assert result.status is ProcessingRunStatus.PARTIAL
+    assert result.status is ProcessingRunStatus.FAILED
+    assert result.canonical_document_sha256 is None
     assert any(
         run.component_id == "jats-locator-adapter"
         and run.status is ProcessingRunStatus.FAILED

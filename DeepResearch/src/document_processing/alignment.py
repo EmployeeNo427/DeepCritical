@@ -520,6 +520,27 @@ def _tei_path_segment(tag: str) -> str:
     return f"{{{namespace}}}{local_name}"
 
 
+def verify_scholarly_alignment_overlay(
+    docling_document: dict[str, Any],
+    grobid_tei: bytes,
+    overlay: ScholarlyAlignmentOverlay,
+    *,
+    minimum_score: float,
+) -> ScholarlyAlignmentOverlay:
+    """Replay an alignment against its exact native inputs and reject drift."""
+
+    expected = DoclingGrobidAligner(minimum_score=minimum_score).align(
+        docling_document,
+        grobid_tei,
+    )
+    if overlay != expected:
+        raise ValueError(
+            "scholarly alignment overlay does not match its exact Docling and "
+            "GROBID inputs"
+        )
+    return overlay
+
+
 __all__ = [
     "AlignmentRecord",
     "AlignmentStatus",
@@ -527,4 +548,5 @@ __all__ = [
     "GrobidCoordinate",
     "ScholarlyAlignmentOverlay",
     "ScholarlyAnnotation",
+    "verify_scholarly_alignment_overlay",
 ]

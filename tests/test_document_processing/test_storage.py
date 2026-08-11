@@ -1,39 +1,57 @@
 """Tests for immutable content-addressed document-processing storage."""
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
 from DeepResearch.src.document_processing import storage as storage_module
+from DeepResearch.src.document_processing.alignment import DoclingGrobidAligner
 from DeepResearch.src.document_processing.canonical import (
     CANONICAL_ANCHORING_POLICY,
+    CANONICAL_COMPONENT_CAPABILITY,
+    CANONICAL_COMPONENT_ID,
+    CANONICAL_COMPONENT_VERSION,
     CANONICAL_TEXT_NORMALIZATION,
     CanonicalAnchorRole,
     CanonicalBlock,
     CanonicalBlockKind,
     CanonicalDocumentMetadata,
     CanonicalDocumentView,
+    CanonicalizationConfig,
     CanonicalSourceAnchor,
+    build_canonical_document_view,
     canonical_block_content_sha256,
     canonical_block_id,
+    canonical_document_bytes,
+    canonical_invocation_configuration,
     canonical_view_id,
 )
 from DeepResearch.src.document_processing.models import (
     ArtifactLocationRole,
     ArtifactRelationship,
     ComponentDescriptor,
+    ContentSpan,
+    ContentSpanSet,
     DataProductRef,
     DiagnosticSeverity,
     DocumentArtifact,
     ExecutionCheckpoint,
+    PdfBoundingBox,
+    PdfLocator,
     ProcessingDiagnostic,
     ProcessingRun,
     ProcessingRunStatus,
+    RepresentationAnchor,
+    RuntimeAttestation,
+    RuntimeAttestationSource,
     configuration_sha256,
+    sha256_bytes,
 )
 from DeepResearch.src.document_processing.products import build_data_product_ref
 from DeepResearch.src.document_processing.storage import (
@@ -46,6 +64,10 @@ from DeepResearch.src.document_processing.storage import (
     RecordNotFoundError,
     StorageError,
     UnsupportedSchemaVersionError,
+)
+from DeepResearch.src.document_processing.validation import (
+    build_pdf_content_spans,
+    validate_content_integrity,
 )
 
 
@@ -61,7 +83,7 @@ def save_artifact(
     relationship: ArtifactRelationship = ArtifactRelationship.SOURCE,
     parent_artifact_id: str | None = None,
 ) -> DocumentArtifact:
-    blob = store.put_blob(b"source document bytes")
+    blob = store.put_blob(b"%PDF-1.7\nsource document bytes")
     artifact = DocumentArtifact(
         artifact_id=artifact_id,
         source_sha256=blob.sha256,
@@ -140,6 +162,237 @@ def make_run(
         status=status,
         inputs=inputs,
         outputs=product_refs,
+    )
+
+
+def make_component_run(
+    store: ContentAddressedStore,
+    artifact_id: str,
+    run_id: str,
+    *,
+    component: ComponentDescriptor,
+    configuration: dict[str, object],
+    inputs: tuple[DataProductRef, ...] = (),
+    outputs: dict[str, str] | None = None,
+    status: ProcessingRunStatus = ProcessingRunStatus.COMPLETE,
+    runtime_attestation: RuntimeAttestation | None = None,
+    runtime_identity_required: bool = False,
+) -> ProcessingRun:
+    source_artifact_ids = tuple(
+        dict.fromkeys(
+            (
+                artifact_id,
+                *(
+                    source_artifact_id
+                    for product in inputs
+                    for source_artifact_id in product.source_artifact_ids
+                ),
+            )
+        )
+    )
+    started_at = datetime(2026, 7, 17, 12, tzinfo=UTC)
+    output_digests = dict(outputs or {})
+    if runtime_attestation is not None:
+        attestation_blob = store.put_blob(
+            json.dumps(
+                runtime_attestation.model_dump(mode="json"),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        )
+        output_digests["runtime_attestation"] = attestation_blob.sha256
+    return ProcessingRun(
+        run_id=run_id,
+        artifact_id=artifact_id,
+        stage_id=component.component_id,
+        component=component,
+        component_invocation_id=(
+            runtime_attestation.invocation_id
+            if runtime_attestation is not None
+            else None
+        ),
+        runtime_identity_required=runtime_identity_required,
+        component_versions=(
+            runtime_attestation.component_versions
+            if runtime_attestation is not None
+            else {}
+        ),
+        model_versions=(
+            runtime_attestation.model_versions
+            if runtime_attestation is not None
+            else {}
+        ),
+        model_hashes=(
+            runtime_attestation.model_hashes if runtime_attestation is not None else {}
+        ),
+        container_image=(
+            runtime_attestation.container_reference
+            if runtime_attestation is not None
+            else None
+        ),
+        container_digest=(
+            runtime_attestation.container_digest
+            if runtime_attestation is not None
+            else None
+        ),
+        runtime_attestation=runtime_attestation,
+        runtime_attestation_sha256=(
+            output_digests.get("runtime_attestation")
+            if runtime_attestation is not None
+            else None
+        ),
+        configuration=configuration,
+        configuration_sha256=configuration_sha256(configuration),
+        started_at=started_at,
+        finished_at=started_at + timedelta(seconds=1),
+        status=status,
+        inputs=inputs,
+        outputs=tuple(
+            store.data_product_ref(
+                name=name,
+                blob_sha256=digest,
+                producer_run_id=run_id,
+                source_artifact_ids=source_artifact_ids,
+            )
+            for name, digest in output_digests.items()
+        ),
+    )
+
+
+def docling_production_configuration(
+    artifact: DocumentArtifact,
+    *,
+    input_format: str = "pdf",
+    input_sha256: str | None = None,
+) -> dict[str, object]:
+    """Return the exact persisted Docling invocation shape used in production."""
+
+    configuration: dict[str, object] = {
+        "serve_version": "1.21.0",
+        "expected_docling_version": "2.113.0",
+        "container_image": "quay.io/docling-project/docling-serve-cpu:v1.21.0",
+        "container_digest": None,
+        "model_versions": {},
+        "model_hashes": {},
+        "input_sha256": input_sha256 or artifact.source_sha256,
+        "input_format": input_format,
+        "options": {
+            "to_formats": ["json"],
+            "image_export_mode": "embedded",
+            "do_ocr": True,
+            "table_mode": "accurate",
+        },
+        "minimum_pdf_locator_coverage": 0.95,
+        "quality_validator_version": "docling-quality-v2",
+        "content_span_schema_version": "1",
+    }
+    if input_format == "pdf":
+        configuration["pdf_span_algorithm"] = "provenance-charspan-v2"
+    return configuration
+
+
+def grobid_production_configuration(
+    artifact: DocumentArtifact,
+    *,
+    minimum_text_characters: int = 1,
+) -> dict[str, object]:
+    """Return the exact persisted GROBID invocation shape used in production."""
+
+    return {
+        "input_sha256": artifact.source_sha256,
+        "expected_grobid_version": "0.9.0",
+        "container_image": "deepcritical/grobid:0.9.0-full-p0-c2",
+        "container_digest": None,
+        "model_versions": {},
+        "model_hashes": {},
+        "coordinates": ["persName", "ref", "biblStruct", "formula", "figure"],
+        "consolidate_header": 0,
+        "consolidate_citations": 0,
+        "segment_sentences": True,
+        "minimum_text_characters": minimum_text_characters,
+    }
+
+
+def ocr_production_configuration(
+    artifact: DocumentArtifact,
+    *,
+    mode: str = "container_cli",
+) -> dict[str, object]:
+    return {
+        "input_sha256": artifact.source_sha256,
+        "fallback_reason": "scan_detection",
+        "expected_ocrmypdf_version": "17.4.1",
+        "mode": mode,
+        "container_image": (
+            "jbarlow83/ocrmypdf:v17.4.1" if mode == "container_cli" else None
+        ),
+        "container_digest": None,
+        "languages": ["eng"],
+        "rotate_pages": True,
+        "deskew": True,
+        "jobs": 1,
+        "optimize": 1,
+        "skip_text": True,
+        "output_type": "pdf",
+    }
+
+
+def docling_runtime_attestation(
+    run_id: str,
+    *,
+    container_digest: str = f"sha256:{'a' * 64}",
+    source: RuntimeAttestationSource = (
+        RuntimeAttestationSource.AUTHENTICATED_DEPLOYMENT_REPORTER
+    ),
+    component_versions: dict[str, str] | None = None,
+) -> RuntimeAttestation:
+    return RuntimeAttestation(
+        component_id="docling",
+        component_version="2.113.0",
+        invocation_id=f"{run_id}-invocation",
+        source=source,
+        reporter_id="test-deployment-reporter",
+        observed_at=datetime(2026, 7, 17, 12, 0, 0, 500_000, tzinfo=UTC),
+        workload_id=f"workload-{run_id}",
+        container_reference=(
+            f"quay.io/docling-project/docling-serve-cpu:v1.21.0@{container_digest}"
+        ),
+        container_digest=container_digest,
+        component_versions=(
+            component_versions
+            if component_versions is not None
+            else {"docling": "2.113.0", "docling_serve": "1.21.0"}
+        ),
+        model_versions={"layout": "fixture-v1"},
+        model_hashes={"layout": "b" * 64},
+    )
+
+
+def ocr_runtime_attestation(
+    run_id: str,
+    *,
+    component_versions: dict[str, str] | None = None,
+    container_digest: str = f"sha256:{'c' * 64}",
+    source: RuntimeAttestationSource = (
+        RuntimeAttestationSource.DIGEST_ADDRESSED_OCI_INVOCATION
+    ),
+) -> RuntimeAttestation:
+    return RuntimeAttestation(
+        component_id="ocrmypdf",
+        component_version="17.4.1",
+        invocation_id=f"{run_id}-invocation",
+        source=source,
+        reporter_id="deepcritical-container-ocr-runner-v1",
+        observed_at=datetime(2026, 7, 17, 12, 0, 0, 500_000, tzinfo=UTC),
+        workload_id=f"workload-{run_id}",
+        container_reference=(f"jbarlow83/ocrmypdf:v17.4.1@{container_digest}"),
+        container_digest=container_digest,
+        component_versions=(
+            component_versions
+            if component_versions is not None
+            else {"ocrmypdf": "17.4.1", "tesseract": "5.3.4"}
+        ),
     )
 
 
@@ -223,20 +476,117 @@ def make_canonical_view(
 def make_durable_canonical_view(
     store: ContentAddressedStore,
     artifact: DocumentArtifact,
+    *,
+    document_mutator: Callable[[dict[str, Any]], None] | None = None,
+    docling_bytes_mutator: Callable[[bytes], bytes] | None = None,
+    source_component: ComponentDescriptor | None = None,
+    source_configuration: dict[str, object] | None = None,
+    source_status: ProcessingRunStatus = ProcessingRunStatus.COMPLETE,
+    source_attestation: RuntimeAttestation | None = None,
+    source_runtime_identity_required: bool = False,
 ) -> tuple[CanonicalDocumentView, ProcessingRun]:
     """Persist both source products used by one canonical test view."""
 
-    docling_blob = store.put_blob(b'{"docling": "canonical source"}')
-    spans_blob = store.put_blob(b'{"spans": []}')
-    source_run = make_run(
+    document = {
+        "schema_name": "DoclingDocument",
+        "version": "1.0.0",
+        "name": "Canonical persistence",
+        "body": {
+            "self_ref": "#/body",
+            "children": [{"$ref": "#/texts/0"}],
+        },
+        "furniture": {"self_ref": "#/furniture", "children": []},
+        "groups": [],
+        "texts": [
+            {
+                "self_ref": "#/texts/0",
+                "parent": {"$ref": "#/body"},
+                "label": "paragraph",
+                "text": "Canonical content",
+                "prov": [
+                    {
+                        "page_no": 1,
+                        "bbox": {
+                            "l": 0,
+                            "t": 20,
+                            "r": 100,
+                            "b": 0,
+                            "coord_origin": "BOTTOMLEFT",
+                        },
+                    }
+                ],
+            }
+        ],
+        "tables": [],
+        "pictures": [],
+        "key_value_items": [],
+        "pages": {
+            "1": {
+                "page_no": 1,
+                "size": {"width": 100, "height": 100},
+            }
+        },
+    }
+    if document_mutator is not None:
+        document_mutator(document)
+    docling_bytes = json.dumps(
+        document,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    if docling_bytes_mutator is not None:
+        docling_bytes = docling_bytes_mutator(docling_bytes)
+    docling_blob = store.put_blob(docling_bytes)
+    source_run_id = f"{artifact.artifact_id}-canonical-source-run"
+    docling_product = store.data_product_ref(
+        name="docling_document",
+        blob_sha256=docling_blob.sha256,
+        producer_run_id=source_run_id,
+        source_artifact_ids=(artifact.artifact_id,),
+    )
+    spans = build_pdf_content_spans(
+        document,
+        artifact_id=artifact.artifact_id,
+        processing_run_id=source_run_id,
+        representation_product_id=docling_product.product_id,
+    )
+    span_set = ContentSpanSet(
+        artifact_id=artifact.artifact_id,
+        processing_run_id=source_run_id,
+        representation_product_id=docling_product.product_id,
+        spans=spans,
+    )
+    spans_blob = store.put_blob(
+        json.dumps(
+            span_set.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    )
+    source_run = make_component_run(
         store,
         artifact.artifact_id,
-        f"{artifact.artifact_id}-canonical-source-run",
-        ProcessingRunStatus.COMPLETE,
+        source_run_id,
+        component=source_component
+        or ComponentDescriptor(
+            component_id="docling",
+            component_version="2.113.0",
+            capability="document.parse",
+        ),
+        configuration=(
+            docling_production_configuration(artifact)
+            if source_configuration is None
+            else source_configuration
+        ),
         outputs={
             "docling_document": docling_blob.sha256,
             "content_spans": spans_blob.sha256,
         },
+        status=source_status,
+        runtime_attestation=source_attestation,
+        runtime_identity_required=source_runtime_identity_required,
     )
     store.save_processing_run(source_run)
     source_products = (
@@ -244,12 +594,90 @@ def make_durable_canonical_view(
         source_run.require_output("content_spans"),
     )
     return (
-        make_canonical_view(
-            source_artifact_id=artifact.artifact_id,
-            source_sha256=artifact.source_sha256,
+        build_canonical_document_view(
+            artifact=artifact,
+            docling_document=document,
+            docling_product=source_products[0],
+            content_span_set=span_set,
             source_products=source_products,
+            configuration=CanonicalizationConfig(),
         ),
         source_run,
+    )
+
+
+def make_irreproducible_canonical_view(
+    store: ContentAddressedStore,
+    artifact: DocumentArtifact,
+    *,
+    damage: str,
+) -> CanonicalDocumentView:
+    """Persist a schema-valid source run whose spans do not exactly replay."""
+
+    _, valid_source_run = make_durable_canonical_view(store, artifact)
+    old_docling = valid_source_run.require_output("docling_document")
+    old_spans = valid_source_run.require_output("content_spans")
+    run_id = f"{artifact.artifact_id}-{damage}-source-run"
+    docling_product = store.data_product_ref(
+        name="docling_document",
+        blob_sha256=old_docling.blob_sha256,
+        producer_run_id=run_id,
+        source_artifact_ids=(artifact.artifact_id,),
+    )
+    span_payload = json.loads(store.read_blob(old_spans.blob_sha256))
+    span_payload["processing_run_id"] = run_id
+    span_payload["representation_product_id"] = docling_product.product_id
+    for span in span_payload["spans"]:
+        span["processing_run_id"] = run_id
+        span["representation_anchor"]["product_id"] = docling_product.product_id
+    if damage == "omitted":
+        span_payload.pop("spans")
+    elif damage == "locator-drift":
+        span_payload["spans"][0]["source_locator"]["bounding_box"]["left"] = 1
+    else:  # pragma: no cover - test helper guard
+        raise AssertionError(f"unsupported damage: {damage}")
+    span_set = ContentSpanSet.model_validate(span_payload)
+    span_blob = store.put_blob(
+        json.dumps(
+            span_payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    )
+    source_run = make_component_run(
+        store,
+        artifact.artifact_id,
+        run_id,
+        component=ComponentDescriptor(
+            component_id="docling",
+            component_version="2.113.0",
+            capability="document.parse",
+        ),
+        configuration={
+            "content_span_schema_version": "1",
+            "input_format": "pdf",
+            "input_sha256": artifact.source_sha256,
+            "pdf_span_algorithm": "provenance-charspan-v2",
+        },
+        outputs={
+            "docling_document": old_docling.blob_sha256,
+            "content_spans": span_blob.sha256,
+        },
+    )
+    store.save_processing_run(source_run)
+    source_products = (
+        source_run.require_output("docling_document"),
+        source_run.require_output("content_spans"),
+    )
+    return build_canonical_document_view(
+        artifact=artifact,
+        docling_document=json.loads(store.read_blob(old_docling.blob_sha256)),
+        docling_product=source_products[0],
+        content_span_set=span_set,
+        source_products=source_products,
+        configuration=CanonicalizationConfig(),
     )
 
 
@@ -260,20 +688,79 @@ def save_canonical_view_product(
     *,
     inputs: tuple[DataProductRef, ...] | None = None,
     run_id: str = "canonical-view-run",
+    status: ProcessingRunStatus = ProcessingRunStatus.COMPLETE,
+    component: ComponentDescriptor | None = None,
+    configuration: dict[str, object] | None = None,
+    bypass_admission: bool = False,
 ) -> tuple[ProcessingRun, DataProductRef]:
     """Persist a canonical view and its producer record with durable inputs."""
 
     blob = store.put_canonical_document(view)
-    producer = make_run(
-        store,
-        artifact.artifact_id,
-        run_id,
-        ProcessingRunStatus.COMPLETE,
-        inputs=view.source_products if inputs is None else inputs,
-        outputs={"canonical_document_view": blob.sha256},
+    source_products = view.source_products if inputs is None else inputs
+    invocation_configuration = (
+        canonical_invocation_configuration(
+            CanonicalizationConfig(),
+            source_products,
+        )
+        if configuration is None
+        else configuration
     )
-    store.save_processing_run(producer)
+    started_at = datetime(2026, 7, 17, 13, tzinfo=UTC)
+    output = store.data_product_ref(
+        name="canonical_document_view",
+        blob_sha256=blob.sha256,
+        producer_run_id=run_id,
+        source_artifact_ids=tuple(
+            dict.fromkeys(
+                (
+                    artifact.artifact_id,
+                    *(
+                        source_artifact_id
+                        for product in source_products
+                        for source_artifact_id in product.source_artifact_ids
+                    ),
+                )
+            )
+        ),
+    )
+    producer = ProcessingRun(
+        run_id=run_id,
+        artifact_id=artifact.artifact_id,
+        stage_id="canonicalize",
+        component=component
+        or ComponentDescriptor(
+            component_id=CANONICAL_COMPONENT_ID,
+            component_version=CANONICAL_COMPONENT_VERSION,
+            capability=CANONICAL_COMPONENT_CAPABILITY,
+        ),
+        configuration=invocation_configuration,
+        configuration_sha256=configuration_sha256(invocation_configuration),
+        started_at=started_at,
+        finished_at=started_at + timedelta(seconds=1),
+        status=status,
+        inputs=source_products,
+        outputs=(output,),
+    )
+    if bypass_admission:
+        store._save_record(
+            "processing_runs",
+            producer.run_id,
+            producer,
+        )
+    else:
+        store.save_processing_run(producer)
     return producer, producer.require_output("canonical_document_view")
+
+
+def mutate_canonical_view(
+    view: CanonicalDocumentView,
+    mutator: Callable[[dict[str, Any]], None],
+) -> CanonicalDocumentView:
+    payload = json.loads(canonical_document_bytes(view))
+    mutator(payload)
+    payload["view_id"] = "pending"
+    payload["view_id"] = canonical_view_id(payload)
+    return CanonicalDocumentView.model_validate(payload)
 
 
 def test_blob_write_is_content_addressed_verified_and_idempotent(
@@ -805,6 +1292,1634 @@ def test_canonical_persistence_and_verified_read_round_trip(
     assert store.read_canonical_document(product) == view
 
 
+def test_canonical_admission_accepts_clean_partial_docling_producer(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "canonical-partial-docling")
+    view, source_run = make_durable_canonical_view(
+        store,
+        artifact,
+        source_status=ProcessingRunStatus.PARTIAL,
+    )
+
+    _, product = save_canonical_view_product(
+        store,
+        artifact,
+        view,
+        run_id="canonical-partial-docling-view-run",
+    )
+
+    assert source_run.status is ProcessingRunStatus.PARTIAL
+    assert store.read_canonical_document(product) == view
+
+
+@pytest.mark.parametrize(
+    ("component", "status", "message"),
+    [
+        (
+            ComponentDescriptor(
+                component_id="unapproved-docling",
+                component_version="2.113.0",
+                capability="document.parse",
+            ),
+            ProcessingRunStatus.COMPLETE,
+            "identity",
+        ),
+        (
+            ComponentDescriptor(
+                component_id="docling",
+                component_version="2.999.0",
+                capability="document.parse",
+            ),
+            ProcessingRunStatus.COMPLETE,
+            "version|identity",
+        ),
+        (
+            ComponentDescriptor(
+                component_id="docling",
+                component_version="2.113.0",
+                capability="document.parse",
+            ),
+            ProcessingRunStatus.FAILED,
+            "status",
+        ),
+    ],
+    ids=("wrong-component", "wrong-version", "failed"),
+)
+def test_canonical_admission_rejects_unapproved_docling_producer(
+    store: ContentAddressedStore,
+    component: ComponentDescriptor,
+    status: ProcessingRunStatus,
+    message: str,
+) -> None:
+    artifact = save_artifact(store, f"native-{component.component_id}-{status.value}")
+    view, _ = make_durable_canonical_view(
+        store,
+        artifact,
+        source_component=component,
+        source_status=status,
+    )
+
+    with pytest.raises(RecordConflictError, match=message):
+        save_canonical_view_product(
+            store,
+            artifact,
+            view,
+            run_id=f"native-{component.component_id}-{status.value}-view-run",
+        )
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["extra-field", "wrong-input-hash", "wrong-image", "wrong-pdf-algorithm"],
+)
+def test_canonical_admission_rejects_fake_docling_configuration(
+    store: ContentAddressedStore,
+    damage: str,
+) -> None:
+    artifact = save_artifact(store, f"native-config-{damage}")
+    configuration = docling_production_configuration(artifact)
+    if damage == "extra-field":
+        configuration["unregistered_option"] = True
+        message = "production schema"
+    elif damage == "wrong-input-hash":
+        configuration["input_sha256"] = "f" * 64
+        message = "input hash"
+    elif damage == "wrong-image":
+        configuration["container_image"] = "example.test/not-docling:latest"
+        message = "container image"
+    else:
+        configuration["pdf_span_algorithm"] = "unapproved"
+        message = "PDF span algorithm"
+    view, _ = make_durable_canonical_view(
+        store,
+        artifact,
+        source_configuration=configuration,
+    )
+
+    with pytest.raises(RecordConflictError, match=message):
+        save_canonical_view_product(
+            store,
+            artifact,
+            view,
+            run_id=f"native-config-{damage}-view-run",
+        )
+
+
+def test_canonical_admission_binds_docling_runtime_attestation_to_configuration(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "native-attestation-binding")
+    run_id = f"{artifact.artifact_id}-canonical-source-run"
+    attestation = docling_runtime_attestation(run_id)
+    configuration = docling_production_configuration(artifact)
+    configuration.update(
+        {
+            "container_digest": f"sha256:{'c' * 64}",
+            "model_versions": dict(attestation.model_versions),
+            "model_hashes": dict(attestation.model_hashes),
+        }
+    )
+    view, _ = make_durable_canonical_view(
+        store,
+        artifact,
+        source_configuration=configuration,
+        source_attestation=attestation,
+        source_runtime_identity_required=True,
+    )
+
+    with pytest.raises(RecordConflictError, match="attestation conflicts"):
+        save_canonical_view_product(
+            store,
+            artifact,
+            view,
+            run_id="native-attestation-binding-view-run",
+        )
+
+
+def test_canonical_admission_accepts_exact_docling_runtime_attestation(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "native-exact-attestation")
+    run_id = f"{artifact.artifact_id}-canonical-source-run"
+    attestation = docling_runtime_attestation(run_id)
+    configuration = docling_production_configuration(artifact)
+    configuration.update(
+        {
+            "container_digest": attestation.container_digest,
+            "model_versions": dict(attestation.model_versions),
+            "model_hashes": dict(attestation.model_hashes),
+        }
+    )
+    view, _ = make_durable_canonical_view(
+        store,
+        artifact,
+        source_configuration=configuration,
+        source_attestation=attestation,
+        source_runtime_identity_required=True,
+    )
+
+    _, product = save_canonical_view_product(
+        store,
+        artifact,
+        view,
+        run_id="native-exact-attestation-view-run",
+    )
+    assert store.read_canonical_document(product) == view
+
+
+def test_canonical_admission_requires_one_docling_pair_producer(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "native-split-producer")
+    view, source_run = make_durable_canonical_view(store, artifact)
+    old_spans = source_run.require_output("content_spans")
+    split_run = make_component_run(
+        store,
+        artifact.artifact_id,
+        "native-split-span-run",
+        component=ComponentDescriptor(
+            component_id="docling",
+            component_version="2.113.0",
+            capability="document.parse",
+        ),
+        configuration=docling_production_configuration(artifact),
+        outputs={"content_spans": old_spans.blob_sha256},
+    )
+    store.save_processing_run(split_run)
+    replacement = split_run.require_output("content_spans")
+
+    forged = mutate_canonical_view(
+        view,
+        lambda payload: payload["source_products"].__setitem__(
+            1, replacement.model_dump(mode="json")
+        ),
+    )
+    with pytest.raises(RecordConflictError, match="must share one producer"):
+        save_canonical_view_product(
+            store,
+            artifact,
+            forged,
+            run_id="native-split-producer-view-run",
+        )
+
+
+@pytest.mark.parametrize(
+    ("component", "status", "configuration_damage", "message"),
+    [
+        (
+            ComponentDescriptor(
+                component_id="fake-grobid",
+                component_version="0.9.0",
+                capability="document.parse.scholarly",
+            ),
+            ProcessingRunStatus.COMPLETE,
+            None,
+            "identity",
+        ),
+        (
+            ComponentDescriptor(
+                component_id="grobid",
+                component_version="0.9.0",
+                capability="document.parse.scholarly",
+            ),
+            ProcessingRunStatus.FAILED,
+            None,
+            "status",
+        ),
+        (
+            ComponentDescriptor(
+                component_id="grobid",
+                component_version="0.9.0",
+                capability="document.parse.scholarly",
+            ),
+            ProcessingRunStatus.COMPLETE,
+            "input-hash",
+            "input hash",
+        ),
+        (
+            ComponentDescriptor(
+                component_id="grobid",
+                component_version="9.9.9",
+                capability="document.parse.scholarly",
+            ),
+            ProcessingRunStatus.COMPLETE,
+            None,
+            "identity",
+        ),
+        (
+            ComponentDescriptor(
+                component_id="grobid",
+                component_version="0.9.0",
+                capability="document.parse.scholarly",
+            ),
+            ProcessingRunStatus.COMPLETE,
+            "image",
+            "container image",
+        ),
+    ],
+)
+def test_grobid_native_admission_rejects_unapproved_producer(
+    store: ContentAddressedStore,
+    component: ComponentDescriptor,
+    status: ProcessingRunStatus,
+    configuration_damage: str | None,
+    message: str,
+) -> None:
+    artifact = save_artifact(
+        store,
+        f"grobid-native-{component.component_id}-{status.value}-{configuration_damage}",
+    )
+    tei = b'<TEI xmlns="http://www.tei-c.org/ns/1.0"><text>usable</text></TEI>'
+    blob = store.put_blob(tei)
+    configuration = grobid_production_configuration(artifact)
+    if configuration_damage == "input-hash":
+        configuration["input_sha256"] = "f" * 64
+    elif configuration_damage == "image":
+        configuration["container_image"] = "example.test/not-grobid:latest"
+    run = make_component_run(
+        store,
+        artifact.artifact_id,
+        f"{artifact.artifact_id}-run",
+        component=component,
+        configuration=configuration,
+        outputs={"grobid_tei": blob.sha256},
+        status=status,
+    )
+    store.save_processing_run(run)
+
+    with pytest.raises(RecordConflictError, match=message):
+        store._verify_grobid_native_source(
+            canonical_artifact=artifact,
+            product=run.require_output("grobid_tei"),
+            tei_xml=tei,
+        )
+
+
+@pytest.mark.parametrize(
+    "tei",
+    [
+        b"<not-tei />",
+        b'<TEI xmlns="http://www.tei-c.org/ns/1.0"><text /></TEI>',
+        (
+            b'<!DOCTYPE TEI [<!ENTITY x "boom">]>'
+            b'<TEI xmlns="http://www.tei-c.org/ns/1.0"><text>&x;</text></TEI>'
+        ),
+    ],
+    ids=("wrong-root", "below-threshold", "forbidden-entity"),
+)
+def test_grobid_native_admission_requires_usable_tei(
+    store: ContentAddressedStore,
+    tei: bytes,
+) -> None:
+    artifact = save_artifact(store, f"grobid-unusable-{sha256_bytes(tei)[:8]}")
+    blob = store.put_blob(tei)
+    run = make_component_run(
+        store,
+        artifact.artifact_id,
+        f"{artifact.artifact_id}-run",
+        component=ComponentDescriptor(
+            component_id="grobid",
+            component_version="0.9.0",
+            capability="document.parse.scholarly",
+        ),
+        configuration=grobid_production_configuration(artifact),
+        outputs={"grobid_tei": blob.sha256},
+    )
+    store.save_processing_run(run)
+
+    with pytest.raises(RecordConflictError, match=r"TEI|usability"):
+        store._verify_grobid_native_source(
+            canonical_artifact=artifact,
+            product=run.require_output("grobid_tei"),
+            tei_xml=tei,
+        )
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        ("undeclared-product", "does not declare"),
+        ("extra-configuration", "production schema"),
+        ("configured-version", "version configuration"),
+        ("input-lineage", "inputs do not match"),
+        ("consolidation-option", "consolidate_header"),
+        ("segment-sentences", "segment_sentences"),
+        ("coordinates", "coordinates"),
+        ("minimum-characters", "minimum text characters"),
+    ],
+)
+def test_grobid_native_admission_rejects_malformed_production_contract(
+    store: ContentAddressedStore,
+    damage: str,
+    message: str,
+) -> None:
+    artifact = save_artifact(store, f"grobid-contract-{damage}")
+    tei = b'<TEI xmlns="http://www.tei-c.org/ns/1.0"><text>usable</text></TEI>'
+    tei_blob = store.put_blob(tei)
+    configuration = grobid_production_configuration(artifact)
+    inputs: tuple[DataProductRef, ...] = ()
+    if damage == "extra-configuration":
+        configuration["unapproved"] = True
+    elif damage == "configured-version":
+        configuration["expected_grobid_version"] = "99"
+    elif damage == "input-lineage":
+        upstream_blob = store.put_blob(b"unrelated GROBID input")
+        upstream = make_component_run(
+            store,
+            artifact.artifact_id,
+            f"{artifact.artifact_id}-upstream-run",
+            component=ComponentDescriptor(
+                component_id="unrelated-preprocessor",
+                component_version="1",
+                capability="document.prepare",
+            ),
+            configuration={"version": "1"},
+            outputs={"ocr_sidecar": upstream_blob.sha256},
+        )
+        store.save_processing_run(upstream)
+        inputs = (upstream.require_output("ocr_sidecar"),)
+    elif damage == "consolidation-option":
+        configuration["consolidate_header"] = True
+    elif damage == "segment-sentences":
+        configuration["segment_sentences"] = 1
+    elif damage == "coordinates":
+        configuration["coordinates"] = [""]
+    elif damage == "minimum-characters":
+        configuration["minimum_text_characters"] = True
+
+    run = make_component_run(
+        store,
+        artifact.artifact_id,
+        f"{artifact.artifact_id}-run",
+        component=ComponentDescriptor(
+            component_id="grobid",
+            component_version="0.9.0",
+            capability="document.parse.scholarly",
+        ),
+        configuration=configuration,
+        inputs=inputs,
+        outputs={"grobid_tei": tei_blob.sha256},
+    )
+    store.save_processing_run(run)
+    product = run.require_output("grobid_tei")
+    if damage == "undeclared-product":
+        product = product.model_copy(update={"name": "ocr_sidecar"})
+
+    with pytest.raises(RecordConflictError, match=message):
+        store._verify_grobid_native_source(
+            canonical_artifact=artifact,
+            product=product,
+            tei_xml=tei,
+        )
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        ("supplement", "direct PDF derivative"),
+        ("wrong-component", "identity"),
+        ("wrong-version", "identity"),
+        ("failed", "status"),
+        ("wrong-output", "searchable-PDF"),
+        ("extra-config", "production schema"),
+        ("wrong-source", "exact source"),
+        ("wrong-config-version", "exact source"),
+        ("empty-reason", "fallback reason"),
+        ("wrong-image", "container identity"),
+        ("wrong-digest", "container identity"),
+        ("local-image", "cannot claim"),
+        ("wrong-mode", "mode"),
+        ("bad-languages-type", "languages"),
+        ("empty-languages", "languages"),
+        ("bad-language", "languages"),
+        ("bad-bool", "must be a boolean"),
+        ("skip-text", "preserve existing text"),
+        ("bad-jobs-bool", "jobs"),
+        ("bad-jobs", "jobs"),
+        ("bad-optimize-bool", "optimize"),
+        ("bad-optimize", "optimize"),
+        ("bad-output", "output type"),
+    ],
+)
+def test_grobid_derivative_requires_exact_ocr_lineage(
+    store: ContentAddressedStore,
+    damage: str,
+    message: str,
+) -> None:
+    parent = save_artifact(store, f"ocr-lineage-{damage}")
+    derivative_blob = store.put_blob(b"%PDF-1.7\nsearchable derivative")
+    configuration = ocr_production_configuration(parent)
+    component = ComponentDescriptor(
+        component_id="ocrmypdf",
+        component_version="17.4.1",
+        capability="document.ocr",
+    )
+    status = ProcessingRunStatus.COMPLETE
+    output_name = "searchable_pdf"
+    relationship = ArtifactRelationship.DERIVATIVE
+
+    if damage == "supplement":
+        relationship = ArtifactRelationship.SUPPLEMENT
+    elif damage == "wrong-component":
+        component = component.model_copy(update={"component_id": "unapproved-ocr"})
+    elif damage == "wrong-version":
+        component = component.model_copy(update={"component_version": "99"})
+    elif damage == "failed":
+        status = ProcessingRunStatus.FAILED
+    elif damage == "wrong-output":
+        output_name = "ocr_sidecar"
+    elif damage == "extra-config":
+        configuration["unregistered"] = True
+    elif damage == "wrong-source":
+        configuration["input_sha256"] = "f" * 64
+    elif damage == "wrong-config-version":
+        configuration["expected_ocrmypdf_version"] = "99"
+    elif damage == "empty-reason":
+        configuration["fallback_reason"] = " "
+    elif damage == "wrong-image":
+        configuration["container_image"] = "example.test/not-ocr:latest"
+    elif damage == "wrong-digest":
+        configuration["container_digest"] = "sha256:not-a-digest"
+    elif damage == "local-image":
+        configuration = ocr_production_configuration(parent, mode="local_cli")
+        configuration["container_image"] = "jbarlow83/ocrmypdf:v17.4.1"
+    elif damage == "wrong-mode":
+        configuration["mode"] = "remote"
+    elif damage == "bad-languages-type":
+        configuration["languages"] = "eng"
+    elif damage == "empty-languages":
+        configuration["languages"] = []
+    elif damage == "bad-language":
+        configuration["languages"] = [""]
+    elif damage == "bad-bool":
+        configuration["rotate_pages"] = 1
+    elif damage == "skip-text":
+        configuration["skip_text"] = False
+    elif damage == "bad-jobs-bool":
+        configuration["jobs"] = True
+    elif damage == "bad-jobs":
+        configuration["jobs"] = 0
+    elif damage == "bad-optimize-bool":
+        configuration["optimize"] = False
+    elif damage == "bad-optimize":
+        configuration["optimize"] = 4
+    elif damage == "bad-output":
+        configuration["output_type"] = "txt"
+
+    creator = make_component_run(
+        store,
+        parent.artifact_id,
+        f"ocr-lineage-{damage}-run",
+        component=component,
+        configuration=configuration,
+        outputs={output_name: derivative_blob.sha256},
+        status=status,
+    )
+    store.save_processing_run(creator)
+    derivative = DocumentArtifact(
+        artifact_id=f"ocr-lineage-{damage}-derivative",
+        source_sha256=derivative_blob.sha256,
+        acquisition_uri=f"derived://ocr/{damage}",
+        media_type="application/pdf",
+        relationship=relationship,
+        parent_artifact_id=parent.artifact_id,
+        raw_location=derivative_blob.as_location(
+            media_type="application/pdf",
+            role=ArtifactLocationRole.RAW,
+            created_by_run_id=creator.run_id,
+        ),
+    )
+    store.save_artifact(derivative)
+
+    with pytest.raises(RecordConflictError, match=message):
+        store._verify_grobid_artifact_lineage(
+            canonical_artifact=parent,
+            grobid_artifact=derivative,
+        )
+
+
+@pytest.mark.parametrize("mode", ["container_cli", "local_cli"])
+def test_grobid_derivative_accepts_exact_ocr_lineage(
+    store: ContentAddressedStore,
+    mode: str,
+) -> None:
+    parent = save_artifact(store, f"ocr-lineage-valid-{mode}")
+    derivative_blob = store.put_blob(b"%PDF-1.7\nvalid searchable derivative")
+    creator = make_component_run(
+        store,
+        parent.artifact_id,
+        f"ocr-lineage-valid-{mode}-run",
+        component=ComponentDescriptor(
+            component_id="ocrmypdf",
+            component_version="17.4.1",
+            capability="document.ocr",
+        ),
+        configuration=ocr_production_configuration(parent, mode=mode),
+        outputs={"searchable_pdf": derivative_blob.sha256},
+    )
+    store.save_processing_run(creator)
+    derivative = DocumentArtifact(
+        artifact_id=f"ocr-lineage-valid-{mode}-derivative",
+        source_sha256=derivative_blob.sha256,
+        acquisition_uri=f"derived://ocr/valid-{mode}",
+        media_type="application/pdf",
+        relationship=ArtifactRelationship.DERIVATIVE,
+        parent_artifact_id=parent.artifact_id,
+        raw_location=derivative_blob.as_location(
+            media_type="application/pdf",
+            role=ArtifactLocationRole.RAW,
+            created_by_run_id=creator.run_id,
+        ),
+    )
+    store.save_artifact(derivative)
+
+    assert store._verify_grobid_artifact_lineage(
+        canonical_artifact=parent,
+        grobid_artifact=derivative,
+    ) == (creator.require_output("searchable_pdf"),)
+
+
+def test_grobid_derivative_accepts_production_ocr_runtime_attestation(
+    store: ContentAddressedStore,
+) -> None:
+    parent = save_artifact(store, "ocr-lineage-valid-runtime-attestation")
+    derivative_blob = store.put_blob(b"%PDF-1.7\nattested searchable derivative")
+    run_id = "ocr-lineage-valid-runtime-attestation-run"
+    attestation = ocr_runtime_attestation(run_id)
+    configuration = ocr_production_configuration(parent)
+    configuration["container_digest"] = attestation.container_digest
+    creator = make_component_run(
+        store,
+        parent.artifact_id,
+        run_id,
+        component=ComponentDescriptor(
+            component_id="ocrmypdf",
+            component_version="17.4.1",
+            capability="document.ocr",
+        ),
+        configuration=configuration,
+        outputs={"searchable_pdf": derivative_blob.sha256},
+        runtime_attestation=attestation,
+        runtime_identity_required=True,
+    )
+    store.save_processing_run(creator)
+    derivative = DocumentArtifact(
+        artifact_id="ocr-lineage-valid-runtime-attestation-derivative",
+        source_sha256=derivative_blob.sha256,
+        acquisition_uri="derived://ocr/valid-runtime-attestation",
+        media_type="application/pdf",
+        relationship=ArtifactRelationship.DERIVATIVE,
+        parent_artifact_id=parent.artifact_id,
+        raw_location=derivative_blob.as_location(
+            media_type="application/pdf",
+            role=ArtifactLocationRole.RAW,
+            created_by_run_id=creator.run_id,
+        ),
+    )
+    store.save_artifact(derivative)
+
+    assert store._verify_grobid_artifact_lineage(
+        canonical_artifact=parent,
+        grobid_artifact=derivative,
+    ) == (creator.require_output("searchable_pdf"),)
+
+
+@pytest.mark.parametrize(
+    "component_versions",
+    [
+        {"ocrmypdf": "17.4.1"},
+        {"ocrmypdf": "17.4.1", "tesseract": "5.3.4", "ghostscript": "10.0"},
+        {"ocrmypdf": "99", "tesseract": "5.3.4"},
+    ],
+    ids=("missing-tesseract", "extra-component", "wrong-ocrmypdf"),
+)
+def test_grobid_derivative_rejects_unapproved_ocr_runtime_components(
+    store: ContentAddressedStore,
+    component_versions: dict[str, str],
+) -> None:
+    parent = save_artifact(
+        store,
+        f"ocr-lineage-runtime-components-{'-'.join(component_versions)}",
+    )
+    run_id = f"{parent.artifact_id}-run"
+    attestation = ocr_runtime_attestation(
+        run_id,
+        component_versions=component_versions,
+    )
+    configuration = ocr_production_configuration(parent)
+    configuration["container_digest"] = attestation.container_digest
+    creator = make_component_run(
+        store,
+        parent.artifact_id,
+        run_id,
+        component=ComponentDescriptor(
+            component_id="ocrmypdf",
+            component_version="17.4.1",
+            capability="document.ocr",
+        ),
+        configuration=configuration,
+        outputs={"searchable_pdf": store.put_blob(b"%PDF attested").sha256},
+        runtime_attestation=attestation,
+        runtime_identity_required=True,
+    )
+    store.save_processing_run(creator)
+
+    with pytest.raises(RecordConflictError, match="runtime attestation conflicts"):
+        store._verify_ocr_configuration(creator, parent)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["attestation-source", "configuration-digest", "configuration-image"],
+)
+def test_grobid_derivative_rejects_ocr_attestation_configuration_conflicts(
+    store: ContentAddressedStore,
+    damage: str,
+) -> None:
+    parent = save_artifact(store, f"ocr-lineage-runtime-conflict-{damage}")
+    run_id = f"{parent.artifact_id}-run"
+    attestation = ocr_runtime_attestation(
+        run_id,
+        source=(
+            RuntimeAttestationSource.AUTHENTICATED_DEPLOYMENT_REPORTER
+            if damage == "attestation-source"
+            else RuntimeAttestationSource.DIGEST_ADDRESSED_OCI_INVOCATION
+        ),
+    )
+    configuration = ocr_production_configuration(parent)
+    configuration["container_digest"] = (
+        f"sha256:{'d' * 64}"
+        if damage == "configuration-digest"
+        else attestation.container_digest
+    )
+    if damage == "configuration-image":
+        configuration["container_image"] = "registry.example.test/ocrmypdf:v17.4.1"
+    creator = make_component_run(
+        store,
+        parent.artifact_id,
+        run_id,
+        component=ComponentDescriptor(
+            component_id="ocrmypdf",
+            component_version="17.4.1",
+            capability="document.ocr",
+        ),
+        configuration=configuration,
+        outputs={"searchable_pdf": store.put_blob(b"%PDF attested").sha256},
+        runtime_attestation=attestation,
+        runtime_identity_required=True,
+    )
+    store.save_processing_run(creator)
+
+    with pytest.raises(RecordConflictError, match="runtime attestation conflicts"):
+        store._verify_ocr_configuration(creator, parent)
+
+
+def test_grobid_derivative_rejects_ocr_creator_with_unrelated_input(
+    store: ContentAddressedStore,
+) -> None:
+    parent = save_artifact(store, "ocr-lineage-unrelated-creator-input")
+    upstream_blob = store.put_blob(b"unrelated preprocessing output")
+    upstream = make_component_run(
+        store,
+        parent.artifact_id,
+        "ocr-lineage-unrelated-upstream-run",
+        component=ComponentDescriptor(
+            component_id="unrelated-preprocessor",
+            component_version="1",
+            capability="document.prepare",
+        ),
+        configuration={"version": "1"},
+        outputs={"ocr_sidecar": upstream_blob.sha256},
+    )
+    store.save_processing_run(upstream)
+    derivative_blob = store.put_blob(b"%PDF searchable")
+    creator = make_component_run(
+        store,
+        parent.artifact_id,
+        "ocr-lineage-unrelated-creator-input-run",
+        component=ComponentDescriptor(
+            component_id="ocrmypdf",
+            component_version="17.4.1",
+            capability="document.ocr",
+        ),
+        configuration=ocr_production_configuration(parent),
+        inputs=(upstream.require_output("ocr_sidecar"),),
+        outputs={"searchable_pdf": derivative_blob.sha256},
+    )
+    store.save_processing_run(creator)
+    derivative = DocumentArtifact(
+        artifact_id="ocr-lineage-unrelated-creator-input-derivative",
+        source_sha256=derivative_blob.sha256,
+        acquisition_uri="derived://ocr/unrelated-creator-input",
+        media_type="application/pdf",
+        relationship=ArtifactRelationship.DERIVATIVE,
+        parent_artifact_id=parent.artifact_id,
+        raw_location=derivative_blob.as_location(
+            media_type="application/pdf",
+            role=ArtifactLocationRole.RAW,
+            created_by_run_id=creator.run_id,
+        ),
+    )
+    store.save_artifact(derivative)
+
+    with pytest.raises(RecordConflictError, match="inputs do not match"):
+        store._verify_grobid_artifact_lineage(
+            canonical_artifact=parent,
+            grobid_artifact=derivative,
+        )
+
+
+def test_grobid_derivative_rejects_missing_creator_lineage(
+    store: ContentAddressedStore,
+) -> None:
+    parent = save_artifact(store, "ocr-lineage-missing-creator")
+    derivative_blob = store.put_blob(b"%PDF derivative without creator")
+    derivative = DocumentArtifact(
+        artifact_id="ocr-lineage-missing-creator-derivative",
+        source_sha256=derivative_blob.sha256,
+        acquisition_uri="derived://ocr/missing-creator",
+        media_type="application/pdf",
+        relationship=ArtifactRelationship.DERIVATIVE,
+        parent_artifact_id=parent.artifact_id,
+        raw_location=derivative_blob.as_location(
+            media_type="application/pdf",
+            role=ArtifactLocationRole.RAW,
+        ),
+    )
+    store.save_artifact(derivative)
+
+    with pytest.raises(RecordConflictError, match="no creator run"):
+        store._verify_grobid_artifact_lineage(
+            canonical_artifact=parent,
+            grobid_artifact=derivative,
+        )
+
+
+def test_grobid_derivative_rejects_creator_owned_by_another_artifact(
+    store: ContentAddressedStore,
+) -> None:
+    parent = save_artifact(store, "ocr-lineage-wrong-owner-parent")
+    other = save_artifact(store, "ocr-lineage-wrong-owner-other")
+    derivative_blob = store.put_blob(b"%PDF wrong-owner derivative")
+    creator = make_component_run(
+        store,
+        other.artifact_id,
+        "ocr-lineage-wrong-owner-run",
+        component=ComponentDescriptor(
+            component_id="ocrmypdf",
+            component_version="17.4.1",
+            capability="document.ocr",
+        ),
+        configuration=ocr_production_configuration(other),
+        outputs={"searchable_pdf": derivative_blob.sha256},
+    )
+    store.save_processing_run(creator)
+    derivative = DocumentArtifact(
+        artifact_id="ocr-lineage-wrong-owner-derivative",
+        source_sha256=derivative_blob.sha256,
+        acquisition_uri="derived://ocr/wrong-owner",
+        media_type="application/pdf",
+        relationship=ArtifactRelationship.DERIVATIVE,
+        parent_artifact_id=parent.artifact_id,
+        raw_location=derivative_blob.as_location(
+            media_type="application/pdf",
+            role=ArtifactLocationRole.RAW,
+            created_by_run_id=creator.run_id,
+        ),
+    )
+
+    with pytest.raises(RecordConflictError, match="does not own"):
+        store._verify_grobid_artifact_lineage(
+            canonical_artifact=parent,
+            grobid_artifact=derivative,
+        )
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        ("digest", "digest is invalid"),
+        ("model-inventory", "model inventory is invalid"),
+        ("inventory-keys", "inventories do not match"),
+        ("required-attestation", "lacks required runtime attestation"),
+    ],
+)
+def test_container_verifier_rejects_unapproved_configuration(
+    store: ContentAddressedStore,
+    damage: str,
+    message: str,
+) -> None:
+    artifact = save_artifact(store, f"container-contract-{damage}")
+    configuration = grobid_production_configuration(artifact)
+    if damage == "digest":
+        configuration["container_digest"] = "not-an-oci-digest"
+    elif damage == "model-inventory":
+        configuration["model_versions"] = []
+    elif damage == "inventory-keys":
+        configuration["model_versions"] = {"layout": "1"}
+    run = make_component_run(
+        store,
+        artifact.artifact_id,
+        f"{artifact.artifact_id}-run",
+        component=ComponentDescriptor(
+            component_id="grobid",
+            component_version="0.9.0",
+            capability="document.parse.scholarly",
+        ),
+        configuration=configuration,
+    )
+    if damage == "required-attestation":
+        run = run.model_copy(update={"runtime_identity_required": True})
+
+    with pytest.raises(RecordConflictError, match=message):
+        store._verify_container_configuration(
+            run,
+            purpose="GROBID",
+            expected_image_tag="0.9.0-full-p0-c2",
+            expected_component_versions={"grobid": "0.9.0"},
+        )
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["attestation-source", "component-versions"],
+)
+def test_container_verifier_rejects_unapproved_attested_identity(
+    store: ContentAddressedStore,
+    damage: str,
+) -> None:
+    artifact = save_artifact(store, f"container-attestation-{damage}")
+    run_id = f"{artifact.artifact_id}-run"
+    attestation = docling_runtime_attestation(
+        run_id,
+        source=(
+            RuntimeAttestationSource.DIGEST_ADDRESSED_OCI_INVOCATION
+            if damage == "attestation-source"
+            else RuntimeAttestationSource.AUTHENTICATED_DEPLOYMENT_REPORTER
+        ),
+        component_versions=(
+            {"docling": "99", "docling_serve": "1.21.0"}
+            if damage == "component-versions"
+            else None
+        ),
+    )
+    configuration = docling_production_configuration(artifact)
+    configuration.update(
+        {
+            "container_digest": attestation.container_digest,
+            "model_versions": attestation.model_versions,
+            "model_hashes": attestation.model_hashes,
+        }
+    )
+    run = make_component_run(
+        store,
+        artifact.artifact_id,
+        run_id,
+        component=ComponentDescriptor(
+            component_id="docling",
+            component_version="2.113.0",
+            capability="document.parse",
+        ),
+        configuration=configuration,
+        runtime_attestation=attestation,
+        runtime_identity_required=True,
+    )
+    store.save_processing_run(run)
+
+    with pytest.raises(RecordConflictError, match=r"runtime attestation|versions"):
+        store._verify_container_configuration(
+            run,
+            purpose="Docling",
+            expected_image_tag="docling-serve-cpu:v1.21.0",
+            expected_component_versions={
+                "docling": "2.113.0",
+                "docling_serve": "1.21.0",
+            },
+        )
+
+
+@pytest.mark.parametrize("matching_output_count", [1, 2])
+def test_native_artifact_inputs_require_one_exact_creator_product(
+    store: ContentAddressedStore,
+    matching_output_count: int,
+) -> None:
+    parent = save_artifact(store, f"native-input-parent-{matching_output_count}")
+    child_blob = store.put_blob(b"derived native bytes")
+    output_names = (
+        {"searchable_pdf": child_blob.sha256}
+        if matching_output_count == 1
+        else {
+            "searchable_pdf": child_blob.sha256,
+            "ocr_sidecar": child_blob.sha256,
+        }
+    )
+    creator = make_component_run(
+        store,
+        parent.artifact_id,
+        f"native-input-creator-{matching_output_count}",
+        component=ComponentDescriptor(
+            component_id="artifact-creator",
+            component_version="1",
+            capability="document.derive",
+        ),
+        configuration={"version": "1"},
+        outputs=output_names,
+    )
+    store.save_processing_run(creator)
+    child = DocumentArtifact(
+        artifact_id=f"native-input-child-{matching_output_count}",
+        source_sha256=child_blob.sha256,
+        acquisition_uri=f"derived://native/{matching_output_count}",
+        media_type="application/pdf",
+        relationship=ArtifactRelationship.DERIVATIVE,
+        parent_artifact_id=parent.artifact_id,
+        raw_location=child_blob.as_location(
+            media_type="application/pdf",
+            role=ArtifactLocationRole.RAW,
+            created_by_run_id=creator.run_id,
+        ),
+    )
+    store.save_artifact(child)
+
+    if matching_output_count == 1:
+        assert store._native_artifact_inputs(child) == (
+            creator.require_output("searchable_pdf"),
+        )
+    else:
+        with pytest.raises(RecordConflictError, match="exactly one creator product"):
+            store._native_artifact_inputs(child)
+
+
+def test_storage_verifier_helpers_reject_invalid_shapes() -> None:
+    with pytest.raises(RecordConflictError, match="must be a JSON object"):
+        storage_module._strict_canonical_json_object(b"[]", purpose="test payload")
+    assert storage_module._is_oci_sha256(None) is False
+    with pytest.raises(RecordConflictError, match="exactly one"):
+        storage_module._require_single_product({}, "docling_document")
+
+
+@pytest.mark.parametrize(
+    ("damage", "mutator"),
+    [
+        ("pretty", lambda payload: json.dumps(json.loads(payload), indent=2).encode()),
+        (
+            "duplicate-key",
+            lambda payload: payload.replace(
+                b'"name":"Canonical persistence"',
+                b'"name":"forged","name":"Canonical persistence"',
+                1,
+            ),
+        ),
+        (
+            "non-finite",
+            lambda payload: payload.replace(b'"page_no":1', b'"page_no":NaN', 1),
+        ),
+    ],
+)
+def test_canonical_admission_rejects_ambiguous_docling_json(
+    store: ContentAddressedStore,
+    damage: str,
+    mutator: Callable[[bytes], bytes],
+) -> None:
+    artifact = save_artifact(store, f"native-json-{damage}")
+    view, _ = make_durable_canonical_view(
+        store,
+        artifact,
+        docling_bytes_mutator=mutator,
+    )
+
+    with pytest.raises(RecordConflictError, match=r"strict JSON|serialized"):
+        save_canonical_view_product(
+            store,
+            artifact,
+            view,
+            run_id=f"native-json-{damage}-view-run",
+        )
+
+
+def test_complete_docling_producer_cannot_mask_semantic_errors(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "native-complete-semantic-error")
+    view, _ = make_durable_canonical_view(
+        store,
+        artifact,
+        document_mutator=lambda document: document.__setitem__("tables", "invalid"),
+    )
+
+    with pytest.raises(RecordConflictError, match="masks semantic validation errors"):
+        save_canonical_view_product(
+            store,
+            artifact,
+            view,
+            run_id="native-complete-semantic-error-view-run",
+        )
+
+
+def test_complete_canonical_producer_cannot_mask_replayed_errors(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "canonical-complete-semantic-error")
+    view, _ = make_durable_canonical_view(
+        store,
+        artifact,
+        document_mutator=lambda document: document.__setitem__("tables", "invalid"),
+        source_status=ProcessingRunStatus.PARTIAL,
+    )
+
+    with pytest.raises(RecordConflictError, match="canonical producer masks"):
+        save_canonical_view_product(
+            store,
+            artifact,
+            view,
+            run_id="canonical-complete-semantic-error-run",
+        )
+
+    _, product = save_canonical_view_product(
+        store,
+        artifact,
+        view,
+        run_id="canonical-partial-semantic-error-run",
+        status=ProcessingRunStatus.PARTIAL,
+    )
+    assert store.read_canonical_document(product) == view
+
+
+@pytest.mark.parametrize(
+    ("integrity_status", "accepted"),
+    [
+        (ProcessingRunStatus.COMPLETE, False),
+        (ProcessingRunStatus.PARTIAL, True),
+    ],
+)
+def test_integrity_producer_status_must_match_replayed_issues(
+    store: ContentAddressedStore,
+    integrity_status: ProcessingRunStatus,
+    accepted: bool,
+) -> None:
+    artifact = save_artifact(store, f"integrity-status-{integrity_status.value}")
+    _, source_run = make_durable_canonical_view(
+        store,
+        artifact,
+        document_mutator=lambda document: document.__setitem__("tables", "invalid"),
+        source_status=ProcessingRunStatus.PARTIAL,
+    )
+    docling_product = source_run.require_output("docling_document")
+    spans_product = source_run.require_output("content_spans")
+    document = json.loads(store.read_blob(docling_product.blob_sha256))
+    span_set = ContentSpanSet.model_validate_json(
+        store.read_blob(spans_product.blob_sha256)
+    )
+    report = validate_content_integrity(document).to_dict()
+    report_blob = store.put_blob(
+        json.dumps(
+            report,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    )
+    integrity_configuration = {
+        "algorithm": "explicit-content-integrity-v1",
+        "docling_document_sha256": docling_product.blob_sha256,
+        "scholarly_alignment_sha256": None,
+    }
+    integrity_run = make_component_run(
+        store,
+        artifact.artifact_id,
+        f"integrity-status-{integrity_status.value}-run",
+        component=ComponentDescriptor(
+            component_id="docling-content-integrity",
+            component_version="1",
+            capability="document.validate",
+        ),
+        configuration=integrity_configuration,
+        inputs=(docling_product,),
+        outputs={"content_integrity_overlay": report_blob.sha256},
+        status=integrity_status,
+    )
+    store.save_processing_run(integrity_run)
+    sources = (
+        docling_product,
+        spans_product,
+        integrity_run.require_output("content_integrity_overlay"),
+    )
+    view = build_canonical_document_view(
+        artifact=artifact,
+        docling_document=document,
+        docling_product=docling_product,
+        content_span_set=span_set,
+        source_products=sources,
+        configuration=CanonicalizationConfig(),
+        integrity_report=report,
+    )
+
+    if not accepted:
+        with pytest.raises(RecordConflictError, match="integrity producer masks"):
+            save_canonical_view_product(
+                store,
+                artifact,
+                view,
+                run_id="complete-integrity-mask-view-run",
+                status=ProcessingRunStatus.PARTIAL,
+            )
+        return
+
+    _, product = save_canonical_view_product(
+        store,
+        artifact,
+        view,
+        run_id="partial-integrity-issues-view-run",
+        status=ProcessingRunStatus.PARTIAL,
+    )
+    assert store.read_canonical_document(product) == view
+
+
+def test_canonical_read_rechecks_legacy_failed_native_producer(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "canonical-legacy-failed-native")
+    view, source_run = make_durable_canonical_view(store, artifact)
+    _, product = save_canonical_view_product(
+        store,
+        artifact,
+        view,
+        run_id="canonical-legacy-failed-native-view-run",
+    )
+    record_path = store._record_path("processing_runs", source_run.run_id)
+    payload = json.loads(record_path.read_text(encoding="utf-8"))
+    payload["status"] = ProcessingRunStatus.FAILED.value
+    record_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RecordConflictError, match="status"):
+        store.read_canonical_document(product)
+
+
+def test_canonical_partial_producer_is_admitted_and_reproducible(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "canonical-partial")
+    view, _ = make_durable_canonical_view(store, artifact)
+
+    producer, product = save_canonical_view_product(
+        store,
+        artifact,
+        view,
+        run_id="canonical-partial-run",
+        status=ProcessingRunStatus.PARTIAL,
+    )
+
+    assert producer.status is ProcessingRunStatus.PARTIAL
+    assert store.read_canonical_document(product) == view
+
+
+@pytest.mark.parametrize(
+    "component",
+    [
+        ComponentDescriptor(
+            component_id="docling",
+            component_version=CANONICAL_COMPONENT_VERSION,
+            capability=CANONICAL_COMPONENT_CAPABILITY,
+        ),
+        ComponentDescriptor(
+            component_id=CANONICAL_COMPONENT_ID,
+            component_version="2",
+            capability=CANONICAL_COMPONENT_CAPABILITY,
+        ),
+        ComponentDescriptor(
+            component_id=CANONICAL_COMPONENT_ID,
+            component_version=CANONICAL_COMPONENT_VERSION,
+            capability="document.parse",
+        ),
+    ],
+    ids=("wrong-component", "wrong-version", "wrong-capability"),
+)
+def test_canonical_admission_requires_exact_producer_identity(
+    store: ContentAddressedStore,
+    component: ComponentDescriptor,
+) -> None:
+    artifact = save_artifact(store, f"canonical-{component.component_id}")
+    view, _ = make_durable_canonical_view(store, artifact)
+
+    with pytest.raises(RecordConflictError, match="producer identity"):
+        save_canonical_view_product(
+            store,
+            artifact,
+            view,
+            component=component,
+            run_id=f"canonical-{component.component_version}-identity-run",
+        )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [ProcessingRunStatus.FAILED, ProcessingRunStatus.QUARANTINED],
+)
+def test_canonical_admission_rejects_unsuccessful_terminal_status(
+    store: ContentAddressedStore,
+    status: ProcessingRunStatus,
+) -> None:
+    artifact = save_artifact(store, f"canonical-{status.value}")
+    view, _ = make_durable_canonical_view(store, artifact)
+
+    with pytest.raises(RecordConflictError, match="complete or partial"):
+        save_canonical_view_product(
+            store,
+            artifact,
+            view,
+            status=status,
+            run_id=f"canonical-{status.value}-run",
+        )
+
+
+def test_canonical_read_rechecks_legacy_wrong_producer_identity(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "canonical-legacy-wrong-producer")
+    view, _ = make_durable_canonical_view(store, artifact)
+    wrong_component = ComponentDescriptor(
+        component_id="docling",
+        component_version=CANONICAL_COMPONENT_VERSION,
+        capability=CANONICAL_COMPONENT_CAPABILITY,
+    )
+    _, product = save_canonical_view_product(
+        store,
+        artifact,
+        view,
+        component=wrong_component,
+        run_id="canonical-legacy-wrong-producer-run",
+        bypass_admission=True,
+    )
+
+    with pytest.raises(RecordConflictError, match="producer identity"):
+        store.read_canonical_document(product)
+
+
+def test_canonical_admission_rejects_configuration_drift(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "canonical-config-drift")
+    view, _ = make_durable_canonical_view(store, artifact)
+    configuration = canonical_invocation_configuration(
+        CanonicalizationConfig(),
+        view.source_products,
+    )
+    configuration["adapter_version"] = "drifted"
+
+    with pytest.raises(RecordConflictError, match="configuration"):
+        save_canonical_view_product(
+            store,
+            artifact,
+            view,
+            configuration=configuration,
+            run_id="canonical-config-drift-run",
+        )
+
+
+def test_canonical_admission_rejects_nonexistent_native_node(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "canonical-nonexistent-node")
+    view, _ = make_durable_canonical_view(store, artifact)
+
+    def replace_node(payload: dict[str, Any]) -> None:
+        block = payload["blocks"][0]
+        block["native_node_id"] = "#/texts/404"
+        next(
+            anchor for anchor in block["source_anchors"] if anchor["role"] == "primary"
+        )["node_id"] = "#/texts/404"
+        block["block_id"] = canonical_block_id(
+            native_node_id=block["native_node_id"],
+            kind=CanonicalBlockKind(block["kind"]),
+            content_sha256=block["content_sha256"],
+        )
+        payload["root_block_ids"] = [block["block_id"]]
+
+    forged = mutate_canonical_view(view, replace_node)
+
+    with pytest.raises(RecordConflictError, match="identity does not match"):
+        save_canonical_view_product(
+            store,
+            artifact,
+            forged,
+            run_id="canonical-nonexistent-node-run",
+        )
+
+
+def test_canonical_admission_rejects_out_of_bounds_anchor(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "canonical-anchor-bounds")
+    view, _ = make_durable_canonical_view(store, artifact)
+
+    def expand_anchor(payload: dict[str, Any]) -> None:
+        primary = next(
+            anchor
+            for anchor in payload["blocks"][0]["source_anchors"]
+            if anchor["role"] == "primary"
+        )
+        primary["char_start"] = 0
+        primary["char_end"] = 10_000
+
+    forged = mutate_canonical_view(view, expand_anchor)
+
+    with pytest.raises(RecordConflictError, match="identity does not match"):
+        save_canonical_view_product(
+            store,
+            artifact,
+            forged,
+            run_id="canonical-anchor-bounds-run",
+        )
+
+
+def test_canonical_admission_rejects_metadata_drift(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "canonical-metadata-drift")
+    view, _ = make_durable_canonical_view(store, artifact)
+
+    def drift_metadata(payload: dict[str, Any]) -> None:
+        payload["metadata"]["title"] = "Invented title"
+        payload["metadata"]["identifiers"] = {"pmc": "PMC-INVENTED"}
+
+    forged = mutate_canonical_view(view, drift_metadata)
+
+    with pytest.raises(RecordConflictError, match="identity does not match"):
+        save_canonical_view_product(
+            store,
+            artifact,
+            forged,
+            run_id="canonical-metadata-drift-run",
+        )
+
+
+def test_canonical_read_rebuilds_legacy_metadata_before_returning(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "canonical-legacy-metadata-drift")
+    view, _ = make_durable_canonical_view(store, artifact)
+
+    def drift_metadata(payload: dict[str, Any]) -> None:
+        payload["metadata"]["title"] = "Legacy invented title"
+
+    forged = mutate_canonical_view(view, drift_metadata)
+    _, product = save_canonical_view_product(
+        store,
+        artifact,
+        forged,
+        run_id="canonical-legacy-metadata-drift-run",
+        bypass_admission=True,
+    )
+
+    with pytest.raises(RecordConflictError, match="identity does not match"):
+        store.read_canonical_document(product)
+
+
+def test_canonical_admission_rejects_content_span_hash_drift(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "canonical-span-hash-drift")
+    valid_view, valid_source_run = make_durable_canonical_view(store, artifact)
+    old_docling = valid_source_run.require_output("docling_document")
+    old_spans = valid_source_run.require_output("content_spans")
+    invalid_run_id = "canonical-invalid-span-source-run"
+    new_docling = store.data_product_ref(
+        name="docling_document",
+        blob_sha256=old_docling.blob_sha256,
+        producer_run_id=invalid_run_id,
+        source_artifact_ids=(artifact.artifact_id,),
+    )
+    span_payload = json.loads(store.read_blob(old_spans.blob_sha256))
+    span_payload["processing_run_id"] = invalid_run_id
+    span_payload["representation_product_id"] = new_docling.product_id
+    for span in span_payload["spans"]:
+        span["processing_run_id"] = invalid_run_id
+        span["representation_anchor"]["product_id"] = new_docling.product_id
+        span["content_sha256"] = "f" * 64
+    invalid_spans = ContentSpanSet.model_validate(span_payload)
+    invalid_spans_blob = store.put_blob(
+        json.dumps(
+            invalid_spans.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    )
+    invalid_source_run = make_component_run(
+        store,
+        artifact.artifact_id,
+        invalid_run_id,
+        component=ComponentDescriptor(
+            component_id="docling",
+            component_version="2.113.0",
+            capability="document.parse",
+        ),
+        configuration=docling_production_configuration(artifact),
+        outputs={
+            "docling_document": old_docling.blob_sha256,
+            "content_spans": invalid_spans_blob.sha256,
+        },
+    )
+    store.save_processing_run(invalid_source_run)
+    new_sources = (
+        invalid_source_run.require_output("docling_document"),
+        invalid_source_run.require_output("content_spans"),
+    )
+
+    def replace_sources(payload: dict[str, Any]) -> None:
+        payload["source_products"] = [
+            product.model_dump(mode="json") for product in new_sources
+        ]
+        for block in payload["blocks"]:
+            for anchor in block["source_anchors"]:
+                if anchor["product_id"] == old_docling.product_id:
+                    anchor["product_id"] = new_sources[0].product_id
+
+    forged = mutate_canonical_view(valid_view, replace_sources)
+
+    with pytest.raises(RecordConflictError, match="content-span source"):
+        save_canonical_view_product(
+            store,
+            artifact,
+            forged,
+            run_id="canonical-invalid-span-run",
+        )
+
+
+@pytest.mark.parametrize("damage", ["omitted", "locator-drift"])
+def test_canonical_admission_rejects_irreproducible_content_span_sets(
+    store: ContentAddressedStore,
+    damage: str,
+) -> None:
+    artifact = save_artifact(store, f"canonical-admission-{damage}")
+    forged = make_irreproducible_canonical_view(
+        store,
+        artifact,
+        damage=damage,
+    )
+
+    with pytest.raises(RecordConflictError, match="content-span source"):
+        save_canonical_view_product(
+            store,
+            artifact,
+            forged,
+            run_id=f"canonical-admission-{damage}-run",
+        )
+
+
+@pytest.mark.parametrize("damage", ["omitted", "locator-drift"])
+def test_canonical_legacy_read_rejects_irreproducible_content_span_sets(
+    store: ContentAddressedStore,
+    damage: str,
+) -> None:
+    artifact = save_artifact(store, f"canonical-legacy-{damage}")
+    forged = make_irreproducible_canonical_view(
+        store,
+        artifact,
+        damage=damage,
+    )
+    _, product = save_canonical_view_product(
+        store,
+        artifact,
+        forged,
+        run_id=f"canonical-legacy-{damage}-run",
+        bypass_admission=True,
+    )
+
+    with pytest.raises(RecordConflictError, match="content-span source"):
+        store.read_canonical_document(product)
+
+
+def test_canonical_admission_rejects_stale_scholarly_tei_evidence(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "canonical-stale-tei")
+    _, source_run = make_durable_canonical_view(store, artifact)
+    docling_product = source_run.require_output("docling_document")
+    spans_product = source_run.require_output("content_spans")
+    docling_document = json.loads(store.read_blob(docling_product.blob_sha256))
+    span_set = ContentSpanSet.model_validate_json(
+        store.read_blob(spans_product.blob_sha256)
+    )
+    durable_tei = b"""<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body>
+    <p>Canonical content</p>
+    </body></text></TEI>"""
+    stale_tei = b"""<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body>
+    <p>Unrelated stale evidence</p>
+    </body></text></TEI>"""
+    grobid_blob = store.put_blob(durable_tei)
+    grobid_run = make_component_run(
+        store,
+        artifact.artifact_id,
+        "canonical-stale-tei-grobid-run",
+        component=ComponentDescriptor(
+            component_id="grobid",
+            component_version="0.9.0",
+            capability="document.parse.scholarly",
+        ),
+        configuration=grobid_production_configuration(artifact),
+        outputs={"grobid_tei": grobid_blob.sha256},
+    )
+    store.save_processing_run(grobid_run)
+    grobid_product = grobid_run.require_output("grobid_tei")
+    stale_overlay = DoclingGrobidAligner(minimum_score=0.72).align(
+        docling_document,
+        stale_tei,
+    )
+    alignment_blob = store.put_blob(
+        json.dumps(
+            stale_overlay.to_dict(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    )
+    alignment_configuration = {
+        "algorithm": "token-sequence-v2",
+        "minimum_score": 0.72,
+        "docling_document_sha256": docling_product.blob_sha256,
+        "grobid_tei_sha256": grobid_product.blob_sha256,
+    }
+    alignment_run = make_component_run(
+        store,
+        artifact.artifact_id,
+        "canonical-stale-tei-alignment-run",
+        component=ComponentDescriptor(
+            component_id="docling-grobid-aligner",
+            component_version="2",
+            capability="document.align",
+        ),
+        configuration=alignment_configuration,
+        inputs=(docling_product, grobid_product),
+        outputs={"alignment_overlay": alignment_blob.sha256},
+    )
+    store.save_processing_run(alignment_run)
+    alignment_product = alignment_run.require_output("alignment_overlay")
+    forged = build_canonical_document_view(
+        artifact=artifact,
+        docling_document=docling_document,
+        docling_product=docling_product,
+        content_span_set=span_set,
+        source_products=(
+            docling_product,
+            spans_product,
+            grobid_product,
+            alignment_product,
+        ),
+        configuration=CanonicalizationConfig(),
+        scholarly_overlay=stale_overlay,
+    )
+
+    with pytest.raises(RecordConflictError, match="does not reproduce"):
+        save_canonical_view_product(
+            store,
+            artifact,
+            forged,
+            run_id="canonical-stale-tei-run",
+        )
+
+
 def test_canonical_read_requires_exact_producer_inputs(
     store: ContentAddressedStore,
 ) -> None:
@@ -816,6 +2931,7 @@ def test_canonical_read_requires_exact_producer_inputs(
         view,
         inputs=tuple(reversed(view.source_products)),
         run_id="canonical-input-mismatch-run",
+        bypass_admission=True,
     )
 
     with pytest.raises(RecordConflictError, match="source products do not exactly"):
@@ -833,6 +2949,7 @@ def test_canonical_read_binds_view_to_producer_artifact(
         producer_artifact,
         view,
         run_id="canonical-wrong-artifact-run",
+        bypass_admission=True,
     )
 
     with pytest.raises(RecordConflictError, match="artifact does not match"):
@@ -857,6 +2974,7 @@ def test_canonical_read_binds_source_hash_to_producer_artifact(
         artifact,
         forged_view,
         run_id="canonical-forged-source-hash-run",
+        bypass_admission=True,
     )
 
     with pytest.raises(RecordConflictError, match="source hash does not match"):
@@ -906,6 +3024,26 @@ def test_artifact_records_are_idempotent_and_conflicts_never_overwrite(
     with pytest.raises(RecordConflictError, match="different content"):
         store.save_artifact(conflicting)
     assert store.get_artifact(artifact.artifact_id) == artifact
+
+
+def test_legacy_processing_run_without_stage_invocation_id_remains_idempotent(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "legacy-stage-invocation")
+    run = make_run(
+        store,
+        artifact.artifact_id,
+        "run-legacy-stage-invocation",
+        ProcessingRunStatus.COMPLETE,
+    )
+
+    record_path = store.save_processing_run(run)
+    payload = json.loads(record_path.read_text(encoding="utf-8"))
+    restored = store.get_processing_run(run.run_id)
+
+    assert "stage_invocation_id" not in payload
+    assert restored.stage_invocation_id is None
+    assert store.save_processing_run(restored) == record_path
 
 
 def test_record_loading_dispatches_schema_versions_before_validation(

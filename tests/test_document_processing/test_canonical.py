@@ -1,18 +1,31 @@
 from __future__ import annotations
 
 import json
+import random
 from copy import copy, deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
+from pypdf import PdfReader
 
+from DeepResearch.src.document_processing import canonical as canonical_module
+from DeepResearch.src.document_processing.adapters import (
+    BioCAdapter,
+    JATSLocatorAdapter,
+)
 from DeepResearch.src.document_processing.alignment import DoclingGrobidAligner
 from DeepResearch.src.document_processing.canonical import (
+    CANONICAL_COMPONENT_CAPABILITY,
+    CANONICAL_COMPONENT_ID,
+    CANONICAL_COMPONENT_VERSION,
     CANONICAL_DOCUMENT_SCHEMA_VERSION,
+    MAX_CANONICAL_TABLE_AXIS,
+    MAX_CANONICAL_TABLE_CELLS,
     CanonicalAnchorRole,
     CanonicalBlock,
     CanonicalBlockKind,
@@ -35,6 +48,7 @@ from DeepResearch.src.document_processing.canonical import (
     canonical_block_id,
     canonical_diagnostic_id,
     canonical_document_bytes,
+    canonical_invocation_configuration,
     canonical_relationship_id,
     canonical_relationship_status,
     canonical_view_id,
@@ -59,8 +73,12 @@ from DeepResearch.src.document_processing.models import (
     sha256_bytes,
 )
 from DeepResearch.src.document_processing.products import build_data_product_ref
+from DeepResearch.src.document_processing.routing import InputFormat
 from DeepResearch.src.document_processing.storage import ContentAddressedStore
 from DeepResearch.src.document_processing.validation import (
+    align_bioc_content_spans,
+    align_jats_content_spans,
+    build_pdf_content_spans,
     docling_document_sha256,
     validate_content_integrity,
 )
@@ -68,107 +86,45 @@ from DeepResearch.src.document_processing.validation import (
 FIXTURE_ROOT = (
     Path(__file__).parents[1] / "fixtures" / "document_processing" / "canonical"
 )
+FIXTURE_V1_ROOT = FIXTURE_ROOT / "v1"
 
 
 def _document() -> dict[str, Any]:
-    return {
-        "schema_name": "DoclingDocument",
-        "version": "1.0.0",
-        "name": "Fallback title",
-        "body": {
-            "self_ref": "#/body",
-            "children": [
-                {"$ref": "#/groups/0"},
-                {"$ref": "#/tables/0"},
-                {"$ref": "#/pictures/0"},
-                {"$ref": "#/formulas/0"},
-            ],
-        },
-        "groups": [
-            {
-                "self_ref": "#/groups/0",
-                "label": "section_group",
-                "children": [
-                    {"$ref": "#/texts/0"},
-                    {"$ref": "#/texts/1"},
-                    {"$ref": "#/texts/2"},
-                    {"$ref": "#/texts/5"},
-                    {"$ref": "#/texts/6"},
-                ],
-            }
-        ],
-        "texts": [
-            {
-                "self_ref": "#/texts/0",
-                "label": "title",
-                "text": "  APOE4\tpathway  ",
-            },
-            {
-                "self_ref": "#/texts/1",
-                "label": "section_header",
-                "text": "Methods",
-            },
-            {
-                "self_ref": "#/texts/2",
-                "label": "paragraph",
-                "text": "Endosomal pH was measured.",
-            },
-            {
-                "self_ref": "#/texts/3",
-                "label": "caption",
-                "text": "Table 1. Cohort.",
-            },
-            {
-                "self_ref": "#/texts/4",
-                "label": "caption",
-                "text": "Figure 1. Endosomes.",
-            },
-            {
-                "self_ref": "#/texts/5",
-                "label": "citation",
-                "text": "[1]",
-            },
-            {
-                "self_ref": "#/texts/6",
-                "label": "reference",
-                "text": "Smith 2026 endosomal study.",
-            },
-        ],
-        "tables": [
-            {
-                "self_ref": "#/tables/0",
-                "label": "table",
-                "captions": [{"$ref": "#/texts/3"}],
-                "children": [{"$ref": "#/texts/3"}],
-                "data": {"grid": [["Group", "N"], ["APOE4", 12]]},
-            }
-        ],
-        "pictures": [
-            {
-                "self_ref": "#/pictures/0",
-                "label": "picture",
-                "captions": [{"$ref": "#/texts/4"}],
-                "children": [{"$ref": "#/texts/4"}],
-            }
-        ],
-        "formulas": [
-            {
-                "self_ref": "#/formulas/0",
-                "label": "formula",
-                "text": "pH = -log10[H+]",
-            }
-        ],
-        "key_value_items": [],
-        "pages": {"1": {"page_no": 1}},
-    }
+    return json.loads(
+        (FIXTURE_V1_ROOT / "docling_document.json").read_text(encoding="utf-8")
+    )
 
 
 def _tei() -> bytes:
-    return b"""<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body>
-    <p><ref type="bibr" target="#b1">[1]</ref></p>
-    </body><back><listBibl><biblStruct xml:id="b1">
-    Smith 2026 endosomal study.
-    </biblStruct></listBibl></back></text></TEI>"""
+    return (FIXTURE_V1_ROOT / "grobid.tei.xml").read_bytes()
+
+
+def _canonical_json_fixture_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _product_from_bytes(
+    name: str,
+    payload: bytes,
+    *,
+    artifact_id: str,
+    producer_run_id: str,
+):
+    digest = sha256_bytes(payload)
+    return build_data_product_ref(
+        name=name,
+        blob_sha256=digest,
+        uri=f"cas://sha256/{digest}",
+        byte_size=len(payload),
+        producer_run_id=producer_run_id,
+        source_artifact_ids=(artifact_id,),
+    )
 
 
 def _product(
@@ -238,10 +194,19 @@ def _locator(format_name: str, index: int, length: int):
     )
 
 
-def _fixture(format_name: str) -> CanonicalDocumentView:
+def _fixture_bundle(
+    format_name: str,
+) -> tuple[CanonicalDocumentView, dict[str, bytes]]:
     document = _document()
     artifact_id = f"canonical-{format_name}"
-    source_bytes = f"source-{format_name}".encode()
+    source_bytes = (
+        FIXTURE_V1_ROOT
+        / {
+            "pdf": "article.pdf",
+            "jats": "article.jats.xml",
+            "bioc": "article.bioc.json",
+        }[format_name]
+    ).read_bytes()
     source_sha256 = sha256_bytes(source_bytes)
     artifact = DocumentArtifact(
         artifact_id=artifact_id,
@@ -266,136 +231,153 @@ def _fixture(format_name: str) -> CanonicalDocumentView:
         ),
     )
     producer = f"docling-{format_name}"
-    docling_product = _product(
+    docling_bytes = _canonical_json_fixture_bytes(document)
+    docling_product = _product_from_bytes(
         "docling_document",
-        "a",
+        docling_bytes,
         artifact_id=artifact_id,
         producer_run_id=producer,
     )
-    content_spans_product = _product(
-        "content_spans",
-        "b",
-        artifact_id=artifact_id,
-        producer_run_id=producer,
-    )
-    grobid_product = _product(
-        "grobid_tei",
-        "c",
-        artifact_id=artifact_id,
-        producer_run_id=f"grobid-{format_name}",
-    )
-    alignment_product = _product(
-        "alignment_overlay",
-        "d",
-        artifact_id=artifact_id,
-        producer_run_id=f"alignment-{format_name}",
-    )
-    integrity_product = _product(
-        "content_integrity_overlay",
-        "e",
-        artifact_id=artifact_id,
-        producer_run_id=f"integrity-{format_name}",
-    )
-    text_nodes = [
-        (f"#/texts/{index}", item["text"])
-        for index, item in enumerate(document["texts"])
-    ] + [("#/formulas/0", document["formulas"][0]["text"])]
-    spans = tuple(
-        ContentSpan(
-            span_id=f"span-{format_name}-{index}",
+    if format_name == "pdf":
+        spans = build_pdf_content_spans(
+            document,
             artifact_id=artifact_id,
             processing_run_id=producer,
-            representation_anchor=RepresentationAnchor(
-                product_id=docling_product.product_id,
-                node_id=node_id,
-                char_start=0,
-                char_end=len(text),
-            ),
-            content_sha256=sha256_bytes(text.encode()),
-            source_locator=_locator(format_name, index, len(text)),
+            representation_product_id=docling_product.product_id,
         )
-        for index, (node_id, text) in enumerate(text_nodes)
-    )
+    elif format_name == "jats":
+        native_locators = JATSLocatorAdapter().extract_locators(source_bytes)
+        spans = align_jats_content_spans(
+            document,
+            native_locators,
+            artifact_id=artifact_id,
+            processing_run_id=producer,
+            representation_product_id=docling_product.product_id,
+        ).spans
+    else:
+        native_locators = (
+            BioCAdapter()
+            .adapt(
+                source_bytes,
+                input_format=InputFormat.BIOC_JSON,
+            )
+            .locator_overlay
+        )
+        spans = align_bioc_content_spans(
+            document,
+            native_locators,
+            artifact_id=artifact_id,
+            processing_run_id=producer,
+            representation_product_id=docling_product.product_id,
+        ).spans
     span_set = ContentSpanSet(
         artifact_id=artifact_id,
         processing_run_id=producer,
         representation_product_id=docling_product.product_id,
         spans=spans,
     )
-    overlay = DoclingGrobidAligner(minimum_score=0.7).align(document, _tei())
+    spans_bytes = _canonical_json_fixture_bytes(span_set.model_dump(mode="json"))
+    content_spans_product = _product_from_bytes(
+        "content_spans",
+        spans_bytes,
+        artifact_id=artifact_id,
+        producer_run_id=producer,
+    )
+    overlay = (
+        DoclingGrobidAligner(minimum_score=0.7).align(document, _tei())
+        if format_name == "pdf"
+        else None
+    )
+    alignment_bytes = (
+        _canonical_json_fixture_bytes(overlay.to_dict())
+        if overlay is not None
+        else None
+    )
     integrity = validate_content_integrity(
         document, scholarly_overlay=overlay
     ).to_dict()
-    return build_canonical_document_view(
+    integrity_bytes = _canonical_json_fixture_bytes(integrity)
+    source_products = [docling_product, content_spans_product]
+    if overlay is not None:
+        grobid_product = _product_from_bytes(
+            "grobid_tei",
+            _tei(),
+            artifact_id=artifact_id,
+            producer_run_id=f"grobid-{format_name}",
+        )
+        alignment_product = _product_from_bytes(
+            "alignment_overlay",
+            alignment_bytes,
+            artifact_id=artifact_id,
+            producer_run_id=f"alignment-{format_name}",
+        )
+        source_products.extend((grobid_product, alignment_product))
+    integrity_product = _product_from_bytes(
+        "content_integrity_overlay",
+        integrity_bytes,
+        artifact_id=artifact_id,
+        producer_run_id=f"integrity-{format_name}",
+    )
+    source_products.append(integrity_product)
+    view = build_canonical_document_view(
         artifact=artifact,
         docling_document=document,
         docling_product=docling_product,
         content_span_set=span_set,
-        source_products=(
-            docling_product,
-            content_spans_product,
-            grobid_product,
-            alignment_product,
-            integrity_product,
-        ),
+        source_products=tuple(source_products),
         configuration=CanonicalizationConfig(),
         scholarly_overlay=overlay,
         integrity_report=integrity,
     )
-
-
-def _summary(view: CanonicalDocumentView) -> dict[str, Any]:
-    blocks = {block.block_id: block for block in view.blocks}
-    located_text_blocks = sum(
-        bool(
-            block.text
-            and any(
-                anchor.source_locator is not None for anchor in block.source_anchors
-            )
-        )
-        for block in view.blocks
-    )
-    text_blocks = sum(block.text is not None for block in view.blocks)
-    return {
-        "schema_version": view.schema_version,
-        "metadata_title": view.metadata.title,
-        "block_kinds": [block.kind.value for block in view.blocks],
-        "root_kinds": [blocks[block_id].kind.value for block_id in view.root_block_ids],
-        "relationship_kinds": [relation.kind.value for relation in view.relationships],
-        "relationship_statuses": [
-            relation.status.value for relation in view.relationships
-        ],
-        "source_locator_kinds": sorted(
-            {
-                anchor.source_locator.kind
-                for block in view.blocks
-                for anchor in block.source_anchors
-                if anchor.source_locator is not None
-            }
-        ),
-        "source_product_names": [product.name for product in view.source_products],
-        "diagnostic_codes": [diagnostic.code for diagnostic in view.diagnostics],
-        "text_blocks": text_blocks,
-        "located_text_blocks": located_text_blocks,
+    intermediates = {
+        "content_integrity_overlay.json": integrity_bytes,
+        "content_spans.json": spans_bytes,
     }
+    if alignment_bytes is not None:
+        intermediates["alignment_overlay.json"] = alignment_bytes
+    return view, intermediates
+
+
+def _fixture(format_name: str) -> CanonicalDocumentView:
+    return _fixture_bundle(format_name)[0]
 
 
 @pytest.mark.parametrize("format_name", ["pdf", "jats", "bioc"])
-def test_golden_canonical_views_are_deterministic_and_fully_anchored(
+def test_golden_canonical_views_preserve_real_pipeline_anchoring(
     format_name: str,
 ) -> None:
-    first = _fixture(format_name)
-    second = _fixture(format_name)
-    expected = json.loads(
-        (FIXTURE_ROOT / f"{format_name}.json").read_text(encoding="utf-8")
-    )
+    first, first_intermediates = _fixture_bundle(format_name)
+    second, second_intermediates = _fixture_bundle(format_name)
+    expected_bytes = (FIXTURE_ROOT / f"{format_name}.json").read_bytes()
+    expected = load_canonical_document(expected_bytes)
 
     assert first == second
+    assert first_intermediates == second_intermediates
+    assert set(first_intermediates) == {
+        "content_integrity_overlay.json",
+        "content_spans.json",
+        *({"alignment_overlay.json"} if format_name == "pdf" else set()),
+    }
+    for name, actual_bytes in first_intermediates.items():
+        assert actual_bytes == (FIXTURE_V1_ROOT / format_name / name).read_bytes()
     assert canonical_document_bytes(first) == canonical_document_bytes(second)
-    assert _summary(first) == expected
+    assert first == expected
+    assert canonical_document_bytes(first) == expected_bytes
     assert first.view_id.startswith("canonical-view-")
     assert all(block.block_id.startswith("block-") for block in first.blocks)
-    assert _summary(first)["text_blocks"] == _summary(first)["located_text_blocks"]
+    unlocated_text_nodes = {
+        block.native_node_id
+        for block in first.blocks
+        if block.text is not None
+        and not any(
+            anchor.source_locator is not None for anchor in block.source_anchors
+        )
+    }
+    assert unlocated_text_nodes == {"#/formulas/0"}
+    assert [
+        (diagnostic.code, diagnostic.native_node_ids)
+        for diagnostic in first.diagnostics
+    ] == [("MISSING_SOURCE_SPAN", ("#/formulas/0",))]
     assert all(
         relation.status is CanonicalRelationshipStatus.RESOLVED
         for relation in first.relationships
@@ -410,11 +392,75 @@ def test_golden_canonical_views_are_deterministic_and_fully_anchored(
         for relation in first.relationships
         if relation.source_anchor is not None
     ]
-    assert scholarly_anchors
+    assert bool(scholarly_anchors) is (format_name == "pdf")
     assert all(
         anchor.char_start is None and anchor.char_end is None
         for anchor in scholarly_anchors
     )
+
+
+def test_canonical_sources_contain_the_represented_text() -> None:
+    document = _document()
+    represented_text = {
+        item["text"] for item in document["texts"] if isinstance(item, dict)
+    }
+    represented_text.update(
+        cell["text"]
+        for table in document["tables"]
+        for cell in table["data"]["table_cells"]
+    )
+    represented_text.update(
+        item["text"] for item in document["formulas"] if isinstance(item, dict)
+    )
+
+    pdf_text = "\n".join(
+        page.extract_text() or ""
+        for page in PdfReader(
+            BytesIO((FIXTURE_V1_ROOT / "article.pdf").read_bytes())
+        ).pages
+    )
+    assert all(text in pdf_text for text in represented_text)
+    scholarly_text = {
+        annotation.text
+        for annotation in DoclingGrobidAligner().extract_annotations(_tei())
+    }
+    assert all(text in pdf_text for text in scholarly_text)
+
+    jats_text = {
+        locator.text
+        for locator in JATSLocatorAdapter().extract_locators(
+            (FIXTURE_V1_ROOT / "article.jats.xml").read_bytes()
+        )
+    }
+    assert represented_text <= jats_text
+
+    bioc_text = {
+        locator.text
+        for locator in BioCAdapter()
+        .adapt(
+            (FIXTURE_V1_ROOT / "article.bioc.json").read_bytes(),
+            input_format=InputFormat.BIOC_JSON,
+        )
+        .locator_overlay
+    }
+    assert represented_text <= bioc_text
+
+
+def test_canonical_fixture_manifest_matches_every_frozen_file() -> None:
+    manifest = json.loads((FIXTURE_V1_ROOT / "manifest.json").read_bytes())
+    assert manifest["schema_version"] == ("deepcritical-canonical-fixture-manifest-v1")
+    assert manifest["external_services"]["captured_from_services"] is False
+    assert manifest["external_services"]["container_image_digests"] == {}
+    for relative_path, expected in manifest["files"].items():
+        payload = (FIXTURE_V1_ROOT / relative_path).resolve().read_bytes()
+        assert len(payload) == expected["byte_size"]
+        assert sha256_bytes(payload) == expected["sha256"]
+        product_bytes = expected.get("product_bytes")
+        if product_bytes is None:
+            continue
+        encoded = _canonical_json_fixture_bytes(json.loads(payload))
+        assert len(encoded) == product_bytes["byte_size"]
+        assert sha256_bytes(encoded) == product_bytes["sha256"]
 
 
 def test_normalization_and_table_content_are_processor_independent() -> None:
@@ -433,9 +479,24 @@ def test_normalization_and_table_content_are_processor_independent() -> None:
         row_count=2,
         column_count=2,
         cells=(
-            CanonicalTableCell(text="Group", row_index=0, column_index=0),
-            CanonicalTableCell(text="N", row_index=0, column_index=1),
-            CanonicalTableCell(text="APOE4", row_index=1, column_index=0),
+            CanonicalTableCell(
+                text="Group",
+                row_index=0,
+                column_index=0,
+                column_header=True,
+            ),
+            CanonicalTableCell(
+                text="N",
+                row_index=0,
+                column_index=1,
+                column_header=True,
+            ),
+            CanonicalTableCell(
+                text="APOE4",
+                row_index=1,
+                column_index=0,
+                row_header=True,
+            ),
             CanonicalTableCell(text="12", row_index=1, column_index=1),
         ),
     )
@@ -672,6 +733,393 @@ def test_builder_deduplicates_repeated_spanning_cells_in_grid_fallback() -> None
             ),
         ),
     )
+
+
+def test_builder_rejects_duplicate_authoritative_cells() -> None:
+    document = _document()
+    cell = {
+        "text": "header",
+        "start_row_offset_idx": 0,
+        "start_col_offset_idx": 0,
+    }
+    document["tables"][0]["data"] = {
+        "table_cells": [cell, deepcopy(cell)],
+    }
+
+    with pytest.raises(CanonicalDocumentError, match="conflicting cells"):
+        build_canonical_document_view(**_fixture_inputs("pdf", document))
+
+
+def test_table_overlap_validation_is_span_bounded_and_half_open() -> None:
+    disjoint_huge = CanonicalTable(
+        row_count=MAX_CANONICAL_TABLE_AXIS,
+        column_count=2,
+        cells=(
+            CanonicalTableCell(
+                text="left",
+                row_index=0,
+                column_index=0,
+                row_span=MAX_CANONICAL_TABLE_AXIS,
+            ),
+            CanonicalTableCell(
+                text="right",
+                row_index=0,
+                column_index=1,
+                row_span=MAX_CANONICAL_TABLE_AXIS,
+            ),
+        ),
+    )
+    assert len(disjoint_huge.cells) == 2
+
+    edge_touching = CanonicalTable(
+        row_count=MAX_CANONICAL_TABLE_AXIS,
+        column_count=1,
+        cells=(
+            CanonicalTableCell(
+                text="top",
+                row_index=0,
+                column_index=0,
+                row_span=MAX_CANONICAL_TABLE_AXIS // 2,
+            ),
+            CanonicalTableCell(
+                text="bottom",
+                row_index=MAX_CANONICAL_TABLE_AXIS // 2,
+                column_index=0,
+                row_span=MAX_CANONICAL_TABLE_AXIS // 2,
+            ),
+        ),
+    )
+    assert len(edge_touching.cells) == 2
+
+    with pytest.raises(ValidationError, match="extents must not overlap"):
+        CanonicalTable(
+            row_count=MAX_CANONICAL_TABLE_AXIS,
+            column_count=2,
+            cells=(
+                CanonicalTableCell(
+                    text="wide",
+                    row_index=0,
+                    column_index=0,
+                    row_span=MAX_CANONICAL_TABLE_AXIS,
+                    column_span=2,
+                ),
+                CanonicalTableCell(
+                    text="overlap",
+                    row_index=MAX_CANONICAL_TABLE_AXIS - 1,
+                    column_index=1,
+                ),
+            ),
+        )
+
+
+def test_table_rectangle_sweep_matches_seeded_brute_force() -> None:
+    random_source = random.Random(427)
+
+    def overlaps(left: CanonicalTableCell, right: CanonicalTableCell) -> bool:
+        return (
+            left.row_index < right.row_index + right.row_span
+            and right.row_index < left.row_index + left.row_span
+            and left.column_index < right.column_index + right.column_span
+            and right.column_index < left.column_index + left.column_span
+        )
+
+    for sample_index in range(250):
+        coordinates: set[tuple[int, int]] = set()
+        cells: list[CanonicalTableCell] = []
+        for cell_index in range(random_source.randint(1, 8)):
+            while True:
+                row = random_source.randrange(6)
+                column = random_source.randrange(6)
+                if (row, column) not in coordinates:
+                    coordinates.add((row, column))
+                    break
+            cells.append(
+                CanonicalTableCell(
+                    text=f"{sample_index}-{cell_index}",
+                    row_index=row,
+                    column_index=column,
+                    row_span=random_source.randint(1, 6 - row),
+                    column_span=random_source.randint(1, 6 - column),
+                )
+            )
+        expected_overlap = any(
+            overlaps(left, right)
+            for left_index, left in enumerate(cells)
+            for right in cells[left_index + 1 :]
+        )
+        if expected_overlap:
+            with pytest.raises(ValidationError, match="extents must not overlap"):
+                CanonicalTable(row_count=6, column_count=6, cells=tuple(cells))
+        else:
+            assert CanonicalTable(
+                row_count=6,
+                column_count=6,
+                cells=tuple(cells),
+            ).cells == tuple(cells)
+
+
+def test_canonical_table_contract_enforces_fixed_resource_limits() -> None:
+    with pytest.raises(ValidationError, match="less than or equal to 1000000"):
+        CanonicalTable(row_count=MAX_CANONICAL_TABLE_AXIS + 1)
+    assert any(
+        getattr(constraint, "max_length", None) == MAX_CANONICAL_TABLE_CELLS
+        for constraint in CanonicalTable.model_fields["cells"].metadata
+    )
+
+    document = _document()
+    document["tables"][0]["data"] = {
+        "table_cells": [{}] * (MAX_CANONICAL_TABLE_CELLS + 1)
+    }
+    with pytest.raises(CanonicalDocumentError, match="cell limit"):
+        build_canonical_document_view(**_fixture_inputs("pdf", document))
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [
+        3,
+        {"text": "missing coordinates"},
+        {
+            "text": "bad coordinate",
+            "start_row_offset_idx": "0",
+            "start_col_offset_idx": 0,
+        },
+        {
+            "text": "bad flag",
+            "start_row_offset_idx": 0,
+            "start_col_offset_idx": 0,
+            "column_header": 1,
+        },
+        {
+            "text": "bad span",
+            "start_row_offset_idx": 0,
+            "start_col_offset_idx": 0,
+            "end_col_offset_idx": 2,
+            "column_span": 1,
+        },
+        {
+            "start_row_offset_idx": 0,
+            "start_col_offset_idx": 0,
+        },
+        {
+            "text": "bad ref",
+            "start_row_offset_idx": 0,
+            "start_col_offset_idx": 0,
+            "ref": {"missing": "#/groups/0"},
+        },
+        {
+            "text": "disagreeing aliases",
+            "start_row_offset_idx": 0,
+            "start_col_offset_idx": 0,
+            "column_span": 1,
+            "col_span": 2,
+        },
+        {
+            "text": "zero span",
+            "start_row_offset_idx": 0,
+            "start_col_offset_idx": 0,
+            "row_span": 0,
+        },
+        {
+            "text": "bad end",
+            "start_row_offset_idx": 0,
+            "start_col_offset_idx": 0,
+            "end_row_offset_idx": 0,
+        },
+    ],
+)
+def test_malformed_authoritative_table_cells_are_explicit_errors(cell: Any) -> None:
+    document = _document()
+    document["tables"][0]["data"] = {
+        "table_cells": [cell],
+        "grid": [["must not be used"]],
+    }
+
+    view = build_canonical_document_view(**_fixture_inputs("pdf", document))
+    table = next(
+        block.table for block in view.blocks if block.kind is CanonicalBlockKind.TABLE
+    )
+    assert table == CanonicalTable()
+    diagnostics = [
+        diagnostic
+        for diagnostic in view.diagnostics
+        if diagnostic.code in {"INVALID_TABLE_CELL", "EMPTY_TABLE_DATA"}
+    ]
+    assert {diagnostic.code for diagnostic in diagnostics} == {
+        "INVALID_TABLE_CELL",
+        "EMPTY_TABLE_DATA",
+    }
+    assert all(
+        diagnostic.severity is CanonicalDiagnosticSeverity.ERROR
+        for diagnostic in diagnostics
+    )
+
+
+@pytest.mark.parametrize("cell", [True, float("inf")])
+def test_invalid_grid_scalars_are_not_stringified(cell: Any) -> None:
+    document = _document()
+    document["tables"][0]["data"] = {"grid": [[cell]]}
+
+    view = build_canonical_document_view(**_fixture_inputs("pdf", document))
+
+    assert {diagnostic.code for diagnostic in view.diagnostics} >= {
+        "INVALID_TABLE_CELL",
+        "EMPTY_TABLE_DATA",
+    }
+
+
+def test_malformed_authoritative_cell_collection_never_falls_back_to_grid() -> None:
+    document = _document()
+    document["tables"][0]["data"] = {
+        "table_cells": "not-a-list",
+        "grid": [["must not be used"]],
+    }
+
+    view = build_canonical_document_view(**_fixture_inputs("pdf", document))
+    table = next(
+        block.table for block in view.blocks if block.kind is CanonicalBlockKind.TABLE
+    )
+    assert table == CanonicalTable()
+    assert "INVALID_TABLE_CELLS" in {diagnostic.code for diagnostic in view.diagnostics}
+
+
+def test_valid_grid_fallback_has_explicit_scalar_and_reference_semantics() -> None:
+    document = _document()
+    document["tables"][0]["data"] = {
+        "grid": [
+            [
+                None,
+                1.5,
+                {"text": "linked", "ref": "#/groups/0"},
+            ]
+        ]
+    }
+
+    view = build_canonical_document_view(**_fixture_inputs("pdf", document))
+    table = next(
+        block.table for block in view.blocks if block.kind is CanonicalBlockKind.TABLE
+    )
+    assert table is not None
+    assert [cell.text for cell in table.cells] == ["", "1.5", "linked"]
+    assert table.cells[-1].native_ref == "#/groups/0"
+
+
+def test_table_parser_hard_limits_have_stable_failure_codes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    too_many_rows = _document()
+    too_many_rows["tables"][0]["data"] = {"grid": [[], []]}
+    row_inputs = _fixture_inputs("pdf", too_many_rows)
+    too_many_columns = _document()
+    too_many_columns["tables"][0]["data"] = {"grid": [["a", "b"]]}
+    column_inputs = _fixture_inputs("pdf", too_many_columns)
+    invalid_dimension = _document()
+    invalid_dimension["tables"][0]["data"] = {
+        "num_rows": "1",
+        "grid": [["a"]],
+    }
+    dimension_inputs = _fixture_inputs("pdf", invalid_dimension)
+
+    monkeypatch.setattr(canonical_module, "MAX_CANONICAL_TABLE_AXIS", 1)
+    with pytest.raises(CanonicalDocumentError, match="TABLE_LIMIT_EXCEEDED"):
+        build_canonical_document_view(**row_inputs)
+
+    with pytest.raises(CanonicalDocumentError, match="TABLE_LIMIT_EXCEEDED"):
+        build_canonical_document_view(**column_inputs)
+
+    with pytest.raises(CanonicalDocumentError, match="INVALID_TABLE_DIMENSIONS"):
+        build_canonical_document_view(**dimension_inputs)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {
+            "num_rows": MAX_CANONICAL_TABLE_AXIS + 1,
+            "grid": [["value"]],
+        },
+        {
+            "table_cells": [
+                {
+                    "text": "coordinate over limit",
+                    "start_row_offset_idx": MAX_CANONICAL_TABLE_AXIS,
+                    "start_col_offset_idx": 0,
+                }
+            ],
+        },
+        {
+            "table_cells": [
+                {
+                    "text": "span over limit",
+                    "start_row_offset_idx": 0,
+                    "start_col_offset_idx": 0,
+                    "row_span": MAX_CANONICAL_TABLE_AXIS + 1,
+                }
+            ],
+        },
+        {
+            "table_cells": [
+                {
+                    "text": "extent over limit",
+                    "start_row_offset_idx": MAX_CANONICAL_TABLE_AXIS - 1,
+                    "start_col_offset_idx": 0,
+                    "row_span": 2,
+                }
+            ],
+        },
+        {
+            "table_cells": [
+                {
+                    "text": "end over limit",
+                    "start_row_offset_idx": 0,
+                    "start_col_offset_idx": 0,
+                    "end_row_offset_idx": MAX_CANONICAL_TABLE_AXIS + 1,
+                }
+            ],
+        },
+    ],
+)
+def test_all_table_resource_bound_overages_are_hard_failures(
+    data: dict[str, Any],
+) -> None:
+    document = _document()
+    document["tables"][0]["data"] = data
+
+    with pytest.raises(CanonicalDocumentError, match="TABLE_LIMIT_EXCEEDED"):
+        build_canonical_document_view(**_fixture_inputs("pdf", document))
+
+
+def test_builder_does_not_infer_over_invalid_declared_table_dimensions() -> None:
+    document = _document()
+    document["tables"][0]["data"] = {
+        "num_rows": 1,
+        "num_cols": 1,
+        "table_cells": [
+            {
+                "text": "wide",
+                "start_row_offset_idx": 0,
+                "start_col_offset_idx": 0,
+                "column_span": 2,
+            }
+        ],
+    }
+    with pytest.raises(CanonicalDocumentError, match="declared column dimension"):
+        build_canonical_document_view(**_fixture_inputs("pdf", document))
+
+    document["tables"][0]["data"] = {
+        "num_rows": 1,
+        "num_cols": 1,
+        "table_cells": [
+            {
+                "text": "tall",
+                "start_row_offset_idx": 0,
+                "start_col_offset_idx": 0,
+                "row_span": 2,
+            }
+        ],
+    }
+    with pytest.raises(CanonicalDocumentError, match="declared row dimension"):
+        build_canonical_document_view(**_fixture_inputs("pdf", document))
 
 
 def test_canonical_schema_dispatch_rejects_unknown_and_invalid_payloads() -> None:
@@ -932,7 +1380,7 @@ def test_canonical_configuration_is_closed_and_typed() -> None:
 
 def test_store_round_trip_dispatches_canonical_product_schema(tmp_path: Path) -> None:
     store = ContentAddressedStore(tmp_path / "store")
-    source = store.put_blob(b"canonical-source")
+    source = store.put_blob(b"%PDF-1.7\ncanonical-source")
     artifact = DocumentArtifact(
         artifact_id="canonical-persisted",
         source_sha256=source.sha256,
@@ -959,29 +1407,15 @@ def test_store_round_trip_dispatches_canonical_product_schema(tmp_path: Path) ->
         producer_run_id=native_run_id,
         source_artifact_ids=(artifact.artifact_id,),
     )
-    native_text = [
-        (f"#/texts/{index}", item["text"])
-        for index, item in enumerate(document["texts"])
-    ] + [("#/formulas/0", document["formulas"][0]["text"])]
     span_set = ContentSpanSet(
         artifact_id=artifact.artifact_id,
         processing_run_id=native_run_id,
         representation_product_id=docling_product.product_id,
-        spans=tuple(
-            ContentSpan(
-                span_id=f"persisted-span-{index}",
-                artifact_id=artifact.artifact_id,
-                processing_run_id=native_run_id,
-                representation_anchor=RepresentationAnchor(
-                    product_id=docling_product.product_id,
-                    node_id=node_id,
-                    char_start=0,
-                    char_end=len(text),
-                ),
-                content_sha256=sha256_bytes(text.encode("utf-8")),
-                source_locator=_locator("pdf", index, len(text)),
-            )
-            for index, (node_id, text) in enumerate(native_text)
+        spans=build_pdf_content_spans(
+            document,
+            artifact_id=artifact.artifact_id,
+            processing_run_id=native_run_id,
+            representation_product_id=docling_product.product_id,
         ),
     )
     spans_blob = store.put_blob(
@@ -998,7 +1432,26 @@ def test_store_round_trip_dispatches_canonical_product_schema(tmp_path: Path) ->
         producer_run_id=native_run_id,
         source_artifact_ids=(artifact.artifact_id,),
     )
-    configuration: dict[str, Any] = {}
+    configuration: dict[str, Any] = {
+        "serve_version": "1.21.0",
+        "expected_docling_version": "2.113.0",
+        "container_image": "quay.io/docling-project/docling-serve-cpu:v1.21.0",
+        "container_digest": None,
+        "model_versions": {},
+        "model_hashes": {},
+        "input_sha256": artifact.source_sha256,
+        "input_format": "pdf",
+        "options": {
+            "to_formats": ["json"],
+            "image_export_mode": "embedded",
+            "do_ocr": True,
+            "table_mode": "accurate",
+        },
+        "minimum_pdf_locator_coverage": 0.95,
+        "quality_validator_version": "docling-quality-v2",
+        "content_span_schema_version": "1",
+        "pdf_span_algorithm": "provenance-charspan-v2",
+    }
     started_at = datetime(2026, 8, 10, 12, tzinfo=UTC)
     store.save_processing_run(
         ProcessingRun(
@@ -1007,14 +1460,14 @@ def test_store_round_trip_dispatches_canonical_product_schema(tmp_path: Path) ->
             stage_id="docling",
             component=ComponentDescriptor(
                 component_id="docling",
-                component_version="1",
-                capability="document-conversion",
+                component_version="2.113.0",
+                capability="document.parse",
             ),
             configuration=configuration,
             configuration_sha256=configuration_sha256(configuration),
             started_at=started_at,
             finished_at=started_at + timedelta(seconds=1),
-            status=ProcessingRunStatus.COMPLETE,
+            status=ProcessingRunStatus.PARTIAL,
             outputs=(docling_product, spans_product),
         )
     )
@@ -1035,18 +1488,22 @@ def test_store_round_trip_dispatches_canonical_product_schema(tmp_path: Path) ->
         producer_run_id="canonical-run",
         source_artifact_ids=(artifact.artifact_id,),
     )
+    canonical_configuration = canonical_invocation_configuration(
+        CanonicalizationConfig(),
+        persisted_view.source_products,
+    )
     store.save_processing_run(
         ProcessingRun(
             run_id="canonical-run",
             artifact_id=artifact.artifact_id,
             stage_id="canonical-document-view",
             component=ComponentDescriptor(
-                component_id="canonical-document-view",
-                component_version=CANONICAL_DOCUMENT_SCHEMA_VERSION,
-                capability="canonical-document-normalization",
+                component_id=CANONICAL_COMPONENT_ID,
+                component_version=CANONICAL_COMPONENT_VERSION,
+                capability=CANONICAL_COMPONENT_CAPABILITY,
             ),
-            configuration=configuration,
-            configuration_sha256=configuration_sha256(configuration),
+            configuration=canonical_configuration,
+            configuration_sha256=configuration_sha256(canonical_configuration),
             started_at=started_at,
             finished_at=started_at + timedelta(seconds=1),
             status=ProcessingRunStatus.COMPLETE,
@@ -1094,7 +1551,9 @@ def test_explicit_diagnostics_preserve_unresolved_native_mapping() -> None:
         integrity_report=broken_integrity,
     )
 
-    assert view.diagnostics == ()
+    assert {diagnostic.code for diagnostic in view.diagnostics} == {
+        "MISSING_SOURCE_SPAN"
+    }
     assert {diagnostic.code for diagnostic in broken.diagnostics} == {
         "UNRESOLVED_NATIVE_REFERENCE",
         "UNRESOLVED_CANONICAL_RELATIONSHIP",
@@ -1156,6 +1615,68 @@ def test_explicit_diagnostics_preserve_unresolved_native_mapping() -> None:
     assert citation.status is CanonicalRelationshipStatus.RESOLVED
     assert citation.declared_target_refs == ("#b1",)
     assert citation.target_block_ids
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "non_object_record",
+        "unknown_kind",
+        "malformed_targets",
+        "wrong_record_id",
+        "wrong_status",
+        "wrong_count",
+        "extra_field",
+    ],
+)
+def test_builder_rejects_non_replayable_integrity_reports(damage: str) -> None:
+    document = _document()
+    report = validate_content_integrity(document).to_dict()
+    if damage == "non_object_record":
+        report["records"][0] = 42
+    elif damage == "unknown_kind":
+        report["records"][0]["kind"] = "unknown"
+    elif damage == "malformed_targets":
+        report["records"][0]["resolved_docling_item_refs"] = "not-a-list"
+    elif damage == "wrong_record_id":
+        report["records"][0]["record_id"] = "0" * 64
+    elif damage == "wrong_status":
+        report["records"][0]["status"] = "unaligned"
+    elif damage == "wrong_count":
+        report["resolved_count"] += 1
+    else:
+        report["unexpected"] = True
+    inputs = _fixture_inputs("pdf", document)
+    _add_integrity_product(inputs)
+
+    with pytest.raises(CanonicalDocumentError, match="contract is invalid"):
+        build_canonical_document_view(**inputs, integrity_report=report)
+
+
+def test_valid_integrity_error_is_preserved_as_canonical_error() -> None:
+    document = _document()
+    report = validate_content_integrity(document).to_dict()
+    report["issues"].append(
+        {
+            "code": "UPSTREAM_INTEGRITY_ERROR",
+            "message": "A verified source relationship is structurally damaged",
+            "severity": "error",
+            "item_ref": "#/tables/0",
+            "page_number": None,
+        }
+    )
+    inputs = _fixture_inputs("pdf", document)
+    _add_integrity_product(inputs)
+    integrity_product = inputs["source_products"][-1]
+
+    view = build_canonical_document_view(**inputs, integrity_report=report)
+
+    diagnostic = next(
+        item for item in view.diagnostics if item.code == "UPSTREAM_INTEGRITY_ERROR"
+    )
+    assert diagnostic.severity is CanonicalDiagnosticSeverity.ERROR
+    assert diagnostic.product_id == integrity_product.product_id
+    assert diagnostic.native_node_ids == ("#/tables/0",)
 
 
 def test_hierarchy_reconciliation_preserves_all_children_and_diagnoses_damage() -> None:
@@ -1524,11 +2045,73 @@ def _integrity_payload(
     records: Any,
     *,
     scholarly_overlay_present: bool = False,
+    issues: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    normalized_records: Any = records
+    if isinstance(records, list):
+        normalized_records = []
+        for raw_record in records:
+            if not isinstance(raw_record, dict):
+                normalized_records.append(raw_record)
+                continue
+            record = {
+                "kind": raw_record.get("kind"),
+                "status": raw_record.get(
+                    "status",
+                    "unaligned" if raw_record.get("reason_codes") else "resolved",
+                ),
+                "source_ref": raw_record.get("source_ref"),
+                "source_docling_item_ref": raw_record.get("source_docling_item_ref"),
+                "declared_target_refs": raw_record.get("declared_target_refs", []),
+                "resolved_docling_item_refs": raw_record.get(
+                    "resolved_docling_item_refs", []
+                ),
+                "unresolved_target_refs": raw_record.get("unresolved_target_refs", []),
+                "reason_codes": raw_record.get("reason_codes", []),
+            }
+            identity = {
+                key: record[key]
+                for key in (
+                    "kind",
+                    "status",
+                    "source_ref",
+                    "source_docling_item_ref",
+                    "declared_target_refs",
+                    "resolved_docling_item_refs",
+                    "unresolved_target_refs",
+                    "reason_codes",
+                )
+            }
+            record["record_id"] = raw_record.get(
+                "record_id",
+                sha256_bytes(
+                    json.dumps(
+                        identity,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ),
+            )
+            normalized_records.append(record)
+    resolved_count = (
+        sum(record.get("status") == "resolved" for record in normalized_records)
+        if isinstance(normalized_records, list)
+        and all(isinstance(record, dict) for record in normalized_records)
+        else 0
+    )
     return {
         "document_sha256": docling_document_sha256(document),
         "scholarly_overlay_present": scholarly_overlay_present,
-        "records": records,
+        "resolved_count": resolved_count,
+        "unaligned_count": (
+            len(normalized_records) - resolved_count
+            if isinstance(normalized_records, list)
+            else 0
+        ),
+        "records": normalized_records,
+        "issues": issues or [],
     }
 
 
@@ -2285,38 +2868,40 @@ def test_builder_reports_malformed_native_structures_and_missing_anchors() -> No
     _add_integrity_product(inputs)
     view = build_canonical_document_view(
         **inputs,
-        integrity_report=_integrity_payload(malformed, "not-a-list"),
+        integrity_report=_integrity_payload(malformed, []),
     )
 
     assert view.metadata.title == "Fallback Title"
     assert {diagnostic.code for diagnostic in view.diagnostics} == {
-        "INVALID_INTEGRITY_RELATIONSHIPS",
         "INVALID_DOCUMENT_FURNITURE",
         "INVALID_NATIVE_COLLECTION",
         "INVALID_NATIVE_NODE",
+        "INVALID_TABLE_CELL",
+        "INVALID_TABLE_DATA",
+        "INVALID_TABLE_GRID",
+        "INVALID_TABLE_GRID_ROW",
+        "EMPTY_TABLE_DATA",
         "MISSING_DOCUMENT_BODY",
         "MISSING_SOURCE_SPAN",
     }
     tables = [block for block in view.blocks if block.kind is CanonicalBlockKind.TABLE]
-    assert tables[0].table == CanonicalTable()
-    assert tables[1].table == CanonicalTable()
-    assert tables[2].table == CanonicalTable(
-        row_count=1,
-        column_count=1,
-        cells=(
-            CanonicalTableCell(
-                text="Cell value",
-                row_index=0,
-                column_index=0,
-            ),
-        ),
-    )
-    assert tables[3].table == CanonicalTable()
-    assert tables[4].table == CanonicalTable()
+    assert all(table.table == CanonicalTable() for table in tables)
     assert any(block.kind is CanonicalBlockKind.OTHER for block in view.blocks)
+
+    absent_furniture = _document()
+    absent_furniture["furniture"] = None
+    absent_furniture_view = build_canonical_document_view(
+        **_fixture_inputs("pdf", absent_furniture)
+    )
+    assert "INVALID_DOCUMENT_FURNITURE" not in {
+        diagnostic.code for diagnostic in absent_furniture_view.diagnostics
+    }
 
     invalid_children = _document()
     invalid_children["groups"][0]["children"] = "not-a-list"
+    for text_item in invalid_children["texts"]:
+        if text_item.get("parent") == {"$ref": "#/groups/0"}:
+            text_item.pop("parent")
     child_inputs = _fixture_inputs("pdf", _document())
     child_inputs["docling_document"] = invalid_children
     child_view = build_canonical_document_view(**child_inputs)
@@ -2363,8 +2948,6 @@ def test_builder_preserves_ambiguous_partial_and_scholarly_diagnostics() -> None
     inputs["integrity_report"] = _integrity_payload(
         document,
         [
-            42,
-            {"kind": "other"},
             {
                 "kind": "figure",
                 "source_ref": "#/pictures/0",
@@ -2373,11 +2956,6 @@ def test_builder_preserves_ambiguous_partial_and_scholarly_diagnostics() -> None
                 "resolved_docling_item_refs": ["#/texts/4"],
                 "unresolved_target_refs": ["#/texts/404"],
                 "reason_codes": ["one-target-missing"],
-            },
-            {
-                "kind": "citation",
-                "source_ref": "#/texts/5",
-                "resolved_docling_item_refs": "not-a-list",
             },
         ],
     )

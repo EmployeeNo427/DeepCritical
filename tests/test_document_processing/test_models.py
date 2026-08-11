@@ -119,6 +119,7 @@ def processing_run(**overrides: object) -> ProcessingRun:
     values: dict[str, object] = {
         "run_id": "run-docling-1",
         "artifact_id": "pmc-123-pdf",
+        "stage_invocation_id": "stage-invocation-1",
         "stage_id": "docling",
         "component": ComponentDescriptor(
             component_id="docling",
@@ -289,6 +290,19 @@ def test_processing_run_rejects_mismatched_config_hash_and_bad_times() -> None:
 
     with pytest.raises(ValidationError, match="requires pipeline_run_id"):
         processing_run(repetition_group_id="benchmark-v1")
+    with pytest.raises(
+        ValidationError, match="processing run values must not be empty"
+    ):
+        processing_run(stage_invocation_id=" ")
+
+
+def test_processing_run_accepts_legacy_record_without_stage_invocation_id() -> None:
+    payload = processing_run().model_dump(mode="json")
+    del payload["stage_invocation_id"]
+
+    restored = ProcessingRun.model_validate(payload)
+
+    assert restored.stage_invocation_id is None
 
 
 def test_processing_run_validates_the_full_output_policy_snapshot_hash() -> None:

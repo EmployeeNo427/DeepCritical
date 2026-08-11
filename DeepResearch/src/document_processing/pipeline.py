@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import unquote, urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -23,10 +22,14 @@ from .adapters import (
 )
 from .alignment import DoclingGrobidAligner, ScholarlyAlignmentOverlay
 from .canonical import (
+    CANONICAL_COMPONENT_CAPABILITY,
+    CANONICAL_COMPONENT_ID,
+    CANONICAL_COMPONENT_VERSION,
     CanonicalDiagnosticSeverity,
     CanonicalDocumentView,
     CanonicalizationConfig,
     build_canonical_document_view,
+    canonical_invocation_configuration,
 )
 from .clients import (
     DEFAULT_DOCLING_MAX_RESPONSE_BYTES,
@@ -93,6 +96,7 @@ from .validation import (
     align_jats_content_spans,
     build_docling_content_spans,
     build_pdf_content_spans,
+    parse_content_integrity_report,
     probably_image_only,
     validate_content_integrity,
 )
@@ -126,7 +130,7 @@ _COMPONENT_CAPABILITIES = {
     "ocrmypdf": "document.ocr",
     "docling-grobid-aligner": "document.align",
     "docling-content-integrity": "document.validate",
-    "canonical-document-view": "document.canonicalize",
+    CANONICAL_COMPONENT_ID: CANONICAL_COMPONENT_CAPABILITY,
 }
 
 
@@ -1349,7 +1353,8 @@ class DocumentProcessor:
         }
         native_locator_bytes = (
             _canonical_json_bytes(_native_locator_payload(native_locators))
-            if native_locators
+            if input_format
+            in {InputFormat.JATS, InputFormat.BIOC_JSON, InputFormat.BIOC_XML}
             else None
         )
         if input_format is InputFormat.JATS:
@@ -2418,11 +2423,10 @@ class DocumentProcessor:
     ) -> tuple[ProcessingRun, CanonicalDocumentView] | None:
         """Build a project-owned view exclusively from verified durable products."""
 
-        invocation_configuration: dict[str, Any] = {
-            "adapter_version": "1",
-            "policy": configuration.model_dump(mode="json"),
-            "input_products": [],
-        }
+        invocation_configuration = canonical_invocation_configuration(
+            configuration,
+            (),
+        )
         started = utc_now()
         started_clock = time.perf_counter()
         verified_inputs: list[DataProductRef] = []
@@ -2455,15 +2459,10 @@ class DocumentProcessor:
             unique_inputs = tuple(
                 {product.product_id: product for product in inputs}.values()
             )
-            invocation_configuration["input_products"] = [
-                {
-                    "name": product.name,
-                    "product_id": product.product_id,
-                    "blob_sha256": product.blob_sha256,
-                    "payload_schema_version": product.payload_schema_version,
-                }
-                for product in unique_inputs
-            ]
+            invocation_configuration = canonical_invocation_configuration(
+                configuration,
+                unique_inputs,
+            )
 
             persisted_inputs: dict[str, bytes] = {}
             for product in unique_inputs:
@@ -2508,17 +2507,18 @@ class DocumentProcessor:
             )
             if not isinstance(integrity_payload, dict):
                 raise ValueError("content-integrity product must contain an object")
+            parsed_integrity = parse_content_integrity_report(integrity_payload)
             durable_docling_sha256 = sha256_bytes(
                 persisted_inputs[docling_product.product_id]
             )
-            if integrity_payload.get("document_sha256") != durable_docling_sha256:
+            if parsed_integrity.document_sha256 != durable_docling_sha256:
                 raise ValueError(
                     "content-integrity document hash must match the durable "
                     "Docling product"
                 )
             expected_scholarly_overlay = scholarly_alignment_product is not None
             if (
-                integrity_payload.get("scholarly_overlay_present")
+                parsed_integrity.scholarly_overlay_present
                 is not expected_scholarly_overlay
             ):
                 raise ValueError(
@@ -2540,7 +2540,7 @@ class DocumentProcessor:
 
             reusable = self._reusable_run(
                 artifact,
-                "canonical-document-view",
+                CANONICAL_COMPONENT_ID,
                 invocation_configuration,
             )
             if (
@@ -2584,7 +2584,10 @@ class DocumentProcessor:
                 run_id=run_id,
                 artifact_id=artifact.artifact_id,
                 stage_id="canonical-document-view",
-                component=_component_descriptor("canonical-document-view", "1"),
+                component=_component_descriptor(
+                    CANONICAL_COMPONENT_ID,
+                    CANONICAL_COMPONENT_VERSION,
+                ),
                 configuration=invocation_configuration,
                 configuration_sha256=configuration_sha256(invocation_configuration),
                 started_at=started,
@@ -2623,8 +2626,8 @@ class DocumentProcessor:
         except Exception as exc:
             self._save_failed_run(
                 artifact,
-                component_id="canonical-document-view",
-                component_version="1",
+                component_id=CANONICAL_COMPONENT_ID,
+                component_version=CANONICAL_COMPONENT_VERSION,
                 configuration=invocation_configuration,
                 started_at=started,
                 started_clock=started_clock,
@@ -2751,17 +2754,28 @@ class DocumentProcessor:
         from .orchestration import _active_stage_context
 
         stage_context = _active_stage_context()
-        active_stage_id = (
-            stage_context.stage_id
+        active_stage_context = (
+            stage_context
             if stage_context is not None
             and pipeline_context is not None
             and stage_context.pipeline_run_id == pipeline_context.pipeline_run_id
+            else None
+        )
+        active_stage_id = (
+            active_stage_context.stage_id
+            if active_stage_context is not None
             else run.stage_id
+        )
+        active_stage_invocation_id = (
+            active_stage_context.stage_invocation_id
+            if active_stage_context is not None
+            else run.stage_invocation_id
         )
         run_payload.update(
             {
                 "status": committed_status,
                 "stage_id": active_stage_id,
+                "stage_invocation_id": active_stage_invocation_id,
                 "pipeline_run_id": (
                     pipeline_context.pipeline_run_id
                     if pipeline_context is not None
@@ -2975,6 +2989,7 @@ class DocumentProcessor:
         error: Exception,
         component_descriptor: ComponentDescriptor | None = None,
         stage_id: str | None = None,
+        stage_invocation_id: str | None = None,
         container_image: str | None = None,
         container_digest: OciDigest | None = None,
         component_versions: dict[str, str] | None = None,
@@ -2992,12 +3007,18 @@ class DocumentProcessor:
             or stage_id
             or component_id
         )
+        resolved_stage_invocation_id = (
+            active_stage.stage_invocation_id
+            if active_stage is not None
+            else stage_invocation_id
+        )
         memory_measurement = getattr(error, "memory_measurement", None)
         resolved_run_id = run_id or _run_id()
         run = ProcessingRun(
             run_id=resolved_run_id,
             artifact_id=artifact.artifact_id,
             stage_id=resolved_stage_id,
+            stage_invocation_id=resolved_stage_invocation_id,
             component=component_descriptor
             or _component_descriptor(component_id, component_version),
             runtime_identity_required=runtime_identity_required,
@@ -3337,6 +3358,7 @@ def _native_locator_payload(
             "document_index": item.document_index,
             "document_id": item.document_id,
             "passage_index": item.passage_index,
+            "sentence_index": item.sentence_index,
             "offset": item.offset,
             "length": item.length,
             "xml_id": item.xml_id,
@@ -3496,12 +3518,6 @@ def _tei_text_length(tei_xml: bytes) -> int:
     except ElementTree.ParseError:
         return 0
     return len(" ".join("".join(root.itertext()).split()))
-
-
-def _filename_from_uri(uri: str) -> str:
-    parsed = urlparse(uri)
-    name = Path(unquote(parsed.path)).name
-    return name or "document"
 
 
 __all__ = [

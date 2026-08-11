@@ -8,8 +8,15 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel
 
 from .alignment import ScholarlyAlignmentOverlay
-from .canonical import CanonicalDocumentView, CanonicalizationConfig
+from .canonical import (
+    CANONICAL_COMPONENT_CAPABILITY,
+    CANONICAL_COMPONENT_ID,
+    CANONICAL_COMPONENT_VERSION,
+    CanonicalDocumentView,
+    CanonicalizationConfig,
+)
 from .models import (
+    ArtifactRelationship,
     ComponentDescriptor,
     DataProductRef,
     DocumentArtifact,
@@ -43,7 +50,7 @@ from .orchestration import (
     StageSpec,
 )
 from .preflight import PreflightDecision
-from .routing import InputFormat, ProcessingStage, RouteDecision
+from .routing import InputFormat, ProcessingStage, RouteDecision, filename_from_uri
 from .validation import probably_image_only
 
 if TYPE_CHECKING:
@@ -231,14 +238,20 @@ class DocumentProcessingFailureRecorder:
             raise ValueError(
                 "document-processing failure identity requires artifact_id"
             )
-        artifact = self.processor.store.get_artifact(artifact_id)
+        input_artifact = self.processor.store.get_artifact(artifact_id)
+        artifact, derivative_input = self._current_artifact(
+            failure,
+            input_artifact=input_artifact,
+        )
         terminal_during_stage = tuple(
             run
             for run in self.processor.store.list_processing_runs()
-            if run.pipeline_run_id == failure.pipeline_run_id
-            and run.started_at >= failure.started_at
+            if run.stage_invocation_id == failure.stage_invocation_id
+            and run.artifact_id == artifact.artifact_id
+            and run.pipeline_run_id == failure.pipeline_run_id
             and run.stage_id == failure.stage_id
             and run.component.capability == failure.component.capability
+            and (derivative_input is None or derivative_input in run.inputs)
         )
         if terminal_during_stage:
             return
@@ -253,11 +266,65 @@ class DocumentProcessingFailureRecorder:
             component_version=failure.component.component_version,
             component_descriptor=failure.component,
             stage_id=failure.stage_id,
+            stage_invocation_id=failure.stage_invocation_id,
             configuration=configuration,
             started_at=failure.started_at,
             started_clock=failure.started_clock,
             error=failure.exception,
+            inputs=(() if derivative_input is None else (derivative_input,)),
         )
+
+    def _current_artifact(
+        self,
+        failure: StageFailure,
+        *,
+        input_artifact: DocumentArtifact,
+    ) -> tuple[DocumentArtifact, DataProductRef | None]:
+        """Resolve the artifact actually consumed by this graph invocation.
+
+        ``StageFailure.input_identity`` deliberately carries the stable pipeline
+        input identity.  The fallback GROBID stage, however, invokes its parser
+        on the OCR-created searchable-PDF derivative present in its typed stage
+        input.  Select that different artifact only when its immutable store
+        record and exact creator product both prove the claimed lineage.
+        """
+
+        if failure.component.component_id != "grobid-fallback":
+            return input_artifact, None
+        ocr = failure.stage_inputs.get("ocr")
+        if not isinstance(ocr, _OCROutcome):
+            raise ValueError("fallback GROBID failure has no typed OCR stage input")
+        if ocr.stage is None or ocr.stage.derivative is None:
+            return input_artifact, None
+        claimed_artifact = ocr.stage.derivative
+        current_artifact = self.processor.store.get_artifact(
+            claimed_artifact.artifact_id
+        )
+        if current_artifact != claimed_artifact:
+            raise ValueError("fallback GROBID derivative differs from durable metadata")
+        if (
+            current_artifact.relationship is not ArtifactRelationship.DERIVATIVE
+            or current_artifact.parent_artifact_id != input_artifact.artifact_id
+        ):
+            raise ValueError("fallback GROBID derivative has invalid source lineage")
+        creator_run_id = current_artifact.raw_location.created_by_run_id
+        if creator_run_id is None:
+            raise ValueError("fallback GROBID derivative has no creator run")
+        creator = self.processor.store.get_processing_run(creator_run_id)
+        if creator.artifact_id != input_artifact.artifact_id:
+            raise ValueError(
+                "fallback GROBID derivative creator belongs to another artifact"
+            )
+        creator_products = tuple(
+            product
+            for product in creator.outputs
+            if product.blob_sha256 == current_artifact.source_sha256
+        )
+        if len(creator_products) != 1:
+            raise ValueError(
+                "fallback GROBID derivative must resolve to one creator product"
+            )
+        return current_artifact, creator_products[0]
 
 
 def _port(
@@ -349,12 +416,12 @@ class _DocumentStagePlugins:
         context: StageContext,
         _: BaseModel,
     ) -> StageResult:
-        from .pipeline import DocumentProcessingResult, _filename_from_uri
+        from .pipeline import DocumentProcessingResult
 
         flow = context.require_input("ready", _ArtifactFlow)
         artifact = flow.artifact
         content = self.processor.store.read_blob(artifact.source_sha256)
-        filename = artifact.identifiers.get("filename") or _filename_from_uri(
+        filename = artifact.identifiers.get("filename") or filename_from_uri(
             artifact.acquisition_uri
         )
         route = self.processor.router.route(
@@ -1169,9 +1236,9 @@ def build_document_component_registry(
         ),
         _registration(
             descriptor=_descriptor(
-                "canonical-document-view",
-                "1",
-                "document.canonicalize",
+                CANONICAL_COMPONENT_ID,
+                CANONICAL_COMPONENT_VERSION,
+                CANONICAL_COMPONENT_CAPABILITY,
             ),
             inputs={
                 "integrity": _port(
@@ -1233,7 +1300,7 @@ def default_document_pipeline_spec() -> PipelineSpec:
         "scholarly-output-selector",
         "docling-grobid-aligner",
         "docling-content-integrity",
-        "canonical-document-view",
+        CANONICAL_COMPONENT_ID,
         "document-fallback-policy",
         "document-result",
     )
@@ -1247,7 +1314,7 @@ def default_document_pipeline_spec() -> PipelineSpec:
                 component_id=component_id,
                 configuration=(
                     CanonicalizationConfig().model_dump(mode="json")
-                    if component_id == "canonical-document-view"
+                    if component_id == CANONICAL_COMPONENT_ID
                     else {}
                 ),
             )
@@ -1436,7 +1503,7 @@ def default_document_pipeline_spec() -> PipelineSpec:
             ),
             StageSpec(
                 stage_id="canonicalize",
-                component="canonical-document-view",
+                component=CANONICAL_COMPONENT_ID,
                 depends_on=("integrity",),
                 inputs={
                     "integrity": StageOutputRef(
