@@ -5,6 +5,8 @@ from pathlib import Path
 
 import yaml
 
+from DeepResearch.src.document_processing.pipeline import DocumentProcessingConfig
+
 
 def _repository_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -104,18 +106,26 @@ def test_live_policy_versions_match_the_pinned_stack() -> None:
         ).read_text(encoding="utf-8")
     )
     services = config["services"]
+    defaults = DocumentProcessingConfig()
 
     assert services["docling"]["container_image"] == (
         "quay.io/docling-project/docling-serve-cpu:v1.21.0"
     )
     assert services["docling"]["component_version"] == "2.96.1"
     assert services["docling"]["serve_version"] == "1.21.0"
+    assert services["docling"]["component_version"] == defaults.docling_version
+    assert services["docling"]["serve_version"] == defaults.docling_serve_version
+    assert services["docling"]["container_image"] == defaults.docling_container_image
     assert services["grobid"]["container_image"] == (
         "deepcritical/grobid:0.9.0-full-p0-c2"
     )
     assert services["grobid"]["component_version"] == "0.9.0"
+    assert services["grobid"]["component_version"] == defaults.grobid_version
+    assert services["grobid"]["container_image"] == defaults.grobid_container_image
     assert services["ocr"]["container_image"] == "jbarlow83/ocrmypdf:v17.4.1"
     assert services["ocr"]["component_version"] == "17.4.1"
+    assert services["ocr"]["component_version"] == defaults.ocrmypdf_version
+    assert services["ocr"]["container_image"] == defaults.ocr_container_image
 
 
 def test_live_workflow_runs_direct_and_compiled_contracts_in_isolated_jobs() -> None:

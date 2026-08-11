@@ -354,7 +354,7 @@ def _structured_docling_case(
         run_id,
         component=ComponentDescriptor(
             component_id="docling",
-            component_version="2.113.0",
+            component_version="2.96.1",
             capability="document.parse",
         ),
         configuration=configuration,

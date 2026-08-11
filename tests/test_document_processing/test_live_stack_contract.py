@@ -662,12 +662,16 @@ async def test_live_compiled_docling_pipeline(
         use_async_api=True,
     )
     versions = await base_client.version()
+    attested_versions = {
+        "docling": versions["docling"],
+        "docling_serve": versions["docling-serve"],
+    }
     image_reference = _required_environment("DEEPCRITICAL_LIVE_DOCLING_IMAGE_REF")
     reporter = _DockerRuntimeReporter(
         expected_reporter_id="github-actions-docker-inspector",
         component_id="docling",
         component_version=versions["docling"],
-        component_versions=versions,
+        component_versions=attested_versions,
         container_reference=image_reference,
         container_id=_required_environment("DEEPCRITICAL_LIVE_DOCLING_CONTAINER_ID"),
         expected_image_id=_required_environment("DEEPCRITICAL_LIVE_DOCLING_IMAGE_ID"),
@@ -727,7 +731,7 @@ async def test_live_compiled_docling_pipeline(
     assert run.runtime_attestation is not None
     assert run.runtime_attestation.container_reference == image_reference
     assert run.runtime_attestation.container_image_id == reporter.expected_image_id
-    assert run.component_versions == versions
+    assert run.component_versions == attested_versions
 
 
 @pytest.mark.asyncio
@@ -767,8 +771,9 @@ async def test_live_compiled_grobid_pipeline(
         docling=_FixtureDocling(),
         grobid=client,
         ocrmypdf=_NeverOCR(),
+        # Only GROBID is live in this isolated lane. The deterministic Docling
+        # fixture still records the exact native contract required for replay.
         config=DocumentProcessingConfig(
-            docling_version="fixture-docling-v1",
             grobid_version=version,
             grobid_container_image=image_reference.split("@", maxsplit=1)[0],
             grobid_container_digest=image_reference.rsplit("@", maxsplit=1)[1],
@@ -841,9 +846,9 @@ async def test_live_compiled_ocr_pipeline(
         docling=_FixtureDocling(image_only=True),
         grobid=grobid,
         ocrmypdf=runner,
+        # Only OCRmyPDF is live in this isolated lane. The deterministic parser
+        # fixtures still record the exact native contracts required for replay.
         config=DocumentProcessingConfig(
-            docling_version="fixture-docling-v1",
-            grobid_version="fixture-grobid-v1",
             grobid_minimum_text_characters=80,
             ocrmypdf_version="17.4.1",
             ocr_mode="container_cli",

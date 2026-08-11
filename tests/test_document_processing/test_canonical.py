@@ -1434,7 +1434,7 @@ def test_store_round_trip_dispatches_canonical_product_schema(tmp_path: Path) ->
     )
     configuration: dict[str, Any] = {
         "serve_version": "1.21.0",
-        "expected_docling_version": "2.113.0",
+        "expected_docling_version": "2.96.1",
         "container_image": "quay.io/docling-project/docling-serve-cpu:v1.21.0",
         "container_digest": None,
         "model_versions": {},
@@ -1460,7 +1460,7 @@ def test_store_round_trip_dispatches_canonical_product_schema(tmp_path: Path) ->
             stage_id="docling",
             component=ComponentDescriptor(
                 component_id="docling",
-                component_version="2.113.0",
+                component_version="2.96.1",
                 capability="document.parse",
             ),
             configuration=configuration,

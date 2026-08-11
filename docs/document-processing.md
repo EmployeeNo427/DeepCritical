@@ -153,10 +153,12 @@ guessed into the new contract.
 
 Canonical schema v1 admits native evidence only through its pinned producer
 contracts. The Docling document and `content_spans` must be canonically encoded
-outputs of the same `docling` 2.113.0 / `document.parse` run, using Docling
+outputs of the same `docling` 2.96.1 / `document.parse` run, using Docling
 Serve 1.21.0 and the exact format-specific invocation schema (including
 `provenance-charspan-v2` for PDFs). JATS and BioC inputs must come from the
 version-1 project adapters with exact artifact and configuration lineage.
+Draft records that advertise a different Docling version are not relabeled;
+they must be reprocessed under a supported native contract.
 Scholarly TEI must come from a usable `grobid` 0.9.0 /
 `document.parse.scholarly` run whose input hash and parser options replay
 against the source artifact or its direct OCR derivative. Conflicting runtime

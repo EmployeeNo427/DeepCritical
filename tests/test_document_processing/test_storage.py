@@ -146,7 +146,7 @@ def make_run(
         stage_id="docling",
         component=ComponentDescriptor(
             component_id="docling",
-            component_version="2.113.0",
+            component_version="2.96.1",
             capability="document-conversion",
         ),
         configuration=config,
@@ -270,7 +270,7 @@ def docling_production_configuration(
 
     configuration: dict[str, object] = {
         "serve_version": "1.21.0",
-        "expected_docling_version": "2.113.0",
+        "expected_docling_version": "2.96.1",
         "container_image": "quay.io/docling-project/docling-serve-cpu:v1.21.0",
         "container_digest": None,
         "model_versions": {},
@@ -349,7 +349,7 @@ def docling_runtime_attestation(
 ) -> RuntimeAttestation:
     return RuntimeAttestation(
         component_id="docling",
-        component_version="2.113.0",
+        component_version="2.96.1",
         invocation_id=f"{run_id}-invocation",
         source=source,
         reporter_id="test-deployment-reporter",
@@ -362,7 +362,7 @@ def docling_runtime_attestation(
         component_versions=(
             component_versions
             if component_versions is not None
-            else {"docling": "2.113.0", "docling_serve": "1.21.0"}
+            else {"docling": "2.96.1", "docling_serve": "1.21.0"}
         ),
         model_versions={"layout": "fixture-v1"},
         model_hashes={"layout": "b" * 64},
@@ -572,7 +572,7 @@ def make_durable_canonical_view(
         component=source_component
         or ComponentDescriptor(
             component_id="docling",
-            component_version="2.113.0",
+            component_version="2.96.1",
             capability="document.parse",
         ),
         configuration=(
@@ -652,7 +652,7 @@ def make_irreproducible_canonical_view(
         run_id,
         component=ComponentDescriptor(
             component_id="docling",
-            component_version="2.113.0",
+            component_version="2.96.1",
             capability="document.parse",
         ),
         configuration={
@@ -1319,7 +1319,7 @@ def test_canonical_admission_accepts_clean_partial_docling_producer(
         (
             ComponentDescriptor(
                 component_id="unapproved-docling",
-                component_version="2.113.0",
+                component_version="2.96.1",
                 capability="document.parse",
             ),
             ProcessingRunStatus.COMPLETE,
@@ -1340,11 +1340,20 @@ def test_canonical_admission_accepts_clean_partial_docling_producer(
                 component_version="2.113.0",
                 capability="document.parse",
             ),
+            ProcessingRunStatus.COMPLETE,
+            "version|identity",
+        ),
+        (
+            ComponentDescriptor(
+                component_id="docling",
+                component_version="2.96.1",
+                capability="document.parse",
+            ),
             ProcessingRunStatus.FAILED,
             "status",
         ),
     ],
-    ids=("wrong-component", "wrong-version", "failed"),
+    ids=("wrong-component", "wrong-version", "stale-draft-version", "failed"),
 )
 def test_canonical_admission_rejects_unapproved_docling_producer(
     store: ContentAddressedStore,
@@ -1480,7 +1489,7 @@ def test_canonical_admission_requires_one_docling_pair_producer(
         "native-split-span-run",
         component=ComponentDescriptor(
             component_id="docling",
-            component_version="2.113.0",
+            component_version="2.96.1",
             capability="document.parse",
         ),
         configuration=docling_production_configuration(artifact),
@@ -2218,7 +2227,7 @@ def test_container_verifier_rejects_unapproved_attested_identity(
         run_id,
         component=ComponentDescriptor(
             component_id="docling",
-            component_version="2.113.0",
+            component_version="2.96.1",
             capability="document.parse",
         ),
         configuration=configuration,
@@ -2233,7 +2242,7 @@ def test_container_verifier_rejects_unapproved_attested_identity(
             purpose="Docling",
             expected_image_tag="docling-serve-cpu:v1.21.0",
             expected_component_versions={
-                "docling": "2.113.0",
+                "docling": "2.96.1",
                 "docling_serve": "1.21.0",
             },
         )
@@ -2752,7 +2761,7 @@ def test_canonical_admission_rejects_content_span_hash_drift(
         invalid_run_id,
         component=ComponentDescriptor(
             component_id="docling",
-            component_version="2.113.0",
+            component_version="2.96.1",
             capability="document.parse",
         ),
         configuration=docling_production_configuration(artifact),

@@ -68,6 +68,15 @@ from .models import (
     sha256_bytes,
     utc_now,
 )
+from .native_contracts import (
+    DOCLING_COMPONENT_VERSION,
+    DOCLING_CONTAINER_IMAGE,
+    DOCLING_SERVE_VERSION,
+    GROBID_COMPONENT_VERSION,
+    GROBID_CONTAINER_IMAGE,
+    OCR_COMPONENT_VERSION,
+    OCR_CONTAINER_IMAGE,
+)
 from .preflight import (
     PreflightDecision,
     PreflightDiagnostic,
@@ -150,9 +159,9 @@ class DocumentProcessingConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    docling_version: str = "2.113.0"
-    docling_serve_version: str = "1.21.0"
-    docling_container_image: str = "quay.io/docling-project/docling-serve-cpu:v1.21.0"
+    docling_version: str = DOCLING_COMPONENT_VERSION
+    docling_serve_version: str = DOCLING_SERVE_VERSION
+    docling_container_image: str = DOCLING_CONTAINER_IMAGE
     docling_container_digest: OciDigest | None = None
     docling_model_versions: dict[str, str] = Field(default_factory=dict)
     docling_model_hashes: dict[str, Sha256] = Field(default_factory=dict)
@@ -160,9 +169,9 @@ class DocumentProcessingConfig(BaseModel):
     docling_max_response_bytes: int = Field(
         default=DEFAULT_DOCLING_MAX_RESPONSE_BYTES, gt=0, strict=True
     )
-    grobid_version: str = "0.9.0"
+    grobid_version: str = GROBID_COMPONENT_VERSION
     grobid_enabled: bool = True
-    grobid_container_image: str = "deepcritical/grobid:0.9.0-full-p0-c2"
+    grobid_container_image: str = GROBID_CONTAINER_IMAGE
     grobid_container_digest: OciDigest | None = None
     grobid_model_versions: dict[str, str] = Field(default_factory=dict)
     grobid_model_hashes: dict[str, Sha256] = Field(default_factory=dict)
@@ -170,10 +179,10 @@ class DocumentProcessingConfig(BaseModel):
         default=DEFAULT_GROBID_MAX_RESPONSE_BYTES, gt=0, strict=True
     )
     grobid_minimum_text_characters: int = Field(default=100, ge=0)
-    ocrmypdf_version: str = "17.4.1"
+    ocrmypdf_version: str = OCR_COMPONENT_VERSION
     ocr_enabled: bool = True
     ocr_mode: Literal["container_cli", "local_cli"] = "container_cli"
-    ocr_container_image: str = "jbarlow83/ocrmypdf:v17.4.1"
+    ocr_container_image: str = OCR_CONTAINER_IMAGE
     ocr_container_digest: OciDigest | None = None
     ocr_languages: tuple[str, ...] = ("eng",)
     detect_image_only_pdfs: bool = True

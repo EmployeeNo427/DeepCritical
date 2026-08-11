@@ -95,15 +95,17 @@ def processing_run(**overrides: object) -> ProcessingRun:
     digest = f"sha256:{'2' * 64}"
     attestation = RuntimeAttestation(
         component_id="docling",
-        component_version="2.113.0",
+        component_version="2.96.1",
         invocation_id="docling-task-1",
         source=RuntimeAttestationSource.AUTHENTICATED_DEPLOYMENT_REPORTER,
         reporter_id="fixture-supervisor",
         observed_at=datetime(2026, 7, 17, 12, 0, 2, tzinfo=UTC),
         workload_id="docling-worker-1",
-        container_reference=("quay.io/docling-project/docling-serve:2.113.0@" + digest),
+        container_reference=(
+            "quay.io/docling-project/docling-serve-cpu:v1.21.0@" + digest
+        ),
         container_digest=digest,
-        component_versions={"docling": "2.113.0"},
+        component_versions={"docling": "2.96.1", "docling_serve": "1.21.0"},
         model_versions={"layout": "heron-101"},
         model_hashes={"layout": "1" * 64},
     )
@@ -123,11 +125,14 @@ def processing_run(**overrides: object) -> ProcessingRun:
         "stage_id": "docling",
         "component": ComponentDescriptor(
             component_id="docling",
-            component_version="2.113.0",
+            component_version="2.96.1",
             capability="document-conversion",
         ),
         "component_invocation_id": "docling-task-1",
-        "component_versions": {"docling": "2.113.0"},
+        "component_versions": {
+            "docling": "2.96.1",
+            "docling_serve": "1.21.0",
+        },
         "model_versions": {"layout": "heron-101"},
         "model_hashes": {"layout": "1" * 64},
         "container_image": attestation.container_reference,

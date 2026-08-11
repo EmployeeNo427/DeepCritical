@@ -113,7 +113,7 @@ def _clone_docling_sources(
         run_id,
         component=ComponentDescriptor(
             component_id="docling",
-            component_version="2.113.0",
+            component_version="2.96.1",
             capability="document.parse",
         ),
         configuration=docling_production_configuration(artifact),

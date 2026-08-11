@@ -45,6 +45,15 @@ from .models import (
     ProcessingRunStatus,
     RuntimeAttestationSource,
 )
+from .native_contracts import (
+    DOCLING_COMPONENT_VERSION,
+    DOCLING_IMAGE_TAG,
+    DOCLING_SERVE_VERSION,
+    GROBID_COMPONENT_VERSION,
+    GROBID_IMAGE_TAG,
+    OCR_COMPONENT_VERSION,
+    OCR_IMAGE_TAG,
+)
 from .products import build_data_product_ref, validate_product_contract
 from .routing import InputFormat
 from .span_replay import ContentSpanReplayError, replay_content_span_set
@@ -57,13 +66,6 @@ from .validation import (
 _SHA256_PATTERN = frozenset("0123456789abcdef")
 _RECORD_MODEL = TypeVar("_RECORD_MODEL", bound=BaseModel)
 
-_DOCLING_COMPONENT_VERSION = "2.113.0"
-_DOCLING_SERVE_VERSION = "1.21.0"
-_DOCLING_IMAGE_TAG = "docling-serve-cpu:v1.21.0"
-_GROBID_COMPONENT_VERSION = "0.9.0"
-_GROBID_IMAGE_TAG = "0.9.0-full-p0-c2"
-_OCR_COMPONENT_VERSION = "17.4.1"
-_OCR_IMAGE_TAG = "ocrmypdf:v17.4.1"
 _REMOTE_ATTESTATION_SOURCE = RuntimeAttestationSource.AUTHENTICATED_DEPLOYMENT_REPORTER
 
 _DOCLING_CONFIGURATION_KEYS = frozenset(
@@ -781,7 +783,7 @@ class ContentAddressedStore:
         self._require_component_contract(
             producer,
             component_id="docling",
-            component_version=_DOCLING_COMPONENT_VERSION,
+            component_version=DOCLING_COMPONENT_VERSION,
             capability="document.parse",
             statuses=frozenset(
                 {ProcessingRunStatus.COMPLETE, ProcessingRunStatus.PARTIAL}
@@ -817,8 +819,8 @@ class ContentAddressedStore:
                 "Docling producer configuration does not match the production schema"
             )
         if (
-            configuration["serve_version"] != _DOCLING_SERVE_VERSION
-            or configuration["expected_docling_version"] != _DOCLING_COMPONENT_VERSION
+            configuration["serve_version"] != DOCLING_SERVE_VERSION
+            or configuration["expected_docling_version"] != DOCLING_COMPONENT_VERSION
             or configuration["quality_validator_version"] != "docling-quality-v2"
             or configuration["content_span_schema_version"] != "1"
         ):
@@ -833,10 +835,10 @@ class ContentAddressedStore:
         self._verify_container_configuration(
             producer,
             purpose="Docling",
-            expected_image_tag=_DOCLING_IMAGE_TAG,
+            expected_image_tag=DOCLING_IMAGE_TAG,
             expected_component_versions={
-                "docling": _DOCLING_COMPONENT_VERSION,
-                "docling_serve": _DOCLING_SERVE_VERSION,
+                "docling": DOCLING_COMPONENT_VERSION,
+                "docling_serve": DOCLING_SERVE_VERSION,
             },
         )
 
@@ -1064,7 +1066,7 @@ class ContentAddressedStore:
         self._require_component_contract(
             producer,
             component_id="grobid",
-            component_version=_GROBID_COMPONENT_VERSION,
+            component_version=GROBID_COMPONENT_VERSION,
             capability="document.parse.scholarly",
             statuses=frozenset(
                 {ProcessingRunStatus.COMPLETE, ProcessingRunStatus.PARTIAL}
@@ -1086,15 +1088,15 @@ class ContentAddressedStore:
             raise RecordConflictError(
                 "GROBID producer configuration does not match the production schema"
             )
-        if configuration["expected_grobid_version"] != _GROBID_COMPONENT_VERSION:
+        if configuration["expected_grobid_version"] != GROBID_COMPONENT_VERSION:
             raise RecordConflictError(
                 "GROBID producer version configuration is not approved"
             )
         self._verify_container_configuration(
             producer,
             purpose="GROBID",
-            expected_image_tag=_GROBID_IMAGE_TAG,
-            expected_component_versions={"grobid": _GROBID_COMPONENT_VERSION},
+            expected_image_tag=GROBID_IMAGE_TAG,
+            expected_component_versions={"grobid": GROBID_COMPONENT_VERSION},
         )
         if producer.inputs != expected_grobid_inputs:
             raise RecordConflictError(
@@ -1168,7 +1170,7 @@ class ContentAddressedStore:
         self._require_component_contract(
             creator,
             component_id="ocrmypdf",
-            component_version=_OCR_COMPONENT_VERSION,
+            component_version=OCR_COMPONENT_VERSION,
             capability="document.ocr",
             statuses=frozenset(
                 {ProcessingRunStatus.COMPLETE, ProcessingRunStatus.PARTIAL}
@@ -1209,7 +1211,7 @@ class ContentAddressedStore:
             )
         if (
             configuration["input_sha256"] != source_artifact.source_sha256
-            or configuration["expected_ocrmypdf_version"] != _OCR_COMPONENT_VERSION
+            or configuration["expected_ocrmypdf_version"] != OCR_COMPONENT_VERSION
         ):
             raise RecordConflictError(
                 "GROBID OCR derivative configuration does not match its exact source"
@@ -1225,7 +1227,7 @@ class ContentAddressedStore:
             if (
                 not isinstance(image, str)
                 or not image.strip()
-                or not image.split("@", maxsplit=1)[0].endswith(_OCR_IMAGE_TAG)
+                or not image.split("@", maxsplit=1)[0].endswith(OCR_IMAGE_TAG)
                 or (digest is not None and not _is_oci_sha256(digest))
             ):
                 raise RecordConflictError(
@@ -1278,7 +1280,7 @@ class ContentAddressedStore:
             attestation.source
             is not RuntimeAttestationSource.DIGEST_ADDRESSED_OCI_INVOCATION
             or component_versions.keys() != {"ocrmypdf", "tesseract"}
-            or component_versions["ocrmypdf"] != _OCR_COMPONENT_VERSION
+            or component_versions["ocrmypdf"] != OCR_COMPONENT_VERSION
             or not isinstance(component_versions["tesseract"], str)
             or not component_versions["tesseract"].strip()
             or digest != attestation.container_digest

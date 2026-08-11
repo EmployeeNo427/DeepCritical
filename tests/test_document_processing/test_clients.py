@@ -343,7 +343,7 @@ async def test_http_runtime_reporter_authenticates_and_binds_exact_task() -> Non
             {
                 "schema_version": "deepcritical-runtime-attestation-v1",
                 "component_id": component_id,
-                "component_version": "2.113.0",
+                "component_version": "2.96.1",
                 "invocation_id": task_id,
                 "source": "authenticated_deployment_reporter",
                 "reporter_id": "fixture-supervisor",
@@ -352,7 +352,7 @@ async def test_http_runtime_reporter_authenticates_and_binds_exact_task() -> Non
                 "container_reference": f"registry.test/docling@{digest}",
                 "container_digest": digest,
                 "component_versions": {
-                    "docling": "2.113.0",
+                    "docling": "2.96.1",
                     "docling_serve": "1.21.0",
                 },
                 "model_versions": {"layout": "1"},

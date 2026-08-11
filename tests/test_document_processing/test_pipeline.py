@@ -453,7 +453,7 @@ class OversizedResponseCheckpointDocling(FakeDocling):
 
 
 class VersionedDocling(FakeDocling):
-    def __init__(self, version: str = "2.113.0") -> None:
+    def __init__(self, version: str = "2.96.1") -> None:
         super().__init__()
         self.observed_version = version
         self.observed_reporter_id = "fixture-supervisor"
@@ -2789,7 +2789,7 @@ async def test_expected_runtime_config_not_transient_probe_controls_reuse(
     fourth_docling_run = next(
         run for run in fourth.processing_runs if run.component_id == "docling"
     )
-    assert first_docling_run.component_versions["docling"] == "2.113.0"
+    assert first_docling_run.component_versions["docling"] == "2.96.1"
     assert first_docling_run.runtime_attestation is not None
     assert (
         first_docling_run.component_invocation_id
@@ -2872,7 +2872,7 @@ def test_runtime_attestation_requires_exact_canonical_component_names(
     digest = "sha256:" + ("a" * 64)
     spoofed = RuntimeAttestation(
         component_id="docling",
-        component_version="2.113.0",
+        component_version="2.96.1",
         invocation_id="task-spoofed-components",
         source=RuntimeAttestationSource.AUTHENTICATED_DEPLOYMENT_REPORTER,
         reporter_id="fixture-supervisor",
@@ -2883,7 +2883,7 @@ def test_runtime_attestation_requires_exact_canonical_component_names(
         ),
         container_digest=digest,
         component_versions={
-            "unrelated": "docling 2.113.0",
+            "unrelated": "docling 2.96.1",
             "docling_serve": "1.21.0-compatible",
         },
         model_versions={"layout": "1"},
