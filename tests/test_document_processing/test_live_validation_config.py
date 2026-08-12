@@ -5,6 +5,8 @@ from pathlib import Path
 
 import yaml
 
+from DeepResearch.src.document_processing.pipeline import DocumentProcessingConfig
+
 
 def _repository_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -104,25 +106,33 @@ def test_live_policy_versions_match_the_pinned_stack() -> None:
         ).read_text(encoding="utf-8")
     )
     services = config["services"]
+    defaults = DocumentProcessingConfig()
 
     assert services["docling"]["container_image"] == (
         "quay.io/docling-project/docling-serve-cpu:v1.21.0"
     )
     assert services["docling"]["component_version"] == "2.96.1"
     assert services["docling"]["serve_version"] == "1.21.0"
+    assert services["docling"]["component_version"] == defaults.docling_version
+    assert services["docling"]["serve_version"] == defaults.docling_serve_version
+    assert services["docling"]["container_image"] == defaults.docling_container_image
     assert services["grobid"]["container_image"] == (
         "deepcritical/grobid:0.9.0-full-p0-c2"
     )
     assert services["grobid"]["component_version"] == "0.9.0"
+    assert services["grobid"]["component_version"] == defaults.grobid_version
+    assert services["grobid"]["container_image"] == defaults.grobid_container_image
     assert services["ocr"]["container_image"] == "jbarlow83/ocrmypdf:v17.4.1"
     assert services["ocr"]["component_version"] == "17.4.1"
+    assert services["ocr"]["component_version"] == defaults.ocrmypdf_version
+    assert services["ocr"]["container_image"] == defaults.ocr_container_image
 
 
 def test_live_workflow_runs_direct_and_compiled_contracts_in_isolated_jobs() -> None:
     workflow = _live_workflow()
     jobs = workflow["jobs"]
 
-    assert set(jobs) == {"quality", "docling", "grobid", "ocr"}
+    assert set(jobs) == {"quality", "docling", "grobid", "ocr", "all-real"}
     assert all(job["runs-on"] == "ubuntu-24.04" for job in jobs.values())
     assert "continue-on-error" not in _live_workflow_path().read_text(encoding="utf-8")
 
@@ -157,7 +167,7 @@ def test_every_live_job_verifies_the_reported_checkout_revision() -> None:
         == "${{ github.event.pull_request.head.sha || github.sha }}"
     )
 
-    for job_name in ("quality", "docling", "grobid", "ocr"):
+    for job_name in ("quality", "docling", "grobid", "ocr", "all-real"):
         checkout = _step(
             workflow["jobs"],
             job_name,
@@ -173,40 +183,136 @@ def test_every_live_job_verifies_the_reported_checkout_revision() -> None:
         assert 'test "$actual_revision" = "$TESTED_REVISION"' in verify["run"]
 
 
-def test_hardening_pull_requests_run_every_isolated_live_job() -> None:
+def test_hardening_pull_requests_run_every_live_job() -> None:
     workflow = yaml.load(
         _live_workflow_path().read_text(encoding="utf-8"),
         Loader=yaml.BaseLoader,
     )
     pull_request = workflow["on"]["pull_request"]
     compare_revision = workflow["on"]["workflow_dispatch"]["inputs"]["compare_revision"]
+    component = workflow["on"]["workflow_dispatch"]["inputs"]["component"]
     assert compare_revision["required"] == "true"
     assert compare_revision["type"] == "string"
+    assert component["options"] == ["all", "all-real", "docling", "grobid", "ocr"]
     assert pull_request["branches"] == [
         "dev",
         "fix/document-processing-hardening",
+        "fix/document-processing-semantics",
     ]
     assert set(pull_request["paths"]) == {
         ".github/workflows/document-processing-live.yml",
         "DeepResearch/src/document_processing/**",
         "configs/document_processing/**",
         "docker/document-processing/**",
+        "tests/fixtures/document_processing/**",
         "tests/test_document_processing/**",
         "pyproject.toml",
         "uv.lock",
     }
 
-    for job_name in ("docling", "grobid", "ocr"):
+    for job_name in ("docling", "grobid", "ocr", "all-real"):
         assert "github.event_name == 'pull_request'" in workflow["jobs"][job_name]["if"]
+
+
+def test_all_real_job_runs_one_capture_capable_pipeline_with_every_runtime() -> None:
+    workflow = _live_workflow()
+    jobs = workflow["jobs"]
+    job = jobs["all-real"]
+
+    assert job["timeout-minutes"] == 120
+    assert "inputs.component == 'all'" in job["if"]
+    assert "inputs.component == 'all-real'" in job["if"]
+
+    pull_images = _step(
+        jobs,
+        "all-real",
+        "Pull and record every immutable runtime image",
+    )["run"]
+    for image_variable in (
+        "DOCLING_IMAGE_TAG",
+        "REDIS_IMAGE_TAG",
+        "GROBID_BASE_IMAGE_TAG",
+        "CADDY_IMAGE_TAG",
+        "OCRMYPDF_IMAGE_TAG",
+    ):
+        assert f'"${image_variable}"' in pull_images
+    assert "DEEPCRITICAL_LIVE_DOCLING_IMAGE_REF" in pull_images
+    assert "DEEPCRITICAL_LIVE_DOCLING_IMAGE_ID" in pull_images
+    assert "DEEPCRITICAL_LIVE_OCR_IMAGE" in pull_images
+
+    grobid_build = _step(
+        jobs,
+        "all-real",
+        "Build and record the project-owned GROBID image",
+    )["run"]
+    assert "GROBID_DOCKERFILE_BLOB_SHA" in grobid_build
+    assert "DEEPCRITICAL_LIVE_GROBID_DOCKERFILE_BLOB" in grobid_build
+    assert "DEEPCRITICAL_LIVE_GROBID_IMAGE_REF" in grobid_build
+    assert "DEEPCRITICAL_LIVE_GROBID_IMAGE_ID" in grobid_build
+
+    start = _step(jobs, "all-real", "Start every parser service")["run"]
+    for service in (
+        "redis",
+        "docling-api",
+        "docling-worker",
+        "grobid",
+        "grobid-proxy",
+    ):
+        assert service in start
+
+    run_step = _step(jobs, "all-real", "Run the all-real capture contract")
+    assert run_step["env"] == {
+        "DEEPCRITICAL_RUN_LIVE_DOCUMENT_PROCESSING": "1",
+        "DEEPCRITICAL_RUN_LIVE_DOCUMENT_PROCESSING_OCR": "1",
+        "DEEPCRITICAL_RUN_LIVE_DOCUMENT_PROCESSING_ALL_REAL": "1",
+        "DEEPCRITICAL_LIVE_CAPTURE_DIR": "live-evidence/native",
+        "DEEPCRITICAL_LIVE_REQUEST_TIMEOUT_SECONDS": "900",
+        "DEEPCRITICAL_LIVE_TASK_TIMEOUT_SECONDS": "1800",
+        "DEEPCRITICAL_LIVE_OCR_TIMEOUT_SECONDS": "900",
+    }
+    assert "test_live_all_real_pipeline_captures_native_outputs" in run_step["run"]
+    assert "DEEPCRITICAL_LIVE_DOCLING_CONTAINER_ID" in run_step["run"]
+    assert "DEEPCRITICAL_LIVE_GROBID_CONTAINER_ID" in run_step["run"]
+    assert "tee live-evidence/pytest.txt" in run_step["run"]
+
+    collect = _step(
+        jobs,
+        "all-real",
+        "Collect all-real logs and capture inventory",
+    )
+    assert collect["if"] == "always()"
+    assert "compose.log" in collect["run"]
+    assert "native-sha256.txt" in collect["run"]
+    assert "checkout-revision.txt" in collect["run"]
+
+    cleanup = _step(
+        jobs,
+        "all-real",
+        "Stop every parser and remove OCR invocations",
+    )
+    assert cleanup["if"] == "always()"
+    assert "down --volumes --remove-orphans" in cleanup["run"]
+    assert "org.deepcritical.invocation-id" in cleanup["run"]
+    assert "org.deepcritical.probe" in cleanup["run"]
+
+    upload = _step(jobs, "all-real", "Upload all-real evidence")
+    assert upload["if"] == "always()"
+    assert upload["with"]["path"] == "live-evidence"
+    assert upload["with"]["if-no-files-found"] == "error"
 
 
 def test_quality_job_enforces_the_complete_repository_gate() -> None:
     workflow = _live_workflow()
+    assert workflow["concurrency"] == {
+        "group": "document-processing-live-${{ github.ref }}",
+        "cancel-in-progress": True,
+    }
     jobs = workflow["jobs"]
     quality = jobs["quality"]
     assert quality["timeout-minutes"] == 30
     assert all(
-        jobs[name]["needs"] == "quality" for name in ("docling", "grobid", "ocr")
+        jobs[name]["needs"] == "quality"
+        for name in ("docling", "grobid", "ocr", "all-real")
     )
     assert workflow["env"]["COVERAGE_BASE_REVISION"] == (
         "${{ github.event.pull_request.base.sha || inputs.compare_revision }}"
@@ -295,3 +401,28 @@ def test_quality_job_enforces_the_complete_repository_gate() -> None:
             "Build documentation",
         )["run"]
     )
+
+
+def test_canonical_contract_coverage_is_complete_and_isolated() -> None:
+    jobs = _live_workflow()["jobs"]
+    canonical_step = _step(
+        jobs,
+        "quality",
+        "Enforce canonical document contract coverage",
+    )
+    document_step = _step(
+        jobs,
+        "quality",
+        "Run the complete document-processing suite",
+    )
+
+    assert canonical_step["env"]["COVERAGE_FILE"] == ".coverage-canonical-document"
+    assert (
+        canonical_step["env"]["COVERAGE_FILE"] != document_step["env"]["COVERAGE_FILE"]
+    )
+    canonical_coverage = canonical_step["run"]
+    assert "tests/test_document_processing/test_canonical.py" in canonical_coverage
+    assert "--cov=DeepResearch.src.document_processing.canonical" in canonical_coverage
+    assert "--cov-branch" in canonical_coverage
+    assert "--cov-report=term-missing" in canonical_coverage
+    assert "--cov-fail-under=100" in canonical_coverage

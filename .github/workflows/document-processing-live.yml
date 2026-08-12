@@ -10,6 +10,7 @@ on:
         type: choice
         options:
           - all
+          - all-real
           - docling
           - grobid
           - ocr
@@ -21,11 +22,13 @@ on:
     branches:
       - dev
       - fix/document-processing-hardening
+      - fix/document-processing-semantics
     paths:
       - ".github/workflows/document-processing-live.yml"
       - "DeepResearch/src/document_processing/**"
       - "configs/document_processing/**"
       - "docker/document-processing/**"
+      - "tests/fixtures/document_processing/**"
       - "tests/test_document_processing/**"
       - "pyproject.toml"
       - "uv.lock"
@@ -34,7 +37,7 @@ permissions:
 
 concurrency:
   group: document-processing-live-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   PYTHON_VERSION: "3.11"
@@ -96,6 +99,18 @@ jobs:
             tests/test_document_processing/test_orchestration.py \
             tests/test_document_processing/test_pipeline.py \
             -q -p no:cacheprovider
+
+      - name: Enforce canonical document contract coverage
+        env:
+          COVERAGE_FILE: .coverage-canonical-document
+        run: |
+          uv run --frozen pytest \
+            tests/test_document_processing/test_canonical.py \
+            -q -p no:cacheprovider \
+            --cov=DeepResearch.src.document_processing.canonical \
+            --cov-branch \
+            --cov-report=term-missing \
+            --cov-fail-under=100
 
       - name: Run the complete document-processing suite
         env:
@@ -426,6 +441,8 @@ jobs:
             exit 1
           fi
           echo "GROBID_IMAGE_DIGEST=$grobid_image_id" >> "$GITHUB_ENV"
+          echo "DEEPCRITICAL_LIVE_GROBID_DOCKERFILE_BLOB=$grobid_dockerfile_blob" \
+            >> "$GITHUB_ENV"
           echo "DEEPCRITICAL_LIVE_GROBID_IMAGE_REF=$GROBID_CI_IMAGE_TAG@$grobid_image_id" \
             >> "$GITHUB_ENV"
           echo "DEEPCRITICAL_LIVE_GROBID_IMAGE_ID=$grobid_image_id" \
@@ -638,6 +655,247 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: document-processing-ocr-${{ github.run_id }}
+          path: live-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  all-real:
+    name: All-real pipeline and native capture (standard runner)
+    needs: quality
+    if: >-
+      github.event_name == 'pull_request' ||
+      inputs.component == 'all' ||
+      inputs.component == 'all-real'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out the tested revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TESTED_REVISION }}
+
+      - name: Verify the checked-out revision
+        run: |
+          actual_revision="$(git rev-parse HEAD)"
+          test "$actual_revision" = "$TESTED_REVISION"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/local/.ghcup \
+            /usr/local/share/powershell \
+            /usr/share/dotnet \
+            /opt/ghc
+          docker system prune --all --force --volumes
+          df -h
+
+      - name: Install the exact live-test dependency set
+        run: |
+          python -m pip install --disable-pip-version-check --no-cache-dir \
+            --requirement docker/document-processing/requirements-live.txt
+          mkdir -p live-evidence/native
+          python -m pip freeze > live-evidence/python-packages.txt
+
+      - name: Pull and record every immutable runtime image
+        shell: bash
+        run: |
+          resolve_image() {
+            local tag="$1"
+            local expected_digest="$2"
+            local exact_ref="${tag}@${expected_digest}"
+            docker pull "$exact_ref" >&2
+            if [[ ! "$exact_ref" =~ @sha256:[0-9a-f]{64}$ ]]; then
+              echo "Image did not resolve to an immutable sha256 reference: $tag" >&2
+              return 1
+            fi
+            printf '%s\n' "$exact_ref"
+          }
+
+          docling_ref="$(
+            resolve_image "$DOCLING_IMAGE_TAG" "$DOCLING_IMAGE_DIGEST"
+          )"
+          redis_ref="$(resolve_image "$REDIS_IMAGE_TAG" "$REDIS_IMAGE_DIGEST")"
+          grobid_base_ref="$(
+            resolve_image "$GROBID_BASE_IMAGE_TAG" "$GROBID_BASE_DIGEST"
+          )"
+          caddy_ref="$(resolve_image "$CADDY_IMAGE_TAG" "$CADDY_IMAGE_DIGEST")"
+          ocr_ref="$(resolve_image "$OCRMYPDF_IMAGE_TAG" "$OCRMYPDF_IMAGE_DIGEST")"
+          docling_image_id="$(
+            docker image inspect "$docling_ref" --format '{{.Id}}'
+          )"
+          if [[ ! "$docling_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Docling image has no immutable local image ID" >&2
+            exit 1
+          fi
+
+          {
+            echo "DOCLING_IMAGE_DIGEST=${docling_ref##*@}"
+            echo "REDIS_IMAGE_DIGEST=${redis_ref##*@}"
+            echo "GROBID_BASE_DIGEST=${grobid_base_ref##*@}"
+            echo "GROBID_IMAGE_DIGEST=$ZERO_DIGEST"
+            echo "CADDY_IMAGE_DIGEST=${caddy_ref##*@}"
+            echo "OCRMYPDF_IMAGE_DIGEST=${ocr_ref##*@}"
+            echo "DOCLING_API_KEY=dc-docling-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "GROBID_API_KEY=dc-grobid-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "DEEPCRITICAL_LIVE_DOCLING_API_KEY=dc-docling-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "DEEPCRITICAL_LIVE_GROBID_API_KEY=dc-grobid-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "REDIS_PASSWORD=dc-redis-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "DEEPCRITICAL_LIVE_DOCLING_IMAGE_REF=$docling_ref"
+            echo "DEEPCRITICAL_LIVE_DOCLING_IMAGE_ID=$docling_image_id"
+            echo "DEEPCRITICAL_LIVE_OCR_IMAGE=$ocr_ref"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "revision=$TESTED_REVISION"
+            echo "docling=$docling_ref"
+            echo "redis=$redis_ref"
+            echo "grobid_base=$grobid_base_ref"
+            echo "caddy=$caddy_ref"
+            echo "ocrmypdf=$ocr_ref"
+          } > live-evidence/images.txt
+
+      - name: Build and record the project-owned GROBID image
+        shell: bash
+        run: |
+          grobid_dockerfile_blob="$(
+            git hash-object docker/document-processing/Dockerfile.grobid
+          )"
+          if [[ "$grobid_dockerfile_blob" != "$GROBID_DOCKERFILE_BLOB_SHA" ]]; then
+            echo "GROBID Dockerfile does not match the committed Git blob" >&2
+            exit 1
+          fi
+          docker compose \
+            --file docker/document-processing/compose.yaml \
+            --profile build \
+            build grobid-build
+          grobid_image_id="$(
+            docker image inspect "$GROBID_CI_IMAGE_TAG" --format '{{.Id}}'
+          )"
+          if [[ ! "$grobid_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Built GROBID image has no immutable image ID" >&2
+            exit 1
+          fi
+          echo "GROBID_IMAGE_DIGEST=$grobid_image_id" >> "$GITHUB_ENV"
+          echo "DEEPCRITICAL_LIVE_GROBID_DOCKERFILE_BLOB=$grobid_dockerfile_blob" \
+            >> "$GITHUB_ENV"
+          echo "DEEPCRITICAL_LIVE_GROBID_IMAGE_REF=$GROBID_CI_IMAGE_TAG@$grobid_image_id" \
+            >> "$GITHUB_ENV"
+          echo "DEEPCRITICAL_LIVE_GROBID_IMAGE_ID=$grobid_image_id" \
+            >> "$GITHUB_ENV"
+          {
+            echo "grobid_dockerfile_blob=$grobid_dockerfile_blob"
+            echo "grobid_built_image=$GROBID_CI_IMAGE_TAG@$grobid_image_id"
+          } >> live-evidence/images.txt
+
+      - name: Start every parser service
+        working-directory: docker/document-processing
+        run: |
+          docker compose \
+            --file compose.yaml \
+            --file compose.github-actions.yaml \
+            config --quiet
+          docker compose \
+            --file compose.yaml \
+            --file compose.github-actions.yaml \
+            up --detach --wait --wait-timeout 1200 \
+            redis docling-api docling-worker grobid grobid-proxy
+
+      - name: Run the all-real capture contract
+        shell: bash
+        env:
+          DEEPCRITICAL_RUN_LIVE_DOCUMENT_PROCESSING: "1"
+          DEEPCRITICAL_RUN_LIVE_DOCUMENT_PROCESSING_OCR: "1"
+          DEEPCRITICAL_RUN_LIVE_DOCUMENT_PROCESSING_ALL_REAL: "1"
+          DEEPCRITICAL_LIVE_CAPTURE_DIR: live-evidence/native
+          DEEPCRITICAL_LIVE_REQUEST_TIMEOUT_SECONDS: "900"
+          DEEPCRITICAL_LIVE_TASK_TIMEOUT_SECONDS: "1800"
+          DEEPCRITICAL_LIVE_OCR_TIMEOUT_SECONDS: "900"
+        run: |
+          set -o pipefail
+          docling_container_id="$(
+            docker compose \
+              --file docker/document-processing/compose.yaml \
+              --file docker/document-processing/compose.github-actions.yaml \
+              ps --quiet docling-worker
+          )"
+          grobid_container_id="$(
+            docker compose \
+              --file docker/document-processing/compose.yaml \
+              --file docker/document-processing/compose.github-actions.yaml \
+              ps --quiet grobid
+          )"
+          test -n "$docling_container_id"
+          test -n "$grobid_container_id"
+          export DEEPCRITICAL_LIVE_DOCLING_CONTAINER_ID="$docling_container_id"
+          export DEEPCRITICAL_LIVE_GROBID_CONTAINER_ID="$grobid_container_id"
+          python -m pytest \
+            tests/test_document_processing/test_live_stack_contract.py::test_live_all_real_pipeline_captures_native_outputs \
+            -vv --tb=short -p no:cacheprovider \
+            2>&1 | tee live-evidence/pytest.txt
+
+      - name: Collect all-real logs and capture inventory
+        if: always()
+        shell: bash
+        run: |
+          docker compose \
+            --file docker/document-processing/compose.yaml \
+            --file docker/document-processing/compose.github-actions.yaml \
+            ps --all > live-evidence/compose-ps.txt
+          docker compose \
+            --file docker/document-processing/compose.yaml \
+            --file docker/document-processing/compose.github-actions.yaml \
+            logs --no-color --timestamps --tail=4000 \
+            > live-evidence/compose.log 2>&1
+          {
+            docker compose \
+              --file docker/document-processing/compose.yaml \
+              --file docker/document-processing/compose.github-actions.yaml \
+              ps --quiet docling-worker grobid
+          } | xargs -r docker inspect > live-evidence/parser-containers.json
+          docker image inspect \
+            "$DEEPCRITICAL_LIVE_DOCLING_IMAGE_REF" \
+            "$DEEPCRITICAL_LIVE_GROBID_IMAGE_ID" \
+            "$DEEPCRITICAL_LIVE_OCR_IMAGE" \
+            > live-evidence/parser-images.json
+          git rev-parse HEAD > live-evidence/checkout-revision.txt
+          find live-evidence/native -type f -print0 \
+            | sort -z \
+            | xargs -0 -r sha256sum \
+            > live-evidence/native-sha256.txt
+          find live-evidence/native -maxdepth 1 -type f -printf '%f\n' \
+            | sort > live-evidence/native-files.txt
+          docker version > live-evidence/docker-version.txt 2>&1
+          df -h > live-evidence/disk.txt
+
+      - name: Stop every parser and remove OCR invocations
+        if: always()
+        shell: bash
+        run: |
+          status=0
+          docker compose \
+            --file docker/document-processing/compose.yaml \
+            --file docker/document-processing/compose.github-actions.yaml \
+            down --volumes --remove-orphans || status=$?
+          docker ps --all --quiet \
+            --filter label=org.deepcritical.invocation-id \
+            | xargs -r docker rm --force || status=$?
+          docker ps --all --quiet \
+            --filter label=org.deepcritical.probe \
+            | xargs -r docker rm --force || status=$?
+          exit "$status"
+
+      - name: Upload all-real evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: document-processing-all-real-${{ github.run_id }}
           path: live-evidence
           if-no-files-found: error
           retention-days: 14

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import math
+import re
+from collections import defaultdict, deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 
 from .adapters import NativeTextLocator
 from .alignment import AlignmentRecord, AlignmentStatus, ScholarlyAlignmentOverlay
@@ -37,6 +40,9 @@ class ContentIntegrityKind(StrEnum):
 class ContentIntegrityStatus(StrEnum):
     RESOLVED = "resolved"
     UNALIGNED = "unaligned"
+
+
+_EnumT = TypeVar("_EnumT", bound=StrEnum)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +96,95 @@ class ContentIntegrityRecord:
             "reason_codes": list(self.reason_codes),
         }
 
+    @classmethod
+    def from_dict(cls, payload: Any) -> ContentIntegrityRecord:
+        """Load one persisted v1 record without coercion or field loss."""
+
+        expected_fields = {
+            "record_id",
+            "kind",
+            "status",
+            "source_ref",
+            "source_docling_item_ref",
+            "declared_target_refs",
+            "resolved_docling_item_refs",
+            "unresolved_target_refs",
+            "reason_codes",
+        }
+        values = _strict_object(payload, expected_fields, "content-integrity record")
+        record_id = _strict_sha256(values["record_id"], "record_id")
+        kind = _strict_enum(
+            ContentIntegrityKind,
+            values["kind"],
+            "content-integrity record kind",
+        )
+        status = _strict_enum(
+            ContentIntegrityStatus,
+            values["status"],
+            "content-integrity record status",
+        )
+        source_ref = _strict_nonempty_string(values["source_ref"], "source_ref")
+        source_item = values["source_docling_item_ref"]
+        if source_item is not None:
+            source_item = _strict_nonempty_string(
+                source_item,
+                "source_docling_item_ref",
+            )
+        declared = _strict_string_list(
+            values["declared_target_refs"],
+            "declared_target_refs",
+        )
+        resolved = _strict_string_list(
+            values["resolved_docling_item_refs"],
+            "resolved_docling_item_refs",
+        )
+        unresolved = _strict_string_list(
+            values["unresolved_target_refs"],
+            "unresolved_target_refs",
+        )
+        reasons = _strict_string_list(values["reason_codes"], "reason_codes")
+        expected_status = (
+            ContentIntegrityStatus.UNALIGNED
+            if reasons
+            else ContentIntegrityStatus.RESOLVED
+        )
+        if status is not expected_status:
+            raise ValueError(
+                "content-integrity record status does not match its reason codes"
+            )
+        if status is ContentIntegrityStatus.RESOLVED and unresolved:
+            raise ValueError(
+                "resolved content-integrity records cannot retain unresolved targets"
+            )
+        expected_id = _content_integrity_record_id(
+            kind=kind,
+            status=status,
+            source_ref=source_ref,
+            source_docling_item_ref=source_item,
+            declared_target_refs=declared,
+            resolved_docling_item_refs=resolved,
+            unresolved_target_refs=unresolved,
+            reason_codes=reasons,
+        )
+        if record_id != expected_id:
+            raise ValueError(
+                "content-integrity record_id does not match its persisted content"
+            )
+        record = cls(
+            record_id=record_id,
+            kind=kind,
+            status=status,
+            source_ref=source_ref,
+            source_docling_item_ref=source_item,
+            declared_target_refs=declared,
+            resolved_docling_item_refs=resolved,
+            unresolved_target_refs=unresolved,
+            reason_codes=reasons,
+        )
+        if record.to_dict() != dict(values):  # pragma: no cover - defensive replay
+            raise ValueError("content-integrity record does not replay exactly")
+        return record
+
 
 @dataclass(frozen=True, slots=True)
 class ContentIntegrityReport:
@@ -128,6 +223,71 @@ class ContentIntegrityReport:
                 for issue in self.issues
             ],
         }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> ContentIntegrityReport:
+        """Load and exactly replay one persisted v1 integrity report."""
+
+        expected_fields = {
+            "document_sha256",
+            "scholarly_overlay_present",
+            "resolved_count",
+            "unaligned_count",
+            "records",
+            "issues",
+        }
+        values = _strict_object(payload, expected_fields, "content-integrity report")
+        document_sha256 = _strict_sha256(
+            values["document_sha256"],
+            "document_sha256",
+        )
+        scholarly_present = values["scholarly_overlay_present"]
+        if not isinstance(scholarly_present, bool):
+            raise ValueError(
+                "content-integrity scholarly_overlay_present must be a boolean"
+            )
+        raw_records = values["records"]
+        if not isinstance(raw_records, list):
+            raise ValueError("content-integrity records must be a list")
+        records = tuple(ContentIntegrityRecord.from_dict(item) for item in raw_records)
+        record_ids = tuple(record.record_id for record in records)
+        if len(set(record_ids)) != len(record_ids):
+            raise ValueError("content-integrity record IDs must be unique")
+
+        raw_issues = values["issues"]
+        if not isinstance(raw_issues, list):
+            raise ValueError("content-integrity issues must be a list")
+        issues = tuple(_quality_issue_from_dict(item) for item in raw_issues)
+        resolved_count = _strict_nonnegative_int(
+            values["resolved_count"],
+            "resolved_count",
+        )
+        unaligned_count = _strict_nonnegative_int(
+            values["unaligned_count"],
+            "unaligned_count",
+        )
+        actual_resolved = sum(
+            record.status is ContentIntegrityStatus.RESOLVED for record in records
+        )
+        if resolved_count != actual_resolved:
+            raise ValueError("content-integrity resolved_count does not match records")
+        if unaligned_count != len(records) - actual_resolved:
+            raise ValueError("content-integrity unaligned_count does not match records")
+        report = cls(
+            document_sha256=document_sha256,
+            records=records,
+            issues=issues,
+            scholarly_overlay_present=scholarly_present,
+        )
+        if report.to_dict() != dict(values):  # pragma: no cover - defensive replay
+            raise ValueError("content-integrity report does not replay exactly")
+        return report
+
+
+def parse_content_integrity_report(payload: Any) -> ContentIntegrityReport:
+    """Strictly parse the registered persisted v1 integrity payload."""
+
+    return ContentIntegrityReport.from_dict(payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -726,6 +886,132 @@ def _citation_integrity_records(
     return tuple(records)
 
 
+def _strict_object(
+    payload: Any,
+    expected_fields: set[str],
+    context: str,
+) -> Mapping[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{context} must be an object")
+    if any(not isinstance(field, str) for field in payload):
+        raise ValueError(f"{context} fields must be strings")
+    actual_fields = set(payload)
+    if actual_fields != expected_fields:
+        missing = sorted(expected_fields - actual_fields)
+        extra = sorted(actual_fields - expected_fields)
+        raise ValueError(
+            f"{context} fields do not match v1; missing={missing!r}, extra={extra!r}"
+        )
+    return cast("Mapping[str, Any]", payload)
+
+
+def _strict_nonempty_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"content-integrity {field_name} must be a non-empty string")
+    return value
+
+
+def _strict_sha256(value: Any, field_name: str) -> str:
+    text = _strict_nonempty_string(value, field_name)
+    if re.fullmatch(r"[0-9a-f]{64}", text) is None:
+        raise ValueError(f"content-integrity {field_name} must be a SHA-256 digest")
+    return text
+
+
+def _strict_enum(
+    enum_type: type[_EnumT],
+    value: Any,
+    field_name: str,
+) -> _EnumT:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    try:
+        return enum_type(value)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} is unknown") from exc
+
+
+def _strict_string_list(value: Any, field_name: str) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ValueError(f"content-integrity {field_name} must be a list")
+    values = tuple(
+        _strict_nonempty_string(item, f"{field_name}[{index}]")
+        for index, item in enumerate(value)
+    )
+    if len(set(values)) != len(values):
+        raise ValueError(f"content-integrity {field_name} values must be unique")
+    return values
+
+
+def _strict_nonnegative_int(value: Any, field_name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(
+            f"content-integrity {field_name} must be a non-negative integer"
+        )
+    return value
+
+
+def _quality_issue_from_dict(payload: Any) -> QualityIssue:
+    values = _strict_object(
+        payload,
+        {"code", "message", "severity", "item_ref", "page_number"},
+        "content-integrity issue",
+    )
+    item_ref = values["item_ref"]
+    if item_ref is not None:
+        item_ref = _strict_nonempty_string(item_ref, "issue item_ref")
+    page_number = values["page_number"]
+    if page_number is not None:
+        page_number = _strict_nonnegative_int(page_number, "issue page_number")
+        if page_number == 0:
+            raise ValueError(
+                "content-integrity issue page_number must be greater than zero"
+            )
+    return QualityIssue(
+        code=_strict_nonempty_string(values["code"], "issue code"),
+        message=_strict_nonempty_string(values["message"], "issue message"),
+        severity=_strict_enum(
+            QualitySeverity,
+            values["severity"],
+            "content-integrity issue severity",
+        ),
+        item_ref=item_ref,
+        page_number=page_number,
+    )
+
+
+def _content_integrity_record_id(
+    *,
+    kind: ContentIntegrityKind,
+    status: ContentIntegrityStatus,
+    source_ref: str,
+    source_docling_item_ref: str | None,
+    declared_target_refs: tuple[str, ...],
+    resolved_docling_item_refs: tuple[str, ...],
+    unresolved_target_refs: tuple[str, ...],
+    reason_codes: tuple[str, ...],
+) -> str:
+    identity = {
+        "kind": kind.value,
+        "status": status.value,
+        "source_ref": source_ref,
+        "source_docling_item_ref": source_docling_item_ref,
+        "declared_target_refs": declared_target_refs,
+        "resolved_docling_item_refs": resolved_docling_item_refs,
+        "unresolved_target_refs": unresolved_target_refs,
+        "reason_codes": reason_codes,
+    }
+    return sha256_bytes(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
 def _make_integrity_record(
     *,
     kind: ContentIntegrityKind,
@@ -741,24 +1027,15 @@ def _make_integrity_record(
         if reason_codes
         else ContentIntegrityStatus.RESOLVED
     )
-    identity = {
-        "kind": kind.value,
-        "status": status.value,
-        "source_ref": source_ref,
-        "source_docling_item_ref": source_docling_item_ref,
-        "declared_target_refs": declared_target_refs,
-        "resolved_docling_item_refs": resolved_docling_item_refs,
-        "unresolved_target_refs": unresolved_target_refs,
-        "reason_codes": reason_codes,
-    }
-    record_id = sha256_bytes(
-        json.dumps(
-            identity,
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
+    record_id = _content_integrity_record_id(
+        kind=kind,
+        status=status,
+        source_ref=source_ref,
+        source_docling_item_ref=source_docling_item_ref,
+        declared_target_refs=declared_target_refs,
+        resolved_docling_item_refs=resolved_docling_item_refs,
+        unresolved_target_refs=unresolved_target_refs,
+        reason_codes=reason_codes,
     )
     return ContentIntegrityRecord(
         record_id=record_id,
@@ -1023,8 +1300,7 @@ def align_bioc_content_spans(
     serialized ``DoclingDocument`` content is never rewritten.
     """
 
-    candidates = _text_candidates(document)
-    used_items: set[str] = set()
+    candidates = _text_candidates_by_normalized_text(document)
     spans: list[ContentSpan] = []
     records: list[BioCLocatorAlignmentRecord] = []
     for locator_index, native in enumerate(locators):
@@ -1082,15 +1358,8 @@ def align_bioc_content_spans(
             )
             continue
 
-        best = next(
-            (
-                candidate
-                for candidate in candidates
-                if candidate.canonical_ref not in used_items
-                and candidate.normalized_text == _normalized(native.text)
-            ),
-            None,
-        )
+        matching_candidates = candidates.get(_normalized(native.text))
+        best = matching_candidates.popleft() if matching_candidates else None
         if best is None:
             records.append(
                 _bioc_alignment_record(
@@ -1105,7 +1374,6 @@ def align_bioc_content_spans(
 
         item_ref = best.item_ref
         item_text = best.text
-        used_items.add(best.canonical_ref)
         content_sha256 = sha256_bytes(item_text.encode("utf-8"))
         span = ContentSpan(
             span_id=_content_span_id(
@@ -1186,9 +1454,7 @@ def align_jats_content_spans(
 ) -> JatsContentSpanAlignment:
     """Return both evidence spans and an explicit outcome for every locator."""
 
-    candidates = _text_candidates(document)
-
-    used_items: set[str] = set()
+    candidates = _text_candidates_by_normalized_text(document)
     spans: list[ContentSpan] = []
     records: list[JatsLocatorAlignmentRecord] = []
     for locator_index, native in enumerate(locators):
@@ -1204,15 +1470,6 @@ def align_jats_content_spans(
                 )
             ).encode("utf-8")
         )
-        best: _TextCandidate | None = None
-        match_method: str | None = None
-        for candidate in candidates:
-            if candidate.canonical_ref in used_items:
-                continue
-            if candidate.normalized_text == normalized_native:
-                best = candidate
-                match_method = "normalized_exact"
-                break
         if native.xml_id is None and native.xpath is None:
             records.append(
                 JatsLocatorAlignmentRecord(
@@ -1226,6 +1483,8 @@ def align_jats_content_spans(
                 )
             )
             continue
+        matching_candidates = candidates.get(normalized_native)
+        best = matching_candidates.popleft() if matching_candidates else None
         if best is None:
             records.append(
                 JatsLocatorAlignmentRecord(
@@ -1239,7 +1498,6 @@ def align_jats_content_spans(
                 )
             )
             continue
-        used_items.add(best.canonical_ref)
         item_ref = best.item_ref
         item_text = best.text
         locator = JatsLocator(xml_id=native.xml_id, xpath=native.xpath)
@@ -1278,7 +1536,7 @@ def align_jats_content_spans(
                 status="aligned",
                 docling_item_ref=item_ref,
                 content_span_id=span.span_id,
-                match_method=match_method,
+                match_method="normalized_exact",
             )
         )
     return JatsContentSpanAlignment(tuple(spans), tuple(records))
@@ -1305,6 +1563,17 @@ def _text_candidates(document: dict[str, Any]) -> list[_TextCandidate]:
             )
         )
     return candidates
+
+
+def _text_candidates_by_normalized_text(
+    document: dict[str, Any],
+) -> dict[str, deque[_TextCandidate]]:
+    """Index candidates while retaining source order for duplicate text."""
+
+    indexed: defaultdict[str, deque[_TextCandidate]] = defaultdict(deque)
+    for candidate in _text_candidates(document):
+        indexed[candidate.normalized_text].append(candidate)
+    return dict(indexed)
 
 
 def probably_image_only(
@@ -1838,6 +2107,21 @@ def _reference_definition_issues(
     return tuple(issues)
 
 
+def validate_docling_reference_definitions(document: dict[str, Any]) -> None:
+    """Raise when any full-tree ``self_ref`` definition is ambiguous."""
+
+    issues = _reference_definition_issues(document)
+    if not issues:
+        return
+    issue = issues[0]
+    qualifier = (
+        "is ambiguous"
+        if issue.code == "DUPLICATE_DOCLING_SELF_REF"
+        else "collides with a different canonical item"
+    )
+    raise ValueError(f"Docling native reference {issue.item_ref!r} {qualifier}")
+
+
 def _validate_references(document: dict[str, Any]) -> tuple[int, tuple[str, ...]]:
     resolvable: set[str] = {"#"}
     malformed_index_refs: set[str] = set()
@@ -1846,6 +2130,7 @@ def _validate_references(document: dict[str, Any]) -> tuple[int, tuple[str, ...]
         "texts",
         "tables",
         "pictures",
+        "formulas",
         "key_value_items",
         "form_items",
         "field_regions",
@@ -1929,6 +2214,8 @@ __all__ = [
     "build_jats_content_spans",
     "build_pdf_content_spans",
     "docling_document_sha256",
+    "parse_content_integrity_report",
     "probably_image_only",
     "validate_content_integrity",
+    "validate_docling_reference_definitions",
 ]

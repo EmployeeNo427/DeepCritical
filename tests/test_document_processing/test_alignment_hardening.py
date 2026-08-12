@@ -8,6 +8,7 @@ from DeepResearch.src.document_processing.alignment import (
     AlignmentStatus,
     DoclingGrobidAligner,
     ScholarlyAlignmentOverlay,
+    verify_scholarly_alignment_overlay,
 )
 
 
@@ -99,6 +100,56 @@ def test_valid_coordinates_still_align_and_round_trip() -> None:
     assert overlay.aligned_count == 1
     assert overlay.records[0].reason is None
     assert ScholarlyAlignmentOverlay.from_dict(overlay.to_dict()) == overlay
+
+
+def test_alignment_replay_accepts_exact_native_inputs() -> None:
+    tei = b"""<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body>
+    <head>Methods</head>
+    </body></text></TEI>"""
+    overlay = DoclingGrobidAligner(minimum_score=0.72).align(_document(), tei)
+
+    assert (
+        verify_scholarly_alignment_overlay(
+            _document(),
+            tei,
+            overlay,
+            minimum_score=0.72,
+        )
+        is overlay
+    )
+
+
+def test_alignment_replay_rejects_stale_tei() -> None:
+    original_tei = b"""<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body>
+    <head>Methods</head>
+    </body></text></TEI>"""
+    stale_tei = b"""<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body>
+    <head>Different evidence</head>
+    </body></text></TEI>"""
+    stale_overlay = DoclingGrobidAligner().align(_document(), stale_tei)
+
+    with pytest.raises(ValueError, match="does not match"):
+        verify_scholarly_alignment_overlay(
+            _document(),
+            original_tei,
+            stale_overlay,
+            minimum_score=0.72,
+        )
+
+
+def test_alignment_replay_rejects_threshold_drift() -> None:
+    tei = b"""<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body>
+    <head>Methods appendix</head>
+    </body></text></TEI>"""
+    permissive = DoclingGrobidAligner(minimum_score=0.0).align(_document(), tei)
+
+    with pytest.raises(ValueError, match="does not match"):
+        verify_scholarly_alignment_overlay(
+            _document(),
+            tei,
+            permissive,
+            minimum_score=1.0,
+        )
 
 
 def test_foreign_namespace_elements_never_become_scholarly_evidence() -> None:

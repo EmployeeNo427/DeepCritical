@@ -362,7 +362,7 @@ def _persist_docling_run(
         stage_id="docling",
         component=ComponentDescriptor(
             component_id="docling",
-            component_version="2.113.0",
+            component_version="2.96.1",
             capability="document-conversion",
         ),
         configuration=configuration,
@@ -1371,7 +1371,7 @@ def test_generates_deterministic_observations_from_persisted_cas(
     assert observation["outcome"] == "complete"
     assert observation["parser"] == {
         "name": "docling",
-        "version": "2.113.0",
+        "version": "2.96.1",
         "configuration_hash": first["selection"]["pipeline_recipe_sha256"],
     }
     assert (
@@ -1644,7 +1644,7 @@ def test_generation_pins_composite_alignment_identity_and_repeat_hashes(
     ]
     assert observation["parser"] == {
         "name": "docling",
-        "version": "2.113.0",
+        "version": "2.96.1",
         "configuration_hash": payload["selection"]["pipeline_recipe_sha256"],
     }
     assert observation["content_hash"] == expected_content_hash
@@ -1811,7 +1811,7 @@ def test_composite_resolves_ocr_derivative_grobid_lineage(tmp_path: Path) -> Non
 
     assert observation["parser"] == {
         "name": "docling",
-        "version": "2.113.0",
+        "version": "2.96.1",
         "configuration_hash": payload["selection"]["pipeline_recipe_sha256"],
     }
     assert observation["elapsed_seconds"] == 12.0

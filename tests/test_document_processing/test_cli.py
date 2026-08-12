@@ -84,6 +84,7 @@ def test_default_config_maps_to_runtime_contract() -> None:
         "select-scholarly",
         "alignment",
         "integrity",
+        "canonicalize",
         "fallback-policy",
         "finalize",
     )
@@ -359,7 +360,7 @@ def test_result_payload_uses_component_generic_run_contract() -> None:
         stage_id="docling",
         component=ComponentDescriptor(
             component_id="docling",
-            component_version="2.113.0",
+            component_version="2.96.1",
             capability="document.parse",
         ),
         configuration=configuration,
@@ -386,7 +387,7 @@ def test_result_payload_uses_component_generic_run_contract() -> None:
 
     serialized_run = payload["processing_runs"][0]
     assert serialized_run["component_id"] == "docling"
-    assert serialized_run["component_version"] == "2.113.0"
+    assert serialized_run["component_version"] == "2.96.1"
     assert "parser" not in serialized_run
     assert "output_hashes" not in serialized_run
 

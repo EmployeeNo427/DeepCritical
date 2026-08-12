@@ -1,0 +1,23 @@
+<TEI xmlns="http://www.tei-c.org/ns/1.0">
+  <teiHeader>
+    <fileDesc>
+      <titleStmt><title>APOE4 pathway</title></titleStmt>
+      <publicationStmt><publisher>DeepCritical</publisher></publicationStmt>
+      <sourceDesc><bibl>Deterministic synthetic fixture.</bibl></sourceDesc>
+    </fileDesc>
+  </teiHeader>
+  <text>
+    <body>
+      <div>
+        <head>Methods</head>
+        <p>Endosomal pH was measured.</p>
+        <ref type="bibr" target="#b1">[1]</ref>
+      </div>
+    </body>
+    <back>
+      <listBibl>
+        <biblStruct xml:id="b1">Smith 2026 endosomal study.</biblStruct>
+      </listBibl>
+    </back>
+  </text>
+</TEI>
