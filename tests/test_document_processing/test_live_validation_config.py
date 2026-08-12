@@ -182,7 +182,10 @@ def test_hardening_pull_requests_run_every_isolated_live_job() -> None:
     compare_revision = workflow["on"]["workflow_dispatch"]["inputs"]["compare_revision"]
     assert compare_revision["required"] == "true"
     assert compare_revision["type"] == "string"
-    assert pull_request["branches"] == ["dev"]
+    assert pull_request["branches"] == [
+        "dev",
+        "fix/document-processing-hardening",
+    ]
     assert set(pull_request["paths"]) == {
         ".github/workflows/document-processing-live.yml",
         "DeepResearch/src/document_processing/**",
