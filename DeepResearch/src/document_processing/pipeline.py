@@ -315,6 +315,14 @@ class _PipelineContext:
     force_reprocess: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _ProcessingRunOwnership:
+    pipeline_run_id: str | None
+    stage_invocation_id: str | None
+    repetition_group_id: str | None
+    stage_id: str
+
+
 _PIPELINE_CONTEXT: ContextVar[_PipelineContext | None] = ContextVar(
     "document_processing_pipeline_context",
     default=None,
@@ -406,6 +414,9 @@ class DocumentProcessor:
             executor=stage_executor,
         )
         self.pipeline_spec = self.compiled_pipeline.spec
+        self._compiled_stage_ids = frozenset(
+            stage.spec.stage_id for stage in self.compiled_pipeline.stages
+        )
 
     def ingest_path(
         self,
@@ -2495,6 +2506,12 @@ class DocumentProcessor:
             raise ValueError(
                 "processing run output policy hash conflicts with processor policy"
             )
+        ownership = self._resolve_processing_run_ownership(
+            pipeline_run_id=run.pipeline_run_id,
+            stage_invocation_id=run.stage_invocation_id,
+            repetition_group_id=run.repetition_group_id,
+            stage_id=run.stage_id,
+        )
         manifest = ProcessingRunDiagnosticManifest(
             artifact_id=artifact.artifact_id,
             processing_run_id=run.run_id,
@@ -2510,42 +2527,13 @@ class DocumentProcessor:
             for diagnostic in diagnostics
         ):
             committed_status = ProcessingRunStatus.PARTIAL
-        pipeline_context = _PIPELINE_CONTEXT.get()
-        from .orchestration import _active_stage_context
-
-        stage_context = _active_stage_context()
-        active_stage_context = (
-            stage_context
-            if stage_context is not None
-            and pipeline_context is not None
-            and stage_context.pipeline_run_id == pipeline_context.pipeline_run_id
-            else None
-        )
-        active_stage_id = (
-            active_stage_context.stage_id
-            if active_stage_context is not None
-            else run.stage_id
-        )
-        active_stage_invocation_id = (
-            active_stage_context.stage_invocation_id
-            if active_stage_context is not None
-            else run.stage_invocation_id
-        )
         run_payload.update(
             {
                 "status": committed_status,
-                "stage_id": active_stage_id,
-                "stage_invocation_id": active_stage_invocation_id,
-                "pipeline_run_id": (
-                    pipeline_context.pipeline_run_id
-                    if pipeline_context is not None
-                    else run.pipeline_run_id
-                ),
-                "repetition_group_id": (
-                    pipeline_context.repetition_group_id
-                    if pipeline_context is not None
-                    else run.repetition_group_id
-                ),
+                "stage_id": ownership.stage_id,
+                "stage_invocation_id": ownership.stage_invocation_id,
+                "pipeline_run_id": ownership.pipeline_run_id,
+                "repetition_group_id": ownership.repetition_group_id,
                 "output_policy_snapshot": output_policy_snapshot,
                 "output_policy_sha256": output_policy_sha256,
                 "resource_usage": run.resource_usage.model_copy(
@@ -2568,6 +2556,83 @@ class DocumentProcessor:
         self.store.save_processing_run(committed_run)
         self._reconcile_run_diagnostics(artifact, committed_run)
         return committed_run
+
+    def _resolve_processing_run_ownership(
+        self,
+        *,
+        pipeline_run_id: str | None,
+        stage_invocation_id: str | None,
+        repetition_group_id: str | None,
+        stage_id: str,
+    ) -> _ProcessingRunOwnership:
+        """Bind a durable run to one coherent document-pipeline invocation."""
+
+        from .orchestration import _active_stage_context
+
+        pipeline_context = _PIPELINE_CONTEXT.get()
+        stage_context = _active_stage_context()
+        if stage_context is not None:
+            if pipeline_context is None:
+                raise RuntimeError(
+                    "active stage context has no document-pipeline ownership"
+                )
+            if (
+                stage_context.pipeline_id != self.pipeline_spec.pipeline_id
+                or stage_context.pipeline_version != self.pipeline_spec.pipeline_version
+                or stage_context.stage_id not in self._compiled_stage_ids
+            ):
+                raise RuntimeError(
+                    "active stage context does not belong to this document pipeline"
+                )
+            if stage_context.pipeline_run_id != pipeline_context.pipeline_run_id:
+                raise RuntimeError(
+                    "active stage and document-pipeline run ownership disagree"
+                )
+
+        resolved_pipeline_run_id = pipeline_run_id
+        resolved_repetition_group_id = repetition_group_id
+        if pipeline_context is not None:
+            if (
+                pipeline_run_id is not None
+                and pipeline_run_id != pipeline_context.pipeline_run_id
+            ):
+                raise ValueError(
+                    "processing run pipeline_run_id conflicts with active ownership"
+                )
+            if (
+                repetition_group_id is not None
+                and repetition_group_id != pipeline_context.repetition_group_id
+            ):
+                raise ValueError(
+                    "processing run repetition_group_id conflicts with active ownership"
+                )
+            resolved_pipeline_run_id = pipeline_context.pipeline_run_id
+            resolved_repetition_group_id = pipeline_context.repetition_group_id
+
+        resolved_stage_id = stage_id
+        resolved_stage_invocation_id = stage_invocation_id
+        if stage_context is not None:
+            if (
+                stage_invocation_id is not None
+                and stage_invocation_id != stage_context.stage_invocation_id
+            ):
+                raise ValueError(
+                    "processing run stage_invocation_id conflicts with active ownership"
+                )
+            resolved_stage_id = stage_context.stage_id
+            resolved_stage_invocation_id = stage_context.stage_invocation_id
+
+        if (
+            resolved_stage_invocation_id is not None
+            and resolved_pipeline_run_id is None
+        ):
+            raise ValueError("stage_invocation_id requires pipeline_run_id")
+        return _ProcessingRunOwnership(
+            pipeline_run_id=resolved_pipeline_run_id,
+            stage_invocation_id=resolved_stage_invocation_id,
+            repetition_group_id=resolved_repetition_group_id,
+            stage_id=resolved_stage_id,
+        )
 
     def _output_policy_snapshot(self) -> dict[str, Any]:
         """Return the complete, canonical static policy for this processor.
@@ -2749,6 +2814,7 @@ class DocumentProcessor:
         error: Exception,
         component_descriptor: ComponentDescriptor | None = None,
         stage_id: str | None = None,
+        pipeline_run_id: str | None = None,
         stage_invocation_id: str | None = None,
         container_image: str | None = None,
         container_digest: OciDigest | None = None,
@@ -2759,26 +2825,21 @@ class DocumentProcessor:
         run_id: str | None = None,
         inputs: tuple[DataProductRef, ...] = (),
     ) -> ProcessingRun:
-        from .orchestration import _active_stage_context
-
-        active_stage = _active_stage_context()
-        resolved_stage_id = (
-            (active_stage.stage_id if active_stage is not None else None)
-            or stage_id
-            or component_id
-        )
-        resolved_stage_invocation_id = (
-            active_stage.stage_invocation_id
-            if active_stage is not None
-            else stage_invocation_id
+        ownership = self._resolve_processing_run_ownership(
+            pipeline_run_id=pipeline_run_id,
+            stage_invocation_id=stage_invocation_id,
+            repetition_group_id=None,
+            stage_id=stage_id or component_id,
         )
         memory_measurement = getattr(error, "memory_measurement", None)
         resolved_run_id = run_id or _run_id()
         run = ProcessingRun(
             run_id=resolved_run_id,
             artifact_id=artifact.artifact_id,
-            stage_id=resolved_stage_id,
-            stage_invocation_id=resolved_stage_invocation_id,
+            pipeline_run_id=ownership.pipeline_run_id,
+            stage_invocation_id=ownership.stage_invocation_id,
+            repetition_group_id=ownership.repetition_group_id,
+            stage_id=ownership.stage_id,
             component=component_descriptor
             or _component_descriptor(component_id, component_version),
             runtime_identity_required=runtime_identity_required,
@@ -2814,7 +2875,7 @@ class DocumentProcessor:
             artifact,
             run.run_id,
             severity=DiagnosticSeverity.FATAL,
-            stage=resolved_stage_id,
+            stage=ownership.stage_id,
             code=code,
             message=str(error) or error.__class__.__name__,
             details={
@@ -2824,7 +2885,7 @@ class DocumentProcessor:
             },
         )
         memory_diagnostic = self._memory_measurement_diagnostic(
-            artifact, run, memory_measurement, stage=resolved_stage_id
+            artifact, run, memory_measurement, stage=ownership.stage_id
         )
         return self._commit_processing_run(
             artifact,

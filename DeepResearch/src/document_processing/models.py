@@ -36,6 +36,9 @@ OciDigest = Annotated[
 ]
 DoclingInputFormat = Literal["html", "docx", "pptx", "xlsx", "image"]
 
+PROCESSING_RUN_SCHEMA_V1 = "deepcritical-processing-run-v1"
+PROCESSING_RUN_SCHEMA_V2 = "deepcritical-processing-run-v2"
+
 
 def utc_now() -> datetime:
     """Return a timezone-aware timestamp normalized to UTC."""
@@ -577,9 +580,7 @@ class RuntimeAttestation(FrozenModel):
 class ProcessingRun(FrozenModel):
     """Reproducible record of one component invocation on one artifact."""
 
-    schema_version: Literal["deepcritical-processing-run-v1"] = (
-        "deepcritical-processing-run-v1"
-    )
+    schema_version: Literal["deepcritical-processing-run-v2"] = PROCESSING_RUN_SCHEMA_V2
     run_id: str
     artifact_id: str
     pipeline_run_id: str | None = None
@@ -762,6 +763,8 @@ class ProcessingRun(FrozenModel):
                 raise ValueError("model_hashes must come from runtime attestation")
         if self.repetition_group_id is not None and self.pipeline_run_id is None:
             raise ValueError("repetition_group_id requires pipeline_run_id")
+        if self.stage_invocation_id is not None and self.pipeline_run_id is None:
+            raise ValueError("stage_invocation_id requires pipeline_run_id")
         if (
             self.runtime_identity_required
             and self.status is ProcessingRunStatus.COMPLETE

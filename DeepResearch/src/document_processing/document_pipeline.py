@@ -246,6 +246,7 @@ class DocumentProcessingFailureRecorder:
             component_version=failure.component.component_version,
             component_descriptor=failure.component,
             stage_id=failure.stage_id,
+            pipeline_run_id=failure.pipeline_run_id,
             stage_invocation_id=failure.stage_invocation_id,
             configuration=configuration,
             started_at=failure.started_at,

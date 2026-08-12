@@ -228,11 +228,117 @@ def test_legacy_processing_run_without_stage_invocation_id_remains_idempotent(
 
     record_path = store.save_processing_run(run)
     payload = json.loads(record_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = "deepcritical-processing-run-v1"
+    record_path.write_text(json.dumps(payload), encoding="utf-8")
     restored = store.get_processing_run(run.run_id)
 
     assert "stage_invocation_id" not in payload
+    assert restored.schema_version == "deepcritical-processing-run-v2"
     assert restored.stage_invocation_id is None
     assert store.save_processing_run(restored) == record_path
+
+
+def test_transitional_v1_processing_run_with_paired_invocation_ids_migrates(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "transitional-v1-invocation")
+    run = make_run(
+        store,
+        artifact.artifact_id,
+        "run-transitional-v1-invocation",
+        ProcessingRunStatus.FAILED,
+    ).model_copy(
+        update={
+            "pipeline_run_id": "pipeline-transitional-v1",
+            "stage_invocation_id": "stage-invocation-transitional-v1",
+        }
+    )
+    record_path = store.save_processing_run(run)
+    payload = json.loads(record_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = "deepcritical-processing-run-v1"
+    record_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    restored = store.get_processing_run(run.run_id)
+
+    assert restored == run
+    assert restored.schema_version == "deepcritical-processing-run-v2"
+    assert store.save_processing_run(restored) == record_path
+
+
+def test_transitional_v1_processing_run_rejects_orphan_invocation_identity(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "transitional-v1-orphan")
+    run = make_run(
+        store,
+        artifact.artifact_id,
+        "run-transitional-v1-orphan",
+        ProcessingRunStatus.FAILED,
+    )
+    record_path = store.save_processing_run(run)
+    payload = json.loads(record_path.read_text(encoding="utf-8"))
+    payload.update(
+        {
+            "schema_version": "deepcritical-processing-run-v1",
+            "stage_invocation_id": "stage-invocation-orphan",
+        }
+    )
+    record_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CorruptRecordError, match="invalid record"):
+        store.get_processing_run(run.run_id)
+
+
+def test_unknown_processing_run_schema_is_rejected_before_validation(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "unknown-processing-run-schema")
+    run = make_run(
+        store,
+        artifact.artifact_id,
+        "run-unknown-processing-run-schema",
+        ProcessingRunStatus.FAILED,
+    )
+    record_path = store.save_processing_run(run)
+    payload = json.loads(record_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = "deepcritical-processing-run-v99"
+    record_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(UnsupportedSchemaVersionError, match="v99"):
+        store.get_processing_run(run.run_id)
+
+
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_concurrent_v1_processing_run_publish_is_compared_after_migration(
+    store: ContentAddressedStore,
+    monkeypatch: pytest.MonkeyPatch,
+    conflicting: bool,
+) -> None:
+    artifact = save_artifact(store, f"concurrent-v1-{conflicting}")
+    run = make_run(
+        store,
+        artifact.artifact_id,
+        f"run-concurrent-v1-{conflicting}",
+        ProcessingRunStatus.FAILED,
+    )
+
+    def publish_v1_then_report_race(source: Path, destination: Path) -> None:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        payload["schema_version"] = "deepcritical-processing-run-v1"
+        if conflicting:
+            payload["status"] = ProcessingRunStatus.PARTIAL.value
+        destination.write_text(json.dumps(payload), encoding="utf-8")
+        raise FileExistsError
+
+    monkeypatch.setattr(store, "_publish_no_replace", publish_v1_then_report_race)
+
+    if conflicting:
+        with pytest.raises(RecordConflictError, match="concurrent conflicting"):
+            store.save_processing_run(run)
+    else:
+        record_path = store.save_processing_run(run)
+        assert store.get_processing_run(run.run_id) == run
+        assert record_path.is_file()
 
 
 def test_record_loading_dispatches_schema_versions_before_validation(

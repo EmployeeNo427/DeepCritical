@@ -83,6 +83,21 @@ observer path and is re-raised without being converted into a failure record.
 A custom executor may change execution mechanics, but the document orchestrator
 retains this recorder ownership.
 
+Every run persisted during a compiled stage is bound to the active document
+workflow and graph-stage invocation by one shared ownership resolver. Success
+and failure commits therefore apply the same pipeline-run, stage-invocation,
+stage, and repetition-group checks. A `stage_invocation_id` without its owning
+`pipeline_run_id` is invalid.
+
+Invocation-bearing records use `deepcritical-processing-run-v2`. The store
+loads both original v1 records (which have no invocation ID) and the temporary
+fork shape that paired pipeline and invocation IDs under the v1 tag, then
+validates them through the v2 model in memory. Existing bytes remain immutable;
+new writes use v2. An orphan invocation in either version is corrupt. Older
+workers that understand only v1 cannot read v2 records, so rollback and
+mixed-version operation require upgrading readers first; write-downgrade is
+deliberately unsupported because it would erase the ownership invariant.
+
 ## Consequences
 
 New local components can be added without giving YAML import authority, and a

@@ -27,6 +27,7 @@ from DeepResearch.src.document_processing.document_pipeline import (
 from DeepResearch.src.document_processing.models import (
     ArtifactRelationship,
     ComponentDescriptor,
+    DiagnosticSeverity,
     DocumentArtifact,
     MemoryMeasurement,
     MemoryMeasurementScope,
@@ -40,6 +41,7 @@ from DeepResearch.src.document_processing.models import (
     utc_now,
 )
 from DeepResearch.src.document_processing.orchestration import (
+    _ACTIVE_STAGE_CONTEXT,
     CompiledStage,
     LocalStageExecutor,
     StageContext,
@@ -48,11 +50,13 @@ from DeepResearch.src.document_processing.orchestration import (
     _active_stage_context,
 )
 from DeepResearch.src.document_processing.pipeline import (
+    _PIPELINE_CONTEXT,
     ArtifactMetadataConflictError,
     DocumentProcessingConfig,
     DocumentProcessor,
     ProcessingRunCommitIncompleteError,
     SourcePreflightError,
+    _PipelineContext,
 )
 from DeepResearch.src.document_processing.storage import ContentAddressedStore
 
@@ -743,6 +747,313 @@ async def test_unexpected_stage_failure_persists_one_failed_run(
     )
     assert diagnostic.stage == "route"
     assert docling.calls == 0
+
+
+def test_failed_run_rejects_orphan_active_stage_context(tmp_path) -> None:
+    processor = DocumentProcessor(
+        ContentAddressedStore(tmp_path / "store"),
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    artifact = processor.ingest_bytes(
+        b"<html><body>orphan context</body></html>",
+        acquisition_uri="https://example.test/orphan-context.html",
+        media_type="text/html",
+        identifiers={"filename": "orphan-context.html"},
+    )
+    now = utc_now()
+    stage = StageContext(
+        pipeline_id=processor.pipeline_spec.pipeline_id,
+        pipeline_version=processor.pipeline_spec.pipeline_version,
+        pipeline_run_id="pipeline-orphan",
+        stage_invocation_id="stage-invocation-orphan",
+        stage_id="route",
+        inputs={},
+        prior_results={},
+    )
+    token = _ACTIVE_STAGE_CONTEXT.set(stage)
+    try:
+        with pytest.raises(RuntimeError, match="no document-pipeline ownership"):
+            processor._save_failed_run(
+                artifact,
+                component_id="document-router",
+                component_version="1",
+                configuration={},
+                started_at=now,
+                started_clock=time.perf_counter(),
+                error=RuntimeError("orphan stage failure"),
+            )
+    finally:
+        _ACTIVE_STAGE_CONTEXT.reset(token)
+
+    assert processor.store.list_processing_runs() == ()
+
+
+def test_success_and_failure_commits_share_stage_ownership_checks(tmp_path) -> None:
+    processor = DocumentProcessor(
+        ContentAddressedStore(tmp_path / "store"),
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    artifact = processor.ingest_bytes(
+        b"<html><body>ownership mismatch</body></html>",
+        acquisition_uri="https://example.test/ownership-mismatch.html",
+        media_type="text/html",
+        identifiers={"filename": "ownership-mismatch.html"},
+    )
+    now = utc_now()
+    run = ProcessingRun(
+        run_id="run-ownership-mismatch",
+        artifact_id=artifact.artifact_id,
+        stage_id="document-router",
+        component=ComponentDescriptor(
+            component_id="document-router",
+            component_version="1",
+            capability="document-routing",
+        ),
+        configuration={},
+        configuration_sha256=configuration_sha256({}),
+        started_at=now,
+        finished_at=now,
+        status=ProcessingRunStatus.COMPLETE,
+    )
+    blob_paths_before = tuple(
+        sorted(
+            path.relative_to(processor.store.root)
+            for path in (processor.store.root / "blobs").rglob("*")
+            if path.is_file()
+        )
+    )
+    pipeline_token = _PIPELINE_CONTEXT.set(
+        _PipelineContext(
+            pipeline_run_id="pipeline-owner",
+            repetition_group_id=None,
+            pipeline_attempt_id=None,
+            force_reprocess=False,
+        )
+    )
+    stage_token = _ACTIVE_STAGE_CONTEXT.set(
+        StageContext(
+            pipeline_id=processor.pipeline_spec.pipeline_id,
+            pipeline_version=processor.pipeline_spec.pipeline_version,
+            pipeline_run_id="pipeline-foreign",
+            stage_invocation_id="stage-invocation-foreign",
+            stage_id="route",
+            inputs={},
+            prior_results={},
+        )
+    )
+    try:
+        with pytest.raises(RuntimeError, match="run ownership disagree"):
+            processor._commit_processing_run(artifact, run)
+        with pytest.raises(RuntimeError, match="run ownership disagree"):
+            processor._save_failed_run(
+                artifact,
+                component_id="document-router",
+                component_version="1",
+                configuration={},
+                started_at=now,
+                started_clock=time.perf_counter(),
+                error=RuntimeError("ownership mismatch"),
+            )
+    finally:
+        _ACTIVE_STAGE_CONTEXT.reset(stage_token)
+        _PIPELINE_CONTEXT.reset(pipeline_token)
+
+    assert processor.store.list_processing_runs() == ()
+    assert (
+        tuple(
+            sorted(
+                path.relative_to(processor.store.root)
+                for path in (processor.store.root / "blobs").rglob("*")
+                if path.is_file()
+            )
+        )
+        == blob_paths_before
+    )
+
+
+def test_commit_downgrades_complete_run_with_unavailable_memory_evidence(
+    tmp_path,
+) -> None:
+    processor = DocumentProcessor(
+        ContentAddressedStore(tmp_path / "store"),
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    artifact = processor.ingest_bytes(
+        b"<html><body>memory evidence</body></html>",
+        acquisition_uri="https://example.test/memory-evidence.html",
+        media_type="text/html",
+        identifiers={"filename": "memory-evidence.html"},
+    )
+    now = utc_now()
+    run = ProcessingRun(
+        run_id="run-memory-evidence",
+        artifact_id=artifact.artifact_id,
+        stage_id="docling",
+        component=ComponentDescriptor(
+            component_id="docling",
+            component_version="2.113.0",
+            capability="document-conversion",
+        ),
+        configuration={},
+        configuration_sha256=configuration_sha256({}),
+        started_at=now,
+        finished_at=now,
+        status=ProcessingRunStatus.COMPLETE,
+    )
+    diagnostic = processor._build_diagnostic(
+        artifact,
+        run.run_id,
+        severity=DiagnosticSeverity.WARNING,
+        stage="resource_measurement",
+        code="MEMORY_MEASUREMENT_UNAVAILABLE",
+        message="Memory evidence was unavailable.",
+    )
+
+    committed = processor._commit_processing_run(artifact, run, (diagnostic,))
+
+    assert committed.status is ProcessingRunStatus.PARTIAL
+
+
+@pytest.mark.parametrize(
+    ("stage_overrides", "message"),
+    [
+        ({"pipeline_id": "foreign-pipeline"}, "does not belong"),
+        ({"pipeline_version": "foreign-version"}, "does not belong"),
+        ({"stage_id": "foreign-stage"}, "does not belong"),
+    ],
+)
+def test_run_ownership_rejects_foreign_stage_context(
+    tmp_path,
+    stage_overrides: dict[str, str],
+    message: str,
+) -> None:
+    processor = DocumentProcessor(
+        ContentAddressedStore(tmp_path / "store"),
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    stage_values = {
+        "pipeline_id": processor.pipeline_spec.pipeline_id,
+        "pipeline_version": processor.pipeline_spec.pipeline_version,
+        "pipeline_run_id": "pipeline-owner",
+        "stage_invocation_id": "stage-invocation-owner",
+        "stage_id": "route",
+    }
+    stage_values.update(stage_overrides)
+    pipeline_token = _PIPELINE_CONTEXT.set(
+        _PipelineContext(
+            pipeline_run_id="pipeline-owner",
+            repetition_group_id=None,
+            pipeline_attempt_id=None,
+            force_reprocess=False,
+        )
+    )
+    stage_token = _ACTIVE_STAGE_CONTEXT.set(
+        StageContext(inputs={}, prior_results={}, **stage_values)
+    )
+    try:
+        with pytest.raises(RuntimeError, match=message):
+            processor._resolve_processing_run_ownership(
+                pipeline_run_id=None,
+                stage_invocation_id=None,
+                repetition_group_id=None,
+                stage_id="document-router",
+            )
+    finally:
+        _ACTIVE_STAGE_CONTEXT.reset(stage_token)
+        _PIPELINE_CONTEXT.reset(pipeline_token)
+
+
+@pytest.mark.parametrize(
+    ("supplied", "message"),
+    [
+        (
+            {"pipeline_run_id": "pipeline-foreign"},
+            "pipeline_run_id conflicts",
+        ),
+        (
+            {"repetition_group_id": "repetition-foreign"},
+            "repetition_group_id conflicts",
+        ),
+        (
+            {"stage_invocation_id": "stage-invocation-foreign"},
+            "stage_invocation_id conflicts",
+        ),
+    ],
+)
+def test_run_ownership_rejects_supplied_identity_conflicts(
+    tmp_path,
+    supplied: dict[str, str],
+    message: str,
+) -> None:
+    processor = DocumentProcessor(
+        ContentAddressedStore(tmp_path / "store"),
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+    pipeline_token = _PIPELINE_CONTEXT.set(
+        _PipelineContext(
+            pipeline_run_id="pipeline-owner",
+            repetition_group_id="repetition-owner",
+            pipeline_attempt_id="attempt-owner",
+            force_reprocess=True,
+        )
+    )
+    stage_token = _ACTIVE_STAGE_CONTEXT.set(
+        StageContext(
+            pipeline_id=processor.pipeline_spec.pipeline_id,
+            pipeline_version=processor.pipeline_spec.pipeline_version,
+            pipeline_run_id="pipeline-owner",
+            stage_invocation_id="stage-invocation-owner",
+            stage_id="route",
+            inputs={},
+            prior_results={},
+        )
+    )
+    arguments: dict[str, str | None] = {
+        "pipeline_run_id": "pipeline-owner",
+        "stage_invocation_id": "stage-invocation-owner",
+        "repetition_group_id": "repetition-owner",
+        "stage_id": "document-router",
+    }
+    arguments.update(supplied)
+    try:
+        with pytest.raises(ValueError, match=message):
+            processor._resolve_processing_run_ownership(**arguments)
+    finally:
+        _ACTIVE_STAGE_CONTEXT.reset(stage_token)
+        _PIPELINE_CONTEXT.reset(pipeline_token)
+
+
+def test_run_ownership_rejects_standalone_orphan_invocation(tmp_path) -> None:
+    processor = DocumentProcessor(
+        ContentAddressedStore(tmp_path / "store"),
+        docling=FakeDocling(),
+        grobid=FakeGrobid(),
+        ocrmypdf=FakeOCR(),
+        config=_config(),
+    )
+
+    with pytest.raises(ValueError, match="stage_invocation_id requires"):
+        processor._resolve_processing_run_ownership(
+            pipeline_run_id=None,
+            stage_invocation_id="stage-invocation-orphan",
+            repetition_group_id=None,
+            stage_id="route",
+        )
 
 
 @pytest.mark.asyncio
