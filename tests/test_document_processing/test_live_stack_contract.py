@@ -1336,8 +1336,21 @@ async def test_live_all_real_pipeline_captures_native_outputs(
     canonical_product = canonical_run.require_output("canonical_document_view")
     canonical_view = store.read_canonical_document(canonical_product)
     assert canonical_run.stage_id == "canonicalize"
+    unowned_runs = tuple(
+        run for run in result.processing_runs if run.pipeline_run_id is None
+    )
+    assert len(unowned_runs) == 1
+    intake_preflight = unowned_runs[0]
+    assert intake_preflight.component_id == "document-preflight"
+    assert intake_preflight.stage_id == "document-preflight"
+    assert intake_preflight.stage_invocation_id is None
+
+    pipeline_runs = tuple(
+        run for run in result.processing_runs if run.pipeline_run_id is not None
+    )
+    assert pipeline_runs
     stage_invocations: dict[str, str] = {}
-    for run in result.processing_runs:
+    for run in pipeline_runs:
         invocation_id = run.stage_invocation_id
         assert invocation_id is not None
         assert invocation_id.startswith("stage-invocation-")
@@ -1345,9 +1358,11 @@ async def test_live_all_real_pipeline_captures_native_outputs(
             invocation_id
         )
     assert len(set(stage_invocations.values())) == len(stage_invocations)
-    pipeline_run_ids = {run.pipeline_run_id for run in result.processing_runs}
-    assert None not in pipeline_run_ids
+    pipeline_run_ids = {run.pipeline_run_id for run in pipeline_runs}
     assert len(pipeline_run_ids) == 1
+    pipeline_run_id = next(iter(pipeline_run_ids))
+    assert pipeline_run_id is not None
+    assert pipeline_run_id.startswith("workflow-")
     assert canonical_view.artifact_id == artifact.artifact_id
     assert canonical_view.blocks
     assert fallback_grobid.require_output("grobid_tei") in (
