@@ -9,6 +9,7 @@ from DeepResearch.src.document_processing.validation import (
     ContentIntegrityKind,
     ContentIntegrityStatus,
     QualitySeverity,
+    parse_content_integrity_report,
     probably_image_only,
     validate_content_integrity,
 )
@@ -108,6 +109,134 @@ def test_integrity_overlay_resolves_tables_figures_and_citations() -> None:
 
     repeated = validate_content_integrity(document, scholarly_overlay=overlay)
     assert repeated.to_dict() == report.to_dict()
+    assert parse_content_integrity_report(report.to_dict()) == report
+
+
+def test_persisted_integrity_report_requires_exact_identity_replay() -> None:
+    report = validate_content_integrity(_docling_document()).to_dict()
+    wrong_id = deepcopy(report)
+    wrong_id["records"][0]["record_id"] = "0" * 64
+    with pytest.raises(ValueError, match="record_id"):
+        parse_content_integrity_report(wrong_id)
+
+    unknown = deepcopy(report)
+    unknown["records"][0]["kind"] = "unknown"
+    with pytest.raises(ValueError, match="kind is unknown"):
+        parse_content_integrity_report(unknown)
+
+    duplicate_refs = deepcopy(report)
+    duplicate_refs["records"][0]["declared_target_refs"] = [
+        "#/texts/1",
+        "#/texts/1",
+    ]
+    with pytest.raises(ValueError, match="values must be unique"):
+        parse_content_integrity_report(duplicate_refs)
+
+    extra = deepcopy(report)
+    extra["unexpected"] = True
+    with pytest.raises(ValueError, match="fields do not match v1"):
+        parse_content_integrity_report(extra)
+
+    non_string_field = deepcopy(report)
+    non_string_field[1] = "not a JSON object key"
+    with pytest.raises(ValueError, match="fields must be strings"):
+        parse_content_integrity_report(non_string_field)
+
+    resolved_with_unresolved_target = deepcopy(report)
+    resolved_with_unresolved_target["records"][0]["unresolved_target_refs"] = [
+        "#/texts/404"
+    ]
+    with pytest.raises(ValueError, match="cannot retain unresolved targets"):
+        parse_content_integrity_report(resolved_with_unresolved_target)
+
+
+def test_persisted_integrity_report_rejects_every_untyped_container() -> None:
+    base = validate_content_integrity(_docling_document()).to_dict()
+
+    with pytest.raises(ValueError, match="must be an object"):
+        parse_content_integrity_report(None)
+
+    malformed = deepcopy(base)
+    malformed["scholarly_overlay_present"] = 1
+    with pytest.raises(ValueError, match="must be a boolean"):
+        parse_content_integrity_report(malformed)
+
+    malformed = deepcopy(base)
+    malformed["records"] = {}
+    with pytest.raises(ValueError, match="records must be a list"):
+        parse_content_integrity_report(malformed)
+
+    malformed = deepcopy(base)
+    malformed["records"].append(deepcopy(malformed["records"][0]))
+    with pytest.raises(ValueError, match="record IDs must be unique"):
+        parse_content_integrity_report(malformed)
+
+    malformed = deepcopy(base)
+    malformed["issues"] = {}
+    with pytest.raises(ValueError, match="issues must be a list"):
+        parse_content_integrity_report(malformed)
+
+    malformed = deepcopy(base)
+    malformed["resolved_count"] = -1
+    with pytest.raises(ValueError, match="non-negative integer"):
+        parse_content_integrity_report(malformed)
+
+    malformed = deepcopy(base)
+    malformed["unaligned_count"] += 1
+    with pytest.raises(ValueError, match="unaligned_count does not match"):
+        parse_content_integrity_report(malformed)
+
+
+def test_persisted_integrity_record_and_issue_scalars_are_strict() -> None:
+    base = validate_content_integrity(_docling_document()).to_dict()
+
+    malformed = deepcopy(base)
+    malformed["records"][0]["source_ref"] = ""
+    with pytest.raises(ValueError, match="non-empty string"):
+        parse_content_integrity_report(malformed)
+
+    malformed = deepcopy(base)
+    malformed["records"][0]["record_id"] = "not-a-sha"
+    with pytest.raises(ValueError, match="SHA-256"):
+        parse_content_integrity_report(malformed)
+
+    malformed = deepcopy(base)
+    malformed["records"][0]["status"] = 1
+    with pytest.raises(ValueError, match="status must be a string"):
+        parse_content_integrity_report(malformed)
+
+    malformed = deepcopy(base)
+    malformed["records"][0]["reason_codes"] = "not-a-list"
+    with pytest.raises(ValueError, match="reason_codes must be a list"):
+        parse_content_integrity_report(malformed)
+
+    valid_issue = deepcopy(base)
+    valid_issue["issues"] = [
+        {
+            "code": "PINNED_ISSUE",
+            "message": "Pinned issue",
+            "severity": "warning",
+            "item_ref": None,
+            "page_number": 1,
+        }
+    ]
+    assert parse_content_integrity_report(valid_issue).issues[0].page_number == 1
+
+    for field, value, match in (
+        ("item_ref", "", "non-empty string"),
+        ("page_number", 0, "greater than zero"),
+        ("severity", 1, "severity must be a string"),
+    ):
+        malformed = deepcopy(valid_issue)
+        malformed["issues"][0][field] = value
+        with pytest.raises(ValueError, match=match):
+            parse_content_integrity_report(malformed)
+
+    invalid_document = _docling_document()
+    invalid_document["tables"] = [42]
+    source_missing = validate_content_integrity(invalid_document).to_dict()
+    assert source_missing["records"][0]["source_docling_item_ref"] is None
+    assert parse_content_integrity_report(source_missing).records[0].source_ref
 
 
 def test_integrity_overlay_explicitly_records_every_unaligned_relationship() -> None:

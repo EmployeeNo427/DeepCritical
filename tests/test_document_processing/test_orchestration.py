@@ -1051,6 +1051,61 @@ def test_all_and_any_presence_proofs_are_conservative() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "input_identity",
+    [
+        {},
+        {"": "artifact-123"},
+        {"document": ""},
+        {1: "artifact-123"},
+        {"document": 1},
+    ],
+)
+async def test_failure_observer_requires_nonempty_string_identity(
+    input_identity: dict[object, object],
+) -> None:
+    async def passthrough(context: StageContext, _: BaseModel) -> StageResult:
+        return StageResult(
+            status=StageExecutionStatus.COMPLETE,
+            outputs={"text": context.require_input("text", str)},
+        )
+
+    registry = ComponentRegistry()
+    registry.register(
+        _registration(
+            "pass",
+            input_ports={"text": TEXT},
+            output_ports={"text": TEXT},
+            handler=passthrough,
+        )
+    )
+    pipeline = PipelineCompiler(registry).compile(
+        _pipeline(
+            components=(
+                ComponentInstanceSpec(instance_id="pass", component_id="pass"),
+            ),
+            stages=(
+                StageSpec(
+                    stage_id="pass",
+                    component="pass",
+                    inputs={"text": PipelineInputRef(input_name="text")},
+                    outputs=("text",),
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(PipelineExecutionError, match="input_identity"):
+        await PipelineOrchestrator(
+            failure_observer=_RecordingFailureObserver()
+        ).execute(
+            pipeline,
+            {"text": "input"},
+            input_identity=input_identity,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
 async def test_optional_registered_output_requires_and_honors_presence_guard() -> None:
     async def maybe(_: StageContext, __: BaseModel) -> StageResult:
         return StageResult(status=StageExecutionStatus.COMPLETE)

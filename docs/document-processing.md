@@ -66,7 +66,13 @@ count as observed runtime identity.
 8. Persist a second integrity overlay with one outcome for every Docling table
    and figure and every GROBID bibliographic citation. Caption/citation targets
    must resolve to existing Docling items or remain explicitly unaligned.
-9. Treat every supplement as its own artifact, linked to its parent and routed
+9. Build and persist a versioned project-owned `CanonicalDocumentView` from the
+   immutable native products, spans, alignment, and integrity report. The stage
+   re-reads every input from content-addressed storage, verifies the complete
+   `DataProductRef` and producer declaration, and records that exact input tuple
+   as `source_products`. Every canonical block retains exact native anchors;
+   mapping gaps remain explicit diagnostics.
+10. Treat every supplement as its own artifact, linked to its parent and routed
    according to its detected media type.
 
 Every transformation creates a new `ProcessingRun`. `complete`, `partial`,
@@ -78,16 +84,110 @@ Docling output is an immutable native product, not DeepCritical's permanent
 canonical representation. Every evidence span uses a `RepresentationAnchor`
 that identifies the exact representation product, native node, and character
 range. The project-owned `CanonicalDocumentView` described in
-[ADR 0001](adr/0001-project-owned-canonical-document-view.md) will be introduced
-separately through native-output adapters.
+[ADR 0001](adr/0001-project-owned-canonical-document-view.md) is a separate
+immutable `canonical_document_view` product derived by a deterministic native
+adapter.
+
+Canonical schema v1 preserves document order and reconciles parent and child
+declarations across all native node collections. Conflicts, cycles, and missing
+nodes become stable diagnostics rather than silently flattening the hierarchy.
+Normalized tables use Docling's structured `table_cells` as the authoritative
+source when present and retain cell coordinates, row and column spans, header
+and section flags, fillable state, and rich-cell references; the scalar grid is
+only a compatibility fallback. Stable content-derived block IDs, source-level
+metadata, and explicit caption/citation relationships complete the structure.
+
+Schema v1 bounds each canonical table to 100,000 cells and each row/column
+axis to 1,000,000 positions. Cell-overlap validation uses half-open rectangle
+extents and a bounded sweep rather than materializing every covered grid
+coordinate, so a large valid span cannot cause memory use proportional to its
+area. Exceeding a fixed bound, conflicting cells, or overlapping extents
+rejects canonicalization. Cell-count, axis, coordinate, span, and extent limit
+overages fail with `TABLE_LIMIT_EXCEEDED`; ill-typed, negative, or understated
+declared dimensions fail with
+`INVALID_TABLE_DIMENSIONS`; these are hard failures because accepting a
+truncated or invented grid would make canonical content ambiguous. Malformed
+but recoverable native table data is never silently dropped or assigned
+invented coordinates: it produces a stable
+`ERROR` mapping diagnostic, retains only independently valid structure, and
+makes the canonical run and compiled stage `partial`.
+
+Schema v1 also admits at most 100,000 raw native collection entries and
+500,000 hierarchy declarations. The hierarchy bound covers body and furniture
+children, per-node parent and child declarations, and rich-table cell
+references. Raw list slots and present-but-malformed declarations count toward
+the limits, so malformed input cannot evade them merely because semantic
+decoding would later ignore it. `NATIVE_NODE_LIMIT_EXCEEDED` and
+`NATIVE_HIERARCHY_EDGE_LIMIT_EXCEEDED` are hard failures enforced before native
+node decoding or reference resolution. The same node and outgoing-edge bounds
+are rechecked when a persisted `CanonicalDocumentView` is loaded. Hierarchy
+reconciliation uses indexed parent/child lookups in O(nodes + edges), preserving
+explicit child order first and native collection order for inferred children.
+
+Persisted content-integrity overlays are parsed as the registered v1 contract
+without type coercion, unknown record kinds, omitted fields, or extra fields.
+Record identities, derived statuses, report counts, and the complete decoded
+payload must replay exactly. A malformed or non-replayable overlay fails
+canonicalization without producing a canonical product. Issues in a valid
+overlay are copied into the canonical diagnostics; an upstream integrity
+`ERROR` therefore also makes the canonical run `partial`.
+
+Anchors target immutable native product IDs and nodes, with character ranges
+and PDF, JATS, or BioC locators where available. Relationship status is derived
+from the resolved source, resolved targets, unresolved target references, and
+reason codes; it cannot be persisted inconsistently with that evidence. A
+relationship's evidence and derived status also participate in its
+content-derived identity. Ambiguous or missing mappings remain stable
+diagnostics.
+
+Canonical models use immutable tuples and read-only metadata mappings. The
+store rebuilds and fully revalidates the view immediately before deterministic
+serialization, and loading dispatches on the descriptive schema version before
+revalidating hashes, identities, graph links, anchors, relationships, and
+product references. This closes shallow-copy and nested-mutation paths that
+could otherwise persist stale identities.
+
+The canonical view contains document structure only. Scientific labels must be
+stored in separate immutable `AnnotationSet` products targeting an exact
+canonical-view product and block/span IDs; annotations never mutate or become
+part of canonical document identity.
 
 Durable records use descriptive `schema_version` values and every stage output
 is a typed `DataProductRef`. A product reference carries its content hash, CAS
 URI, byte size, media and payload schema, producer run, and source-artifact
-lineage. Record loading dispatches on the schema version before model
-validation. Stores containing the old unversioned `records/parser_runs`
-prototype layout are rejected explicitly rather than guessed into the new
-contract.
+lineage. Reading a stage input verifies that reference against the CAS bytes,
+the durable source-artifact records, and an exact output declaration on the
+durable producer run. A valid-looking or hash-correct reference alone is not
+sufficient provenance. Record loading dispatches on the schema version before
+model validation. Stores containing the old unversioned
+`records/parser_runs` prototype layout are rejected explicitly rather than
+guessed into the new contract.
+
+Canonical schema v1 admits native evidence only through its pinned producer
+contracts. The Docling document and `content_spans` must be canonically encoded
+outputs of the same `docling` 2.96.1 / `document.parse` run, using Docling
+Serve 1.21.0 and the exact format-specific invocation schema (including
+`provenance-charspan-v2` for PDFs). JATS and BioC inputs must come from the
+version-1 project adapters with exact artifact and configuration lineage.
+Draft records that advertise a different Docling version are not relabeled;
+they must be reprocessed under a supported native contract.
+Scholarly TEI must come from a usable `grobid` 0.9.0 /
+`document.parse.scholarly` run whose input hash and parser options replay
+against the source artifact or its direct OCR derivative. Conflicting runtime
+attestation is never accepted: present evidence is replayed against the exact
+reporter, source, contract, schema, image, digest, component/model inventory,
+and parser configuration persisted in the run's output-policy snapshot. A
+`partial` native run remains admissible when identity evidence is absent or an
+unrelated system diagnostic caused the downgrade, but no Docling run may carry
+replayed semantic `ERROR`s. Duplicate native identities and self-references
+that alias another canonical path are semantic errors, not partial mapping
+diagnostics.
+
+The content-integrity overlay remains optional in canonical schema v1 so a
+lower-level structure-only view can still be built. When present, its producer,
+inputs, configuration, bytes, and issue-dependent status are replayed exactly;
+omitting it therefore means consumers do not receive the stronger explicit
+table, figure, and citation-resolution contract.
 
 The current configuration schema is
 `deepcritical-document-processing-config-v2`, and its default is in
@@ -106,7 +206,7 @@ contains only data:
 pipeline:
   schema_version: deepcritical-pipeline-spec-v1
   pipeline_id: deepcritical-document-processing
-  pipeline_version: "1"
+  pipeline_version: "2"
   components:
     - instance_id: document-preflight
       component_id: document-preflight
@@ -114,6 +214,11 @@ pipeline:
     - instance_id: document-router
       component_id: document-router
       configuration: {}
+    - instance_id: canonical-document-view
+      component_id: canonical-document-view
+      configuration:
+        text_normalization: unicode-nfc-collapse-whitespace-v1
+        anchoring_policy: source-spans-and-native-nodes-v1
   stages:
     - stage_id: preflight
       component: document-preflight
@@ -189,13 +294,14 @@ and branch is covered relative to the exact review base revision. This focused
 gate prevents unrelated, well-covered modules from masking untested changes;
 repository-wide Codecov reporting remains informational.
 
-This completes Follow-up 1’s allow-listed local execution layer. Its current
-boundary is intentionally local: several private stage values are ordinary
-in-memory Python objects and are neither durable products nor serializable task
-envelopes. The canonical document view, OCR correction/classification, and
-distributed execution remain separate Follow-ups 2–4. Biomedical extraction,
-evidence appraisal, hypothesis generation, experiment design, and
-Alzheimer’s-specific research functionality remain outside this change.
+This completes Follow-up 1’s allow-listed local execution layer and Follow-up
+2’s project-owned canonical document view. The execution boundary remains
+intentionally local: several private stage values are ordinary in-memory Python
+objects and are neither durable products nor serializable task envelopes. OCR
+correction/classification and distributed execution remain separate Follow-ups
+3–4. Biomedical extraction, evidence appraisal, hypothesis generation,
+experiment design, and Alzheimer’s-specific research functionality remain
+outside this change.
 
 Process or resume one artifact from the repository root:
 
@@ -321,7 +427,7 @@ The live suite contains two different kinds of checks:
   checked-in `PipelineSpec`, and traverse the registry, compiler,
   `PipelineOrchestrator`, and `LocalStageExecutor`.
 
-The free GitHub Actions workflow uses three isolated standard-runner jobs. The
+The GitHub Actions workflow retains three isolated standard-runner jobs. The
 Docling job runs real Docling on a non-scholarly HTML route and never calls real
 GROBID. The GROBID job uses deterministic fixture-backed Docling output before
 the real GROBID boundary. The OCR job uses deterministic upstream stages that
@@ -329,8 +435,18 @@ force the real digest-addressed OCR branch. Each smoke checks executed and
 skipped stages, a terminal `DocumentProcessingResult`, persisted
 `ProcessingRun` records, `DataProductRef` lineage, the exact pipeline and
 registry snapshot in output-policy provenance, and the service/image identity
-observed by the CI host. These jobs do not constitute an all-real end-to-end
-stack execution.
+observed by the CI host.
+
+An additional `all-real` job starts both parser services and invokes the pinned
+OCR image in one `DocumentProcessor` execution over a rich, deterministic
+raster-only paper. Docling performs real OCR (`do_ocr: true`), a high test-only
+text threshold forces the external OCR derivative, and the successful GROBID
+fallback supplies scholarly evidence to canonicalization. The job reads the
+canonical product through verified storage, captures the synthetic source and
+native parser products with an exact-revision manifest, and uploads that
+evidence for review. Invocation-dependent OCR and canonical bytes are evidence,
+not frozen reproducibility fixtures; only native parser outputs from a
+successful capture may be promoted in a later reviewed commit.
 
 With the digest-pinned compose stack already healthy, run the direct and
 compiled Docling and GROBID contracts explicitly:
@@ -515,10 +631,13 @@ for invocation-bound evidence.
 The strict `RuntimeAttestation` and its canonical JSON hash are preserved in
 CAS. `ProcessingRun` validates the component, version, invocation ID, container
 reference/digest, component versions, model inventory, and observation time
-against that evidence. Missing, stale, malformed, or mismatched evidence keeps
-the valid parser output but marks the run partial with an explicit diagnostic;
-an enforced benchmark rejects it. Non-loopback parser and reporter endpoints
-must use HTTPS, and authenticated clients do not follow redirects.
+against that evidence. Canonical admission additionally replays any present
+attestation against the exact persisted runtime-trust policy; evidence without
+that policy, a different reporter, or an alternate registry is rejected even
+when identity was optional. Missing evidence keeps an otherwise valid parser
+output partial with an explicit diagnostic; an enforced benchmark rejects it.
+Non-loopback parser and reporter endpoints must use HTTPS, and authenticated
+clients do not follow redirects.
 
 Capture expected identities after pulling/building the approved images, then
 place them in a deployment-specific override:

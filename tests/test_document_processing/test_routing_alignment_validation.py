@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from bioc import BioCCollection, BioCDocument, BioCPassage, biocjson
 
+from DeepResearch.src.document_processing import validation as validation_module
 from DeepResearch.src.document_processing.adapters import (
     BioCAdapter,
     JATSLocatorAdapter,
@@ -578,3 +579,143 @@ def test_bioc_alignment_consumes_duplicate_texts_in_source_order() -> None:
     assert first == second
     assert first.spans[0].source_locator.document_index == 0
     assert first.spans[1].source_locator.document_index == 1
+
+
+def _brute_force_duplicate_matches(
+    texts: list[str],
+    locators: list[tuple[str, bool]],
+) -> list[str | None]:
+    """Reference the former source-order one-use candidate scan."""
+
+    used: set[int] = set()
+    matches: list[str | None] = []
+    for locator_text, usable in locators:
+        if not usable:
+            matches.append(None)
+            continue
+        normalized = " ".join(locator_text.casefold().split())
+        match = next(
+            (
+                index
+                for index, text in enumerate(texts)
+                if index not in used and " ".join(text.casefold().split()) == normalized
+            ),
+            None,
+        )
+        if match is None:
+            matches.append(None)
+            continue
+        used.add(match)
+        matches.append(f"#/texts/{match}")
+    return matches
+
+
+def test_native_alignment_index_matches_brute_force_for_duplicates() -> None:
+    texts = ["Repeated", "Other", " repeated ", "REPEATED"]
+    document = {"texts": [{"text": text} for text in texts]}
+    locator_cases = [
+        ("repeated", False),
+        (" repeated ", True),
+        ("missing", True),
+        ("REPEATED", True),
+        ("other", True),
+        ("Repeated", True),
+        ("repeated", True),
+    ]
+    expected = _brute_force_duplicate_matches(texts, locator_cases)
+    jats = align_jats_content_spans(
+        document,
+        tuple(
+            NativeTextLocator(
+                text=text,
+                source_kind=InputFormat.JATS.value,
+                xpath=f"/article/p[{index}]" if usable else None,
+            )
+            for index, (text, usable) in enumerate(locator_cases, start=1)
+        ),
+        artifact_id="artifact-1",
+        processing_run_id="run-1",
+        representation_product_id="product-docling-document",
+    )
+    bioc = align_bioc_content_spans(
+        document,
+        tuple(
+            NativeTextLocator(
+                text=text,
+                source_kind=InputFormat.BIOC_JSON.value,
+                document_index=index if usable else None,
+                passage_index=0,
+                offset=0,
+                length=len(text),
+            )
+            for index, (text, usable) in enumerate(locator_cases)
+        ),
+        artifact_id="artifact-1",
+        processing_run_id="run-1",
+        representation_product_id="product-docling-document",
+    )
+
+    assert [record.docling_item_ref for record in jats.records] == expected
+    assert [record.docling_item_ref for record in bioc.records] == expected
+
+
+def test_native_alignment_candidate_lookup_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CountingKey:
+        comparisons = 0
+
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+        def __hash__(self) -> int:
+            return self.value
+
+        def __eq__(self, other: object) -> bool:
+            type(self).comparisons += 1
+            return isinstance(other, CountingKey) and self.value == other.value
+
+    def counting_normalized(text: str) -> CountingKey:
+        kind, raw_index = text.split("-", maxsplit=1)
+        offset = 0 if kind == "doc" else 1_000_000
+        return CountingKey(offset + int(raw_index))
+
+    monkeypatch.setattr(validation_module, "_normalized", counting_normalized)
+    item_count = 500
+    document = {"texts": [{"text": f"doc-{index}"} for index in range(item_count)]}
+    jats_locators = tuple(
+        NativeTextLocator(
+            text=f"native-{index}",
+            source_kind=InputFormat.JATS.value,
+            xpath=f"/article/p[{index + 1}]",
+        )
+        for index in range(item_count)
+    )
+    bioc_locators = tuple(
+        NativeTextLocator(
+            text=f"native-{index}",
+            source_kind=InputFormat.BIOC_JSON.value,
+            document_index=index,
+            passage_index=0,
+            offset=index,
+            length=len(f"native-{index}"),
+        )
+        for index in range(item_count)
+    )
+
+    align_jats_content_spans(
+        document,
+        jats_locators,
+        artifact_id="artifact-1",
+        processing_run_id="run-1",
+        representation_product_id="product-docling-document",
+    )
+    align_bioc_content_spans(
+        document,
+        bioc_locators,
+        artifact_id="artifact-1",
+        processing_run_id="run-1",
+        representation_product_id="product-docling-document",
+    )
+
+    assert CountingKey.comparisons <= item_count * 4

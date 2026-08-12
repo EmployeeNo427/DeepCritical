@@ -8,6 +8,7 @@ the lane never uploads licensed or corpus material.
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import shutil
@@ -23,6 +24,7 @@ import yaml
 from defusedxml import ElementTree
 from pypdf import PdfReader
 
+from DeepResearch.src.document_processing.canonical import canonical_document_bytes
 from DeepResearch.src.document_processing.clients import (
     ContainerOCRmyPDFRunner,
     DoclingConversionResult,
@@ -32,6 +34,7 @@ from DeepResearch.src.document_processing.clients import (
     OCRResult,
 )
 from DeepResearch.src.document_processing.models import (
+    ArtifactRelationship,
     ProcessingRun,
     ProcessingRunStatus,
     RuntimeAttestation,
@@ -53,6 +56,9 @@ from DeepResearch.src.document_processing.storage import ContentAddressedStore
 
 _LIVE_ENABLED = os.getenv("DEEPCRITICAL_RUN_LIVE_DOCUMENT_PROCESSING") == "1"
 _LIVE_OCR_ENABLED = os.getenv("DEEPCRITICAL_RUN_LIVE_DOCUMENT_PROCESSING_OCR") == "1"
+_LIVE_ALL_REAL_ENABLED = (
+    os.getenv("DEEPCRITICAL_RUN_LIVE_DOCUMENT_PROCESSING_ALL_REAL") == "1"
+)
 _DIGEST_ADDRESSED_IMAGE = re.compile(r"^\S+@sha256:[0-9a-f]{64}$")
 _TEI_NAMESPACE = "http://www.tei-c.org/ns/1.0"
 
@@ -378,6 +384,20 @@ def _assert_compiled_pipeline_result(
         for product in run.inputs:
             producer = store.get_processing_run(product.producer_run_id)
             assert product in producer.outputs
+    canonical_run = _run_for_component(
+        result.processing_runs, "canonical-document-view"
+    )
+    canonical_product = canonical_run.require_output("canonical_document_view")
+    canonical_view = store.read_canonical_document(canonical_product)
+    assert result.canonical_document_sha256 == canonical_product.blob_sha256
+    assert canonical_view.artifact_id == result.artifact.artifact_id
+    assert canonical_view.blocks
+    assert all(block.source_anchors for block in canonical_view.blocks)
+    assert {product.name for product in canonical_view.source_products} >= {
+        "docling_document",
+        "content_spans",
+        "content_integrity_overlay",
+    }
 
 
 def _run_for_component(
@@ -387,6 +407,107 @@ def _run_for_component(
     selected = tuple(run for run in runs if run.component_id == component_id)
     assert len(selected) == 1
     return selected[0]
+
+
+_CAPTURE_SUFFIXES = {
+    "application/json": ".json",
+    "application/pdf": ".pdf",
+    "application/xml": ".xml",
+    "text/plain": ".txt",
+}
+_CAPTURE_PRODUCT_SUFFIXES = {
+    "alignment_overlay": ".json",
+    "canonical_document_view": ".json",
+    "content_integrity_overlay": ".json",
+    "content_spans": ".json",
+    "diagnostics_manifest": ".json",
+    "docling_document": ".json",
+    "docling_response": ".json",
+    "grobid_tei": ".tei.xml",
+    "ocr_log": ".json",
+    "ocr_sidecar": ".txt",
+    "runtime_attestation": ".json",
+    "searchable_pdf": ".pdf",
+}
+
+
+def _capture_live_pipeline_evidence(
+    *,
+    capture_directory: Path,
+    source_pdf: bytes,
+    store: ContentAddressedStore,
+    result: DocumentProcessingResult,
+) -> Path:
+    """Capture synthetic native products after verifying their durable chains."""
+
+    capture_directory.mkdir(parents=True, exist_ok=True)
+    source_path = capture_directory / "source-rich-raster.pdf"
+    source_path.write_bytes(source_pdf)
+    captured_products: list[dict[str, Any]] = []
+    for run_index, run in enumerate(result.processing_runs, start=1):
+        stage_label = re.sub(
+            r"[^a-zA-Z0-9_.-]+",
+            "-",
+            run.stage_invocation_id or run.stage_id,
+        )
+        for product in run.outputs:
+            payload = store.read_data_product_bytes(product)
+            suffix = _CAPTURE_PRODUCT_SUFFIXES.get(
+                product.name,
+                _CAPTURE_SUFFIXES.get(product.media_type, ".bin"),
+            )
+            filename = (
+                f"{run_index:02d}-{stage_label}-{run.component_id}-"
+                f"{product.name}{suffix}"
+            )
+            (capture_directory / filename).write_bytes(payload)
+            captured_products.append(
+                {
+                    **product.model_dump(mode="json"),
+                    "capture_file": filename,
+                }
+            )
+
+    manifest = {
+        "schema": "deepcritical-live-all-real-evidence-v1",
+        "synthetic_input": True,
+        "tested_revision": os.getenv("TESTED_REVISION", "local-unreported"),
+        "capture": {
+            "captured_at": utc_now().isoformat(),
+            "github_run_id": os.getenv("GITHUB_RUN_ID", "local-unreported"),
+            "github_run_attempt": os.getenv(
+                "GITHUB_RUN_ATTEMPT",
+                "local-unreported",
+            ),
+        },
+        "source": {
+            "artifact_id": result.artifact.artifact_id,
+            "blob_sha256": result.artifact.source_sha256,
+            "capture_file": source_path.name,
+        },
+        "result": {
+            "status": result.status.value,
+            "route": list(result.route),
+            "canonical_document_sha256": result.canonical_document_sha256,
+            "derivative_artifact_ids": list(result.derivative_artifact_ids),
+        },
+        "artifacts": [
+            artifact.model_dump(mode="json") for artifact in store.list_artifacts()
+        ],
+        "processing_runs": [
+            run.model_dump(mode="json") for run in result.processing_runs
+        ],
+        "diagnostics": [
+            diagnostic.model_dump(mode="json") for diagnostic in result.diagnostics
+        ],
+        "captured_products": captured_products,
+    }
+    manifest_path = capture_directory / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return manifest_path
 
 
 def _assemble_pdf(objects: list[bytes]) -> bytes:
@@ -448,47 +569,87 @@ def synthetic_scholarly_pdf() -> bytes:
 
 _BITMAP_FONT = {
     "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
     "C": ("01111", "10000", "10000", "10000", "10000", "10000", "01111"),
     "D": ("11110", "10001", "10001", "10001", "10001", "10001", "11110"),
     "E": ("11111", "10000", "10000", "11110", "10000", "10000", "11111"),
+    "F": ("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
+    "G": ("01111", "10000", "10000", "10111", "10001", "10001", "01111"),
+    "H": ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
     "I": ("11111", "00100", "00100", "00100", "00100", "00100", "11111"),
+    "J": ("00111", "00010", "00010", "00010", "00010", "10010", "01100"),
+    "K": ("10001", "10010", "10100", "11000", "10100", "10010", "10001"),
     "L": ("10000", "10000", "10000", "10000", "10000", "10000", "11111"),
+    "M": ("10001", "11011", "10101", "10101", "10001", "10001", "10001"),
+    "N": ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
     "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
     "P": ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
+    "Q": ("01110", "10001", "10001", "10001", "10101", "10010", "01101"),
     "R": ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
     "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
     "T": ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+    "U": ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "V": ("10001", "10001", "10001", "10001", "10001", "01010", "00100"),
+    "W": ("10001", "10001", "10001", "10101", "10101", "10101", "01010"),
+    "X": ("10001", "10001", "01010", "00100", "01010", "10001", "10001"),
+    "Y": ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
+    "Z": ("11111", "00001", "00010", "00100", "01000", "10000", "11111"),
 }
 
 
-@pytest.fixture(scope="session")
-def synthetic_image_only_pdf() -> bytes:
-    """Return a deterministic raster-only PDF for the opt-in OCR contract."""
+def _raster_only_pdf(
+    lines: tuple[str, ...],
+    *,
+    width: int,
+    height: int,
+    scale: int,
+) -> bytes:
+    if not lines or width <= 0 or height <= 0 or scale <= 0:
+        raise ValueError("raster fixture dimensions and lines must be non-empty")
+    unsupported = set("".join(lines)) - {" ", *_BITMAP_FONT}
+    if unsupported:
+        raise ValueError(f"unsupported raster fixture characters: {unsupported!r}")
 
-    width, height, scale = 1800, 600, 12
     pixels = bytearray(b"\xff" * (width * height))
-    text = "DEEPCRITICAL OCR TEST"
     glyph_width = 6 * scale
-    start_x = (width - len(text) * glyph_width) // 2
-    start_y = (height - 7 * scale) // 2
-    for character_index, character in enumerate(text):
-        glyph = _BITMAP_FONT.get(character)
-        if glyph is None:
-            continue
-        glyph_x = start_x + character_index * glyph_width
-        for row, pattern in enumerate(glyph):
-            for column, pixel in enumerate(pattern):
-                if pixel != "1":
-                    continue
-                for y_offset in range(scale):
-                    row_start = (start_y + row * scale + y_offset) * width
-                    for x_offset in range(scale):
-                        pixels[row_start + glyph_x + column * scale + x_offset] = 0
+    line_height = 12 * scale
+    rendered_height = (len(lines) - 1) * line_height + 7 * scale
+    start_y = (height - rendered_height) // 2
+    if start_y < 0:
+        raise ValueError("raster fixture lines exceed the image height")
+    for line_index, text in enumerate(lines):
+        start_x = (width - len(text) * glyph_width) // 2
+        if start_x < 0:
+            raise ValueError("raster fixture line exceeds the image width")
+        for character_index, character in enumerate(text):
+            glyph = _BITMAP_FONT.get(character)
+            if glyph is None:
+                continue
+            glyph_x = start_x + character_index * glyph_width
+            for row, pattern in enumerate(glyph):
+                for column, pixel in enumerate(pattern):
+                    if pixel != "1":
+                        continue
+                    for y_offset in range(scale):
+                        row_start = (
+                            start_y + line_index * line_height + row * scale + y_offset
+                        ) * width
+                        for x_offset in range(scale):
+                            pixels[row_start + glyph_x + column * scale + x_offset] = 0
 
     compressed = zlib.compress(bytes(pixels), level=9)
-    content = b"q\n540 0 0 180 36 306 cm\n/Im0 Do\nQ\n"
+    display_width = 540
+    display_height = round(display_width * height / width)
+    display_y = (792 - display_height) // 2
+    content = (
+        f"q\n{display_width} 0 0 {display_height} 36 {display_y} cm\n/Im0 Do\nQ\n"
+    ).encode()
     image = (
-        b"<< /Type /XObject /Subtype /Image /Width 1800 /Height 600 "
+        b"<< /Type /XObject /Subtype /Image /Width "
+        + str(width).encode()
+        + b" /Height "
+        + str(height).encode()
+        + b" "
         b"/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode "
         b"/Length "
         + str(len(compressed)).encode()
@@ -511,6 +672,45 @@ def synthetic_image_only_pdf() -> bytes:
             + b"endstream",
             image,
         ]
+    )
+
+
+@pytest.fixture(scope="session")
+def synthetic_image_only_pdf() -> bytes:
+    """Return a deterministic raster-only PDF for the opt-in OCR contract."""
+
+    return _raster_only_pdf(
+        ("DEEPCRITICAL OCR TEST",),
+        width=1800,
+        height=600,
+        scale=12,
+    )
+
+
+@pytest.fixture(scope="session")
+def synthetic_rich_image_only_pdf() -> bytes:
+    """Return a rich raster paper that both real OCR boundaries can parse."""
+
+    return _raster_only_pdf(
+        (
+            "DEEPCRITICAL PARSER CONTRACT STUDY",
+            "ABSTRACT",
+            "THIS RASTER PAPER REPORTS A CONTROLLED EXPERIMENT",
+            "THE STUDY TESTS REPRODUCIBLE DOCUMENT PROCESSING",
+            "METHODS",
+            "CELLS RECEIVED CONTROL OR TREATMENT CONDITIONS",
+            "PARSER OUTPUTS WERE CAPTURED FOR CRITICAL REVIEW",
+            "RESULTS",
+            "TREATMENT INCREASED RESPONSE RELATIVE TO CONTROL",
+            "THE OBSERVED RESULT WAS CONSISTENT ACROSS REPEATS",
+            "DISCUSSION",
+            "THE EVIDENCE SUPPORTS REPRODUCIBLE ASSESSMENT",
+            "REFERENCES",
+            "RESEARCHER SYNTHETIC PARSER EVALUATION",
+        ),
+        width=3200,
+        height=2100,
+        scale=8,
     )
 
 
@@ -648,12 +848,16 @@ async def test_live_compiled_docling_pipeline(
         use_async_api=True,
     )
     versions = await base_client.version()
+    attested_versions = {
+        "docling": versions["docling"],
+        "docling_serve": versions["docling-serve"],
+    }
     image_reference = _required_environment("DEEPCRITICAL_LIVE_DOCLING_IMAGE_REF")
     reporter = _DockerRuntimeReporter(
         expected_reporter_id="github-actions-docker-inspector",
         component_id="docling",
         component_version=versions["docling"],
-        component_versions=versions,
+        component_versions=attested_versions,
         container_reference=image_reference,
         container_id=_required_environment("DEEPCRITICAL_LIVE_DOCLING_CONTAINER_ID"),
         expected_image_id=_required_environment("DEEPCRITICAL_LIVE_DOCLING_IMAGE_ID"),
@@ -713,7 +917,7 @@ async def test_live_compiled_docling_pipeline(
     assert run.runtime_attestation is not None
     assert run.runtime_attestation.container_reference == image_reference
     assert run.runtime_attestation.container_image_id == reporter.expected_image_id
-    assert run.component_versions == versions
+    assert run.component_versions == attested_versions
 
 
 @pytest.mark.asyncio
@@ -753,8 +957,9 @@ async def test_live_compiled_grobid_pipeline(
         docling=_FixtureDocling(),
         grobid=client,
         ocrmypdf=_NeverOCR(),
+        # Only GROBID is live in this isolated lane. The deterministic Docling
+        # fixture still records the exact native contract required for replay.
         config=DocumentProcessingConfig(
-            docling_version="fixture-docling-v1",
             grobid_version=version,
             grobid_container_image=image_reference.split("@", maxsplit=1)[0],
             grobid_container_digest=image_reference.rsplit("@", maxsplit=1)[1],
@@ -827,9 +1032,9 @@ async def test_live_compiled_ocr_pipeline(
         docling=_FixtureDocling(image_only=True),
         grobid=grobid,
         ocrmypdf=runner,
+        # Only OCRmyPDF is live in this isolated lane. The deterministic parser
+        # fixtures still record the exact native contracts required for replay.
         config=DocumentProcessingConfig(
-            docling_version="fixture-docling-v1",
-            grobid_version="fixture-grobid-v1",
             grobid_minimum_text_characters=80,
             ocrmypdf_version="17.4.1",
             ocr_mode="container_cli",
@@ -862,3 +1067,250 @@ async def test_live_compiled_ocr_pipeline(
     assert run.runtime_attestation.container_reference == image_reference
     assert run.runtime_attestation.container_digest == digest
     assert run.component_versions["ocrmypdf"] == "17.4.1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not _LIVE_ALL_REAL_ENABLED,
+    reason=(
+        "set DEEPCRITICAL_RUN_LIVE_DOCUMENT_PROCESSING_ALL_REAL=1 to run one "
+        "capture-capable pipeline across every real parser boundary"
+    ),
+)
+async def test_live_all_real_pipeline_captures_native_outputs(
+    live_stack_config: _LiveStackConfig,
+    synthetic_rich_image_only_pdf: bytes,
+    tmp_path: Path,
+) -> None:
+    tested_revision = _required_environment("TESTED_REVISION")
+    if re.fullmatch(r"[0-9a-f]{40}", tested_revision) is None:
+        raise RuntimeError("TESTED_REVISION must be an exact 40-character Git SHA")
+    capture_directory = Path(
+        _required_environment("DEEPCRITICAL_LIVE_CAPTURE_DIR")
+    ).resolve()
+
+    docling_probe = DoclingServeClient(
+        live_stack_config.docling_url,
+        api_key=live_stack_config.docling_api_key,
+        connect_timeout_seconds=live_stack_config.connect_timeout_seconds,
+        request_timeout_seconds=live_stack_config.request_timeout_seconds,
+        task_timeout_seconds=live_stack_config.task_timeout_seconds,
+        poll_interval_seconds=0.5,
+        use_async_api=True,
+    )
+    docling_versions = await docling_probe.version()
+    assert docling_versions.get("docling") == (
+        live_stack_config.expected_docling_version
+    )
+    assert docling_versions.get("docling-serve") == (
+        live_stack_config.expected_docling_serve_version
+    )
+    docling_image = _required_environment("DEEPCRITICAL_LIVE_DOCLING_IMAGE_REF")
+    docling_reporter = _DockerRuntimeReporter(
+        expected_reporter_id="github-actions-docker-inspector",
+        component_id="docling",
+        component_version=live_stack_config.expected_docling_version,
+        component_versions={
+            "docling": live_stack_config.expected_docling_version,
+            "docling_serve": live_stack_config.expected_docling_serve_version,
+        },
+        container_reference=docling_image,
+        container_id=_required_environment("DEEPCRITICAL_LIVE_DOCLING_CONTAINER_ID"),
+        expected_image_id=_required_environment("DEEPCRITICAL_LIVE_DOCLING_IMAGE_ID"),
+    )
+    docling = DoclingServeClient(
+        live_stack_config.docling_url,
+        api_key=live_stack_config.docling_api_key,
+        connect_timeout_seconds=live_stack_config.connect_timeout_seconds,
+        request_timeout_seconds=live_stack_config.request_timeout_seconds,
+        task_timeout_seconds=live_stack_config.task_timeout_seconds,
+        poll_interval_seconds=0.5,
+        use_async_api=True,
+        runtime_reporter=docling_reporter,
+    )
+
+    grobid_probe = GrobidClient(
+        live_stack_config.grobid_url,
+        api_key=live_stack_config.grobid_api_key,
+        connect_timeout_seconds=live_stack_config.connect_timeout_seconds,
+        timeout_seconds=live_stack_config.request_timeout_seconds,
+    )
+    grobid_version = await grobid_probe.version()
+    assert grobid_version == live_stack_config.expected_grobid_version
+    grobid_image = _required_environment("DEEPCRITICAL_LIVE_GROBID_IMAGE_REF")
+    grobid_reporter = _DockerRuntimeReporter(
+        expected_reporter_id="github-actions-docker-inspector",
+        component_id="grobid",
+        component_version=grobid_version,
+        component_versions={"grobid": grobid_version},
+        container_reference=grobid_image,
+        container_id=_required_environment("DEEPCRITICAL_LIVE_GROBID_CONTAINER_ID"),
+        expected_image_id=_required_environment("DEEPCRITICAL_LIVE_GROBID_IMAGE_ID"),
+    )
+    grobid = GrobidClient(
+        live_stack_config.grobid_url,
+        api_key=live_stack_config.grobid_api_key,
+        connect_timeout_seconds=live_stack_config.connect_timeout_seconds,
+        timeout_seconds=live_stack_config.request_timeout_seconds,
+        runtime_reporter=grobid_reporter,
+    )
+
+    runtime = os.getenv("DEEPCRITICAL_LIVE_CONTAINER_RUNTIME", "docker").strip()
+    if not runtime or shutil.which(runtime) is None:
+        raise RuntimeError(
+            "DEEPCRITICAL_LIVE_CONTAINER_RUNTIME must name an installed OCI runtime"
+        )
+    ocr_image = _required_environment("DEEPCRITICAL_LIVE_OCR_IMAGE")
+    if not _DIGEST_ADDRESSED_IMAGE.fullmatch(ocr_image):
+        raise RuntimeError(
+            "DEEPCRITICAL_LIVE_OCR_IMAGE must be an exact image@sha256 reference"
+        )
+    ocr = ContainerOCRmyPDFRunner(
+        ocr_image,
+        runtime_executable=runtime,
+        timeout_seconds=_positive_environment_float(
+            "DEEPCRITICAL_LIVE_OCR_TIMEOUT_SECONDS",
+            900.0,
+        ),
+        probe_timeout_seconds=_positive_environment_float(
+            "DEEPCRITICAL_LIVE_OCR_PROBE_TIMEOUT_SECONDS",
+            60.0,
+        ),
+        jobs=1,
+        require_digest_addressed=True,
+    )
+
+    executor = _RecordingExecutor()
+    store = ContentAddressedStore(tmp_path / "all-real-store")
+    processor = DocumentProcessor(
+        store,
+        docling=docling,
+        grobid=grobid,
+        ocrmypdf=ocr,
+        config=DocumentProcessingConfig(
+            docling_version=live_stack_config.expected_docling_version,
+            docling_serve_version=live_stack_config.expected_docling_serve_version,
+            docling_container_image=docling_image.split("@", maxsplit=1)[0],
+            docling_container_digest=docling_image.rsplit("@", maxsplit=1)[1],
+            docling_options={"do_ocr": True},
+            grobid_version=grobid_version,
+            grobid_container_image=grobid_image.split("@", maxsplit=1)[0],
+            grobid_container_digest=grobid_image.rsplit("@", maxsplit=1)[1],
+            grobid_minimum_text_characters=100,
+            ocrmypdf_version="17.4.1",
+            ocr_mode="container_cli",
+            ocr_container_image=ocr_image.split("@", maxsplit=1)[0],
+            ocr_container_digest=ocr_image.rsplit("@", maxsplit=1)[1],
+            ocr_languages=("eng",),
+            detect_image_only_pdfs=True,
+            # Docling still performs real OCR. This deliberately unreachable
+            # threshold proves that the external OCR fallback executes as well.
+            minimum_text_characters_per_page=1_000_000,
+            image_only_page_ratio=1.0,
+            preflight_enabled=True,
+            require_runtime_identity=True,
+        ),
+        stage_executor=executor,
+    )
+    artifact = processor.ingest_bytes(
+        synthetic_rich_image_only_pdf,
+        acquisition_uri="https://example.test/live-all-real-raster.pdf",
+        media_type="application/pdf",
+        identifiers={"filename": "live-all-real-raster.pdf"},
+    )
+
+    result = await processor.process_artifact(artifact.artifact_id)
+
+    _assert_compiled_pipeline_result(
+        processor=processor,
+        store=store,
+        result=result,
+        executor=executor,
+        skipped_stages=set(),
+    )
+    docling_run = _run_for_component(result.processing_runs, "docling")
+    assert docling_run.stage_invocation_id == "docling"
+    assert docling_run.configuration["options"]["do_ocr"] is True
+    assert docling_run.runtime_attestation is not None
+    assert docling_run.runtime_attestation.container_reference == docling_image
+    assert docling_run.runtime_attestation.container_image_id == (
+        docling_reporter.expected_image_id
+    )
+
+    ocr_run = _run_for_component(result.processing_runs, "ocrmypdf")
+    assert ocr_run.stage_invocation_id == "ocr"
+    assert "image_only_pages" in ocr_run.configuration["fallback_reason"].split("+")
+    assert ocr_run.runtime_attestation is not None
+    assert ocr_run.runtime_attestation.container_reference == ocr_image
+    assert ocr_run.component_versions["ocrmypdf"] == "17.4.1"
+    searchable_pdf = store.read_data_product_bytes(
+        ocr_run.require_output("searchable_pdf")
+    )
+    searchable_reader = PdfReader(io.BytesIO(searchable_pdf))
+    assert searchable_reader.pages[0].extract_text().strip()
+
+    assert len(result.derivative_artifact_ids) == 1
+    derivative_id = result.derivative_artifact_ids[0]
+    derivative = store.get_artifact(derivative_id)
+    assert derivative.relationship is ArtifactRelationship.DERIVATIVE
+    assert derivative.parent_artifact_id == artifact.artifact_id
+    assert derivative.raw_location.created_by_run_id == ocr_run.run_id
+    grobid_runs = tuple(
+        run for run in result.processing_runs if run.component_id == "grobid"
+    )
+    assert len(grobid_runs) == 2
+    assert {run.stage_invocation_id for run in grobid_runs} == {
+        "primary-grobid",
+        "fallback-grobid",
+    }
+    primary_grobid = next(
+        run for run in grobid_runs if run.artifact_id == artifact.artifact_id
+    )
+    fallback_grobid = next(
+        run for run in grobid_runs if run.artifact_id == derivative_id
+    )
+    assert primary_grobid.stage_invocation_id == "primary-grobid"
+    if primary_grobid.runtime_attestation is not None:
+        assert primary_grobid.runtime_attestation.container_reference == grobid_image
+    assert fallback_grobid.require_output("grobid_tei")
+    assert fallback_grobid.runtime_attestation is not None
+    assert fallback_grobid.runtime_attestation.container_reference == grobid_image
+    assert fallback_grobid.runtime_attestation.container_image_id == (
+        grobid_reporter.expected_image_id
+    )
+
+    canonical_run = _run_for_component(
+        result.processing_runs,
+        "canonical-document-view",
+    )
+    canonical_product = canonical_run.require_output("canonical_document_view")
+    canonical_view = store.read_canonical_document(canonical_product)
+    assert canonical_run.stage_invocation_id == "canonicalize"
+    assert canonical_view.artifact_id == artifact.artifact_id
+    assert canonical_view.blocks
+    assert fallback_grobid.require_output("grobid_tei") in (
+        canonical_view.source_products
+    )
+    assert store.read_blob(canonical_product.blob_sha256) == canonical_document_bytes(
+        canonical_view
+    )
+
+    manifest_path = _capture_live_pipeline_evidence(
+        capture_directory=capture_directory,
+        source_pdf=synthetic_rich_image_only_pdf,
+        store=store,
+        result=result,
+    )
+    capture_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert capture_manifest["tested_revision"] == tested_revision
+    assert capture_manifest["source"]["blob_sha256"] == artifact.source_sha256
+    assert {
+        "canonical_document_view",
+        "content_spans",
+        "docling_document",
+        "docling_response",
+        "grobid_tei",
+        "ocr_sidecar",
+        "runtime_attestation",
+        "searchable_pdf",
+    } <= {product["name"] for product in capture_manifest["captured_products"]}

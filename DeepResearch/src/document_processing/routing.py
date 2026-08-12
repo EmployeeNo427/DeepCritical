@@ -8,8 +8,9 @@ import zipfile
 from dataclasses import dataclass
 from enum import StrEnum
 from io import BytesIO
-from pathlib import PurePath
+from pathlib import Path, PurePath
 from typing import Final
+from urllib.parse import unquote, urlparse
 
 
 class InputFormat(StrEnum):
@@ -177,6 +178,14 @@ class DocumentRouter:
             required_stages=(ProcessingStage.QUARANTINE,),
             reason="No parser is configured for the detected media type.",
         )
+
+
+def filename_from_uri(uri: str) -> str:
+    """Return the filename used by the production routing decision."""
+
+    parsed = urlparse(uri)
+    name = Path(unquote(parsed.path)).name
+    return name or "document"
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,4 +370,5 @@ __all__ = [
     "ManagedParserPolicy",
     "ProcessingStage",
     "RouteDecision",
+    "filename_from_uri",
 ]

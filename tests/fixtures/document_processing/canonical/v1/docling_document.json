@@ -1,0 +1,141 @@
+{
+  "schema_name": "DoclingDocument",
+  "version": "1.0.0",
+  "name": "APOE4 pathway",
+  "body": {
+    "self_ref": "#/body",
+    "children": [
+      {"$ref": "#/groups/0"},
+      {"$ref": "#/tables/0"},
+      {"$ref": "#/pictures/0"},
+      {"$ref": "#/formulas/0"}
+    ]
+  },
+  "furniture": {
+    "self_ref": "#/furniture",
+    "children": []
+  },
+  "groups": [
+    {
+      "self_ref": "#/groups/0",
+      "parent": {"$ref": "#/body"},
+      "label": "section_group",
+      "children": [
+        {"$ref": "#/texts/0"},
+        {"$ref": "#/texts/1"},
+        {"$ref": "#/texts/2"},
+        {"$ref": "#/texts/5"},
+        {"$ref": "#/texts/6"}
+      ]
+    }
+  ],
+  "texts": [
+    {
+      "self_ref": "#/texts/0",
+      "parent": {"$ref": "#/groups/0"},
+      "label": "title",
+      "orig": "APOE4 pathway",
+      "text": "APOE4 pathway",
+      "prov": [{"page_no": 1, "charspan": [0, 13], "bbox": {"l": 10, "t": 780, "r": 180, "b": 750, "coord_origin": "BOTTOMLEFT"}}]
+    },
+    {
+      "self_ref": "#/texts/1",
+      "parent": {"$ref": "#/groups/0"},
+      "label": "section_header",
+      "orig": "Methods",
+      "text": "Methods",
+      "prov": [{"page_no": 1, "charspan": [0, 7], "bbox": {"l": 10, "t": 730, "r": 100, "b": 710, "coord_origin": "BOTTOMLEFT"}}]
+    },
+    {
+      "self_ref": "#/texts/2",
+      "parent": {"$ref": "#/groups/0"},
+      "label": "paragraph",
+      "orig": "Endosomal pH was measured.",
+      "text": "Endosomal pH was measured.",
+      "prov": [{"page_no": 1, "charspan": [0, 26], "bbox": {"l": 10, "t": 690, "r": 260, "b": 670, "coord_origin": "BOTTOMLEFT"}}]
+    },
+    {
+      "self_ref": "#/texts/3",
+      "parent": {"$ref": "#/tables/0"},
+      "label": "caption",
+      "orig": "Table 1. Cohort.",
+      "text": "Table 1. Cohort.",
+      "prov": [{"page_no": 1, "charspan": [0, 16], "bbox": {"l": 10, "t": 620, "r": 180, "b": 600, "coord_origin": "BOTTOMLEFT"}}]
+    },
+    {
+      "self_ref": "#/texts/4",
+      "parent": {"$ref": "#/pictures/0"},
+      "label": "caption",
+      "orig": "Figure 1. Endosomes.",
+      "text": "Figure 1. Endosomes.",
+      "prov": [{"page_no": 1, "charspan": [0, 20], "bbox": {"l": 10, "t": 470, "r": 220, "b": 450, "coord_origin": "BOTTOMLEFT"}}]
+    },
+    {
+      "self_ref": "#/texts/5",
+      "parent": {"$ref": "#/groups/0"},
+      "label": "citation",
+      "orig": "[1]",
+      "text": "[1]",
+      "prov": [{"page_no": 1, "charspan": [0, 3], "bbox": {"l": 10, "t": 420, "r": 35, "b": 400, "coord_origin": "BOTTOMLEFT"}}]
+    },
+    {
+      "self_ref": "#/texts/6",
+      "parent": {"$ref": "#/groups/0"},
+      "label": "reference",
+      "orig": "Smith 2026 endosomal study.",
+      "text": "Smith 2026 endosomal study.",
+      "prov": [{"page_no": 1, "charspan": [0, 27], "bbox": {"l": 10, "t": 380, "r": 270, "b": 360, "coord_origin": "BOTTOMLEFT"}}]
+    }
+  ],
+  "tables": [
+    {
+      "self_ref": "#/tables/0",
+      "parent": {"$ref": "#/body"},
+      "label": "table",
+      "captions": [{"$ref": "#/texts/3"}],
+      "children": [{"$ref": "#/texts/3"}],
+      "data": {
+        "num_rows": 2,
+        "num_cols": 2,
+        "table_cells": [
+          {"text": "Group", "start_row_offset_idx": 0, "end_row_offset_idx": 1, "start_col_offset_idx": 0, "end_col_offset_idx": 1, "row_span": 1, "col_span": 1, "column_header": true, "row_header": false, "row_section": false, "fillable": false},
+          {"text": "N", "start_row_offset_idx": 0, "end_row_offset_idx": 1, "start_col_offset_idx": 1, "end_col_offset_idx": 2, "row_span": 1, "col_span": 1, "column_header": true, "row_header": false, "row_section": false, "fillable": false},
+          {"text": "APOE4", "start_row_offset_idx": 1, "end_row_offset_idx": 2, "start_col_offset_idx": 0, "end_col_offset_idx": 1, "row_span": 1, "col_span": 1, "column_header": false, "row_header": true, "row_section": false, "fillable": false},
+          {"text": "12", "start_row_offset_idx": 1, "end_row_offset_idx": 2, "start_col_offset_idx": 1, "end_col_offset_idx": 2, "row_span": 1, "col_span": 1, "column_header": false, "row_header": false, "row_section": false, "fillable": false}
+        ],
+        "grid": [
+          [
+            {"text": "Group", "start_row_offset_idx": 0, "end_row_offset_idx": 1, "start_col_offset_idx": 0, "end_col_offset_idx": 1, "row_span": 1, "col_span": 1, "column_header": true, "row_header": false, "row_section": false, "fillable": false},
+            {"text": "N", "start_row_offset_idx": 0, "end_row_offset_idx": 1, "start_col_offset_idx": 1, "end_col_offset_idx": 2, "row_span": 1, "col_span": 1, "column_header": true, "row_header": false, "row_section": false, "fillable": false}
+          ],
+          [
+            {"text": "APOE4", "start_row_offset_idx": 1, "end_row_offset_idx": 2, "start_col_offset_idx": 0, "end_col_offset_idx": 1, "row_span": 1, "col_span": 1, "column_header": false, "row_header": true, "row_section": false, "fillable": false},
+            {"text": "12", "start_row_offset_idx": 1, "end_row_offset_idx": 2, "start_col_offset_idx": 1, "end_col_offset_idx": 2, "row_span": 1, "col_span": 1, "column_header": false, "row_header": false, "row_section": false, "fillable": false}
+          ]
+        ]
+      }
+    }
+  ],
+  "pictures": [
+    {
+      "self_ref": "#/pictures/0",
+      "parent": {"$ref": "#/body"},
+      "label": "picture",
+      "captions": [{"$ref": "#/texts/4"}],
+      "children": [{"$ref": "#/texts/4"}]
+    }
+  ],
+  "formulas": [
+    {
+      "self_ref": "#/formulas/0",
+      "parent": {"$ref": "#/body"},
+      "label": "formula",
+      "orig": "pH = -log10[H+]",
+      "text": "pH = -log10[H+]",
+      "prov": [{"page_no": 1, "charspan": [0, 15], "bbox": {"l": 10, "t": 330, "r": 180, "b": 310, "coord_origin": "BOTTOMLEFT"}}]
+    }
+  ],
+  "key_value_items": [],
+  "form_items": [],
+  "pages": {"1": {"page_no": 1, "size": {"width": 612, "height": 792}}}
+}

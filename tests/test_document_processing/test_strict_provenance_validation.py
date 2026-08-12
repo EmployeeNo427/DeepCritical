@@ -278,6 +278,28 @@ def test_duplicate_self_refs_and_canonical_aliases_are_global_errors() -> None:
     }
 
 
+def test_formula_nodes_are_valid_reference_targets() -> None:
+    document = _document()
+    document["formulas"] = [
+        {
+            "self_ref": "#/formulas/0",
+            "label": "formula",
+            "text": "E = mc²",
+        }
+    ]
+    document["body"]["children"].append({"$ref": "#/formulas/0"})
+
+    report = DoclingQualityValidator().validate(
+        document,
+        require_pdf_geometry=True,
+    )
+
+    assert not any(
+        issue.code == "BROKEN_DOCLING_REFERENCE" and issue.item_ref == "#/formulas/0"
+        for issue in report.issues
+    )
+
+
 def test_span_ids_remain_unique_for_rejected_duplicate_self_refs() -> None:
     document = _document(item_count=2)
     document["texts"][1] = deepcopy(document["texts"][0])

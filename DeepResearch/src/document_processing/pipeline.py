@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import unquote, urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -22,6 +21,16 @@ from .adapters import (
     NativeTextLocator,
 )
 from .alignment import DoclingGrobidAligner, ScholarlyAlignmentOverlay
+from .canonical import (
+    CANONICAL_COMPONENT_CAPABILITY,
+    CANONICAL_COMPONENT_ID,
+    CANONICAL_COMPONENT_VERSION,
+    CanonicalDiagnosticSeverity,
+    CanonicalDocumentView,
+    CanonicalizationConfig,
+    build_canonical_document_view,
+    canonical_invocation_configuration,
+)
 from .clients import (
     DEFAULT_DOCLING_MAX_RESPONSE_BYTES,
     DEFAULT_GROBID_MAX_RESPONSE_BYTES,
@@ -59,6 +68,19 @@ from .models import (
     sha256_bytes,
     utc_now,
 )
+from .native_contracts import (
+    DOCLING_COMPONENT_VERSION,
+    DOCLING_CONTAINER_IMAGE,
+    DOCLING_SERVE_VERSION,
+    GROBID_COMPONENT_VERSION,
+    GROBID_CONTAINER_IMAGE,
+    OCR_COMPONENT_VERSION,
+    OCR_CONTAINER_IMAGE,
+    OCR_DIGEST_RUNNER_VERSION,
+    OUTPUT_POLICY_SCHEMA_VERSION,
+    REMOTE_ATTESTATION_CONTRACT_VERSION,
+    RUNTIME_ATTESTATION_SCHEMA_VERSION,
+)
 from .preflight import (
     PreflightDecision,
     PreflightDiagnostic,
@@ -87,6 +109,7 @@ from .validation import (
     align_jats_content_spans,
     build_docling_content_spans,
     build_pdf_content_spans,
+    parse_content_integrity_report,
     probably_image_only,
     validate_content_integrity,
 )
@@ -120,6 +143,7 @@ _COMPONENT_CAPABILITIES = {
     "ocrmypdf": "document.ocr",
     "docling-grobid-aligner": "document.align",
     "docling-content-integrity": "document.validate",
+    CANONICAL_COMPONENT_ID: CANONICAL_COMPONENT_CAPABILITY,
 }
 
 
@@ -139,9 +163,9 @@ class DocumentProcessingConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    docling_version: str = "2.113.0"
-    docling_serve_version: str = "1.21.0"
-    docling_container_image: str = "quay.io/docling-project/docling-serve-cpu:v1.21.0"
+    docling_version: str = DOCLING_COMPONENT_VERSION
+    docling_serve_version: str = DOCLING_SERVE_VERSION
+    docling_container_image: str = DOCLING_CONTAINER_IMAGE
     docling_container_digest: OciDigest | None = None
     docling_model_versions: dict[str, str] = Field(default_factory=dict)
     docling_model_hashes: dict[str, Sha256] = Field(default_factory=dict)
@@ -149,9 +173,9 @@ class DocumentProcessingConfig(BaseModel):
     docling_max_response_bytes: int = Field(
         default=DEFAULT_DOCLING_MAX_RESPONSE_BYTES, gt=0, strict=True
     )
-    grobid_version: str = "0.9.0"
+    grobid_version: str = GROBID_COMPONENT_VERSION
     grobid_enabled: bool = True
-    grobid_container_image: str = "deepcritical/grobid:0.9.0-full-p0-c2"
+    grobid_container_image: str = GROBID_CONTAINER_IMAGE
     grobid_container_digest: OciDigest | None = None
     grobid_model_versions: dict[str, str] = Field(default_factory=dict)
     grobid_model_hashes: dict[str, Sha256] = Field(default_factory=dict)
@@ -159,10 +183,10 @@ class DocumentProcessingConfig(BaseModel):
         default=DEFAULT_GROBID_MAX_RESPONSE_BYTES, gt=0, strict=True
     )
     grobid_minimum_text_characters: int = Field(default=100, ge=0)
-    ocrmypdf_version: str = "17.4.1"
+    ocrmypdf_version: str = OCR_COMPONENT_VERSION
     ocr_enabled: bool = True
     ocr_mode: Literal["container_cli", "local_cli"] = "container_cli"
-    ocr_container_image: str = "jbarlow83/ocrmypdf:v17.4.1"
+    ocr_container_image: str = OCR_CONTAINER_IMAGE
     ocr_container_digest: OciDigest | None = None
     ocr_languages: tuple[str, ...] = ("eng",)
     detect_image_only_pdfs: bool = True
@@ -282,6 +306,7 @@ class DocumentProcessingResult:
     grobid_tei_sha256: str | None = None
     alignment_sha256: str | None = None
     content_integrity_sha256: str | None = None
+    canonical_document_sha256: str | None = None
     content_span_count: int = 0
     derivative_artifact_ids: tuple[str, ...] = ()
 
@@ -333,12 +358,13 @@ _PIPELINE_CONTEXT: ContextVar[_PipelineContext | None] = ContextVar(
 # ``configuration``. Individual configurations contain immutable input hashes
 # and explain which conditional branch actually ran. The policy snapshot is the
 # static contract used to judge whether two workflows were comparable.
-_OUTPUT_POLICY_SCHEMA_VERSION = "deepcritical-document-output-policy-v2"
+_OUTPUT_POLICY_SCHEMA_VERSION = OUTPUT_POLICY_SCHEMA_VERSION
 _OUTPUT_POLICY_ROUTING_VERSION = "deterministic-document-router-v1"
 _PDF_CONTENT_SPAN_ALGORITHM = "provenance-charspan-v2"
 _OUTPUT_POLICY_ALGORITHM_VERSIONS: dict[str, str] = {
     "bioc_locator_alignment": "normalized-exact-v1",
     "content_integrity": "explicit-content-integrity-v1",
+    "canonical_document": "project-owned-canonical-view-v1",
     "docling_quality_validation": "docling-quality-v2",
     "grobid_docling_alignment": "token-sequence-v2",
     "jats_locator_alignment": "normalized-exact-v1",
@@ -346,15 +372,14 @@ _OUTPUT_POLICY_ALGORITHM_VERSIONS: dict[str, str] = {
     "preflight": "bounded-input-inspection-v1",
 }
 _OUTPUT_POLICY_CONTRACT_SCHEMAS: dict[str, str] = {
+    "canonical_document": "deepcritical-canonical-document-view-v1",
     "content_span": "1",
     "diagnostic_manifest": "1",
     "docling_document": "DoclingDocument",
 }
-_RUNTIME_ATTESTATION_SCHEMA_VERSION = "deepcritical-runtime-attestation-v1"
-_REMOTE_ATTESTATION_CONTRACT_VERSION = (
-    "deepcritical-authenticated-runtime-attestation-reporter-v1"
-)
-_OCR_DIGEST_RUNNER_VERSION = "deepcritical-container-ocr-runner-v1"
+_RUNTIME_ATTESTATION_SCHEMA_VERSION = RUNTIME_ATTESTATION_SCHEMA_VERSION
+_REMOTE_ATTESTATION_CONTRACT_VERSION = REMOTE_ATTESTATION_CONTRACT_VERSION
+_OCR_DIGEST_RUNNER_VERSION = OCR_DIGEST_RUNNER_VERSION
 
 # Runtime supervisors must report these canonical component names with exact
 # version values. In particular, a version embedded in an unrelated component
@@ -1350,7 +1375,8 @@ class DocumentProcessor:
         }
         native_locator_bytes = (
             _canonical_json_bytes(_native_locator_payload(native_locators))
-            if native_locators
+            if input_format
+            in {InputFormat.JATS, InputFormat.BIOC_JSON, InputFormat.BIOC_XML}
             else None
         )
         if input_format is InputFormat.JATS:
@@ -2407,6 +2433,231 @@ class DocumentProcessor:
                 ),
             )
 
+    def _run_canonicalization(
+        self,
+        artifact: DocumentArtifact,
+        docling_run: ProcessingRun,
+        *,
+        selected_grobid_run: ProcessingRun | None,
+        scholarly_alignment_product: DataProductRef | None,
+        integrity_run: ProcessingRun,
+        configuration: CanonicalizationConfig,
+    ) -> tuple[ProcessingRun, CanonicalDocumentView] | None:
+        """Build a project-owned view exclusively from verified durable products."""
+
+        invocation_configuration = canonical_invocation_configuration(
+            configuration,
+            (),
+        )
+        started = utc_now()
+        started_clock = time.perf_counter()
+        verified_inputs: list[DataProductRef] = []
+        try:
+            docling_product = docling_run.require_output("docling_document")
+            content_spans_product = docling_run.require_output("content_spans")
+            integrity_product = integrity_run.require_output(
+                "content_integrity_overlay"
+            )
+            inputs: list[DataProductRef] = [docling_product, content_spans_product]
+            alignment_edge: (
+                tuple[
+                    DataProductRef,
+                    tuple[DataProductRef, DataProductRef],
+                ]
+                | None
+            ) = None
+            if scholarly_alignment_product is not None:
+                if selected_grobid_run is None:
+                    raise ValueError(
+                        "a scholarly alignment requires its selected GROBID run"
+                    )
+                grobid_product = selected_grobid_run.require_output("grobid_tei")
+                inputs.extend((grobid_product, scholarly_alignment_product))
+                alignment_edge = (
+                    scholarly_alignment_product,
+                    (docling_product, grobid_product),
+                )
+            inputs.append(integrity_product)
+            unique_inputs = tuple(
+                {product.product_id: product for product in inputs}.values()
+            )
+            invocation_configuration = canonical_invocation_configuration(
+                configuration,
+                unique_inputs,
+            )
+
+            persisted_inputs: dict[str, bytes] = {}
+            for product in unique_inputs:
+                persisted_inputs[product.product_id] = (
+                    self.store.read_data_product_bytes(product)
+                )
+                verified_inputs.append(product)
+
+            if alignment_edge is not None:
+                alignment_product, expected_alignment_inputs = alignment_edge
+                alignment_run = self.store.get_processing_run(
+                    alignment_product.producer_run_id
+                )
+                if alignment_run.inputs != expected_alignment_inputs:
+                    raise ValueError(
+                        "scholarly alignment producer inputs must exactly match "
+                        "the current Docling and GROBID products"
+                    )
+
+            durable_integrity_run = self.store.get_processing_run(
+                integrity_product.producer_run_id
+            )
+            expected_integrity_inputs = (docling_product,) + (
+                (scholarly_alignment_product,)
+                if scholarly_alignment_product is not None
+                else ()
+            )
+            if durable_integrity_run.inputs != expected_integrity_inputs:
+                raise ValueError(
+                    "content-integrity producer inputs must exactly match the "
+                    "current Docling and optional scholarly alignment products"
+                )
+
+            docling_payload = json.loads(persisted_inputs[docling_product.product_id])
+            if not isinstance(docling_payload, dict):
+                raise ValueError("Docling product must contain an object")
+            span_set = ContentSpanSet.model_validate_json(
+                persisted_inputs[content_spans_product.product_id]
+            )
+            integrity_payload = json.loads(
+                persisted_inputs[integrity_product.product_id]
+            )
+            if not isinstance(integrity_payload, dict):
+                raise ValueError("content-integrity product must contain an object")
+            parsed_integrity = parse_content_integrity_report(integrity_payload)
+            durable_docling_sha256 = sha256_bytes(
+                persisted_inputs[docling_product.product_id]
+            )
+            if parsed_integrity.document_sha256 != durable_docling_sha256:
+                raise ValueError(
+                    "content-integrity document hash must match the durable "
+                    "Docling product"
+                )
+            expected_scholarly_overlay = scholarly_alignment_product is not None
+            if (
+                parsed_integrity.scholarly_overlay_present
+                is not expected_scholarly_overlay
+            ):
+                raise ValueError(
+                    "content-integrity scholarly overlay presence must match "
+                    "canonical source products"
+                )
+            scholarly_overlay = None
+            if scholarly_alignment_product is not None:
+                alignment_payload = json.loads(
+                    persisted_inputs[scholarly_alignment_product.product_id]
+                )
+                if not isinstance(alignment_payload, dict):
+                    raise ValueError(
+                        "scholarly alignment product must contain an object"
+                    )
+                scholarly_overlay = ScholarlyAlignmentOverlay.from_dict(
+                    alignment_payload
+                )
+
+            reusable = self._reusable_run(
+                artifact,
+                CANONICAL_COMPONENT_ID,
+                invocation_configuration,
+            )
+            if (
+                reusable is not None
+                and reusable.output("canonical_document_view") is not None
+            ):
+                self._reconcile_run_diagnostics(artifact, reusable)
+                view = self.store.read_canonical_document(
+                    reusable.require_output("canonical_document_view")
+                )
+                if (
+                    reusable.inputs != unique_inputs
+                    or view.source_products != unique_inputs
+                ):
+                    raise ValueError(
+                        "reused canonical source products must exactly match run inputs"
+                    )
+                return reusable, view
+
+            view = build_canonical_document_view(
+                artifact=artifact,
+                docling_document=docling_payload,
+                docling_product=docling_product,
+                content_span_set=span_set,
+                source_products=unique_inputs,
+                configuration=configuration,
+                scholarly_overlay=scholarly_overlay,
+                integrity_report=integrity_payload,
+            )
+            if view.source_products != unique_inputs:
+                raise ValueError(
+                    "canonical view source products must exactly match run inputs"
+                )
+            view_blob = self.store.put_canonical_document(view)
+            run_id = _run_id()
+            has_errors = any(
+                diagnostic.severity is CanonicalDiagnosticSeverity.ERROR
+                for diagnostic in view.diagnostics
+            )
+            run = ProcessingRun(
+                run_id=run_id,
+                artifact_id=artifact.artifact_id,
+                stage_id="canonical-document-view",
+                component=_component_descriptor(
+                    CANONICAL_COMPONENT_ID,
+                    CANONICAL_COMPONENT_VERSION,
+                ),
+                configuration=invocation_configuration,
+                configuration_sha256=configuration_sha256(invocation_configuration),
+                started_at=started,
+                finished_at=utc_now(),
+                status=(
+                    ProcessingRunStatus.PARTIAL
+                    if has_errors
+                    else ProcessingRunStatus.COMPLETE
+                ),
+                resource_usage=ResourceUsage(
+                    wall_time_seconds=time.perf_counter() - started_clock,
+                    input_bytes=sum(product.byte_size for product in unique_inputs),
+                    output_bytes=view_blob.byte_size,
+                ),
+                warnings=tuple(
+                    dict.fromkeys(diagnostic.code for diagnostic in view.diagnostics)
+                ),
+                inputs=view.source_products,
+                outputs=self.store.data_product_refs(
+                    {"canonical_document_view": view_blob.sha256},
+                    producer_run_id=run_id,
+                    source_artifact_ids=self._source_artifact_ids(
+                        artifact, unique_inputs
+                    ),
+                ),
+                completed_stages=(
+                    "normalize_structure",
+                    "bind_native_anchors",
+                    "resolve_relationships",
+                    "validate_canonical_view",
+                ),
+            )
+            return self._commit_processing_run(artifact, run), view
+        except ProcessingRunCommitIncompleteError:
+            raise
+        except Exception as exc:
+            self._save_failed_run(
+                artifact,
+                component_id=CANONICAL_COMPONENT_ID,
+                component_version=CANONICAL_COMPONENT_VERSION,
+                configuration=invocation_configuration,
+                started_at=started,
+                started_clock=started_clock,
+                error=exc,
+                inputs=tuple(verified_inputs),
+            )
+            return None
+
     def _reusable_run(
         self,
         artifact: DocumentArtifact,
@@ -3179,6 +3430,7 @@ def _native_locator_payload(
             "document_index": item.document_index,
             "document_id": item.document_id,
             "passage_index": item.passage_index,
+            "sentence_index": item.sentence_index,
             "offset": item.offset,
             "length": item.length,
             "xml_id": item.xml_id,
@@ -3338,12 +3590,6 @@ def _tei_text_length(tei_xml: bytes) -> int:
     except ElementTree.ParseError:
         return 0
     return len(" ".join("".join(root.itertext()).split()))
-
-
-def _filename_from_uri(uri: str) -> str:
-    parsed = urlparse(uri)
-    name = Path(unquote(parsed.path)).name
-    return name or "document"
 
 
 __all__ = [
