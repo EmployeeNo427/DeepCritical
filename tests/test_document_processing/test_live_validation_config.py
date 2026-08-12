@@ -303,6 +303,10 @@ def test_all_real_job_runs_one_capture_capable_pipeline_with_every_runtime() -> 
 
 def test_quality_job_enforces_the_complete_repository_gate() -> None:
     workflow = _live_workflow()
+    assert workflow["concurrency"] == {
+        "group": "document-processing-live-${{ github.ref }}",
+        "cancel-in-progress": True,
+    }
     jobs = workflow["jobs"]
     quality = jobs["quality"]
     assert quality["timeout-minutes"] == 30
