@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<TEI xml:space="preserve" xmlns="http://www.tei-c.org/ns/1.0" 
+xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+xsi:schemaLocation="http://www.tei-c.org/ns/1.0 https://raw.githubusercontent.com/kermitt2/grobid/master/grobid-home/schemas/xsd/Grobid.xsd"
+ xmlns:xlink="http://www.w3.org/1999/xlink">
+	<teiHeader xml:lang="en">
+		<fileDesc>
+			<titleStmt>
+				<title level="a" type="main"></title>
+			</titleStmt>
+			<publicationStmt>
+				<publisher/>
+				<availability status="unknown"><licence/></availability>
+			</publicationStmt>
+			<sourceDesc>
+				<biblStruct status="extracted">
+					<analytic>
+					</analytic>
+					<monogr>
+						<imprint>
+							<date/>
+						</imprint>
+					</monogr>
+					<idno type="MD5">C7C3BD426DDB8586185A3CF59D407493</idno>
+				</biblStruct>
+			</sourceDesc>
+		</fileDesc>
+		<encodingDesc>
+			<appInfo>
+				<application version="0.9.0" ident="GROBID" when="2026-08-12T10:51+0000">
+					<desc>GROBID - A machine learning software for extracting information from scholarly documents</desc>
+					<label type="revision">0.9.0</label>
+					<label type="parameters">startPage=-1, endPage=-1, consolidateCitations=0, consolidateHeader=0, consolidateFunders=0, includeRawAffiliations=false, includeRawCitations=true, includeRawCopyrights=false, generateTeiIds=false, generateTeiCoordinates=[persName, head, p, s, ref, biblStruct, figure, formula], flavor=null</label>
+					<ref target="https://github.com/kermitt2/grobid"/>
+				</application>
+			</appInfo>
+		</encodingDesc>
+		<profileDesc>
+			<abstract/>
+		</profileDesc>
+	</teiHeader>
+	<facsimile>
+		<surface n="1" ulx="0.0" uly="0.0" lrx="612.0" lry="792.0"/>
+	</facsimile>
+	<text xml:lang="en">
+		<body>
+<div xmlns="http://www.tei-c.org/ns/1.0"><p coords="1,168.21,288.79,274.34,9.50;1,273.56,304.97,63.79,9.50;1,107.54,321.15,395.57,9.50;1,111.58,337.34,387.46,9.50;1,277.60,353.52,55.44,9.50;1,119.67,369.71,371.55,9.50;1,111.58,385.89,387.48,9.50;1,277.60,402.07,55.71,9.50;1,111.58,418.26,387.72,9.50;1,107.54,434.44,396.52,9.50;1,265.46,450.62,79.70,9.50;1,123.72,466.81,363.20,9.50;1,265.46,482.99,79.70,9.50;1,152.03,499.17,308.22,9.50"><s coords="1,168.21,288.79,274.34,9.50;1,273.56,304.97,63.79,9.50;1,107.54,321.15,395.57,9.50;1,111.58,337.34,387.46,9.50;1,277.60,353.52,55.44,9.50;1,119.67,369.71,371.55,9.50;1,111.58,385.89,387.48,9.50;1,277.60,402.07,55.71,9.50;1,111.58,418.26,387.72,9.50;1,107.54,434.44,396.52,9.50;1,265.46,450.62,79.70,9.50;1,123.72,466.81,363.20,9.50;1,265.46,482.99,79.70,9.50;1,152.03,499.17,308.22,9.50">DEEPLRITICAL PARSER CONTRACT STUDY HES TRACT THIS FASTER PAPER REPORTS A CONTROLLED EXPERIMENT THE STUDY TESTS REPRODUCIBLE DOCUMENT PROCESSING METHODS LELLS RECELWED CONTROL OF TREATMENT CONDITIONS PARSER OUTPUTS WERE CAPTURED FOR CRITICAL REVIEW RESULTS TREATMENT INCREASED RESPONSE RELATIVE TO CONTROL THE OBSERWED RESULT WAS CONSISTENT ACROSS REPEATS DISCUSSION THE EWIDENCE SUPPORTS REPROOUCIBLE ASSESSMENT REFERENCES RESEARCHER SYNTHETIC PARSER EWALUATION</s></p></div>		</body>
+		<back>
+			<div type="references">
+
+				<listBibl/>
+			</div>
+		</back>
+	</text>
+</TEI>

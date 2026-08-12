@@ -1,0 +1,5 @@
+# Frozen service-capture payloads are reviewed through their manifest hashes
+# and contract tests; Git must preserve their exact native bytes.
+tests/fixtures/document_processing/canonical/service_capture/v1/docling_document.json binary
+tests/fixtures/document_processing/canonical/service_capture/v1/grobid.tei.xml binary
+tests/fixtures/document_processing/canonical/service_capture/v1/source-rich-raster.pdf binary

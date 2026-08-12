@@ -444,9 +444,19 @@ text threshold forces the external OCR derivative, and the successful GROBID
 fallback supplies scholarly evidence to canonicalization. The job reads the
 canonical product through verified storage, captures the synthetic source and
 native parser products with an exact-revision manifest, and uploads that
-evidence for review. Invocation-dependent OCR and canonical bytes are evidence,
-not frozen reproducibility fixtures; only native parser outputs from a
-successful capture may be promoted in a later reviewed commit.
+evidence for review. Invocation-dependent OCR and canonical bytes remain run
+evidence rather than reproducibility fixtures. The reviewed
+`tests/fixtures/document_processing/canonical/service_capture/v1/` bundle was
+promoted from one successful exact-head run and freezes only the deterministic
+raster source, the Docling document selected by the canonical view, and the
+selected fallback-GROBID TEI. Its allowlisted manifest records exact service
+and image provenance, accepted partial outcomes, payload hashes, and offline
+replay policy without copying credentials, container/workload IDs, processing
+run IDs, the OCR derivative, or the live canonical bytes. Tests regenerate the
+source, replay native quality and reference checks, parse the TEI contract, and
+rebuild the canonical view twice with stable synthetic identities. This is a
+service-compatibility fixture, not a claim that parser output is reproducible
+across service or model upgrades.
 
 With the digest-pinned compose stack already healthy, run the direct Docling
 and GROBID contracts explicitly:

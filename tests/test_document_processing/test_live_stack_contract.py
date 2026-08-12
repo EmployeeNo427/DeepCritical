@@ -734,9 +734,8 @@ def synthetic_image_only_pdf() -> bytes:
     )
 
 
-@pytest.fixture(scope="session")
-def synthetic_rich_image_only_pdf() -> bytes:
-    """Return a rich raster paper that both real OCR boundaries can parse."""
+def rich_raster_pdf_bytes() -> bytes:
+    """Return the stable raster source used by live capture and offline replay."""
 
     return _raster_only_pdf(
         (
@@ -759,6 +758,13 @@ def synthetic_rich_image_only_pdf() -> bytes:
         height=2100,
         scale=8,
     )
+
+
+@pytest.fixture(scope="session")
+def synthetic_rich_image_only_pdf() -> bytes:
+    """Return a rich raster paper that both real OCR boundaries can parse."""
+
+    return rich_raster_pdf_bytes()
 
 
 @pytest.mark.asyncio
@@ -1341,14 +1347,27 @@ async def test_live_all_real_pipeline_captures_native_outputs(
     )
     assert len(unowned_runs) == 1
     intake_preflight = unowned_runs[0]
+    assert intake_preflight.artifact_id == artifact.artifact_id
     assert intake_preflight.component_id == "document-preflight"
     assert intake_preflight.stage_id == "document-preflight"
     assert intake_preflight.stage_invocation_id is None
+    assert intake_preflight.status is ProcessingRunStatus.COMPLETE
+    assert intake_preflight.require_output("preflight_result")
 
     pipeline_runs = tuple(
         run for run in result.processing_runs if run.pipeline_run_id is not None
     )
     assert pipeline_runs
+    derivative_preflights = tuple(
+        run for run in pipeline_runs if run.component_id == "document-preflight"
+    )
+    assert len(derivative_preflights) == 1
+    derivative_preflight = derivative_preflights[0]
+    assert derivative_preflight.artifact_id == derivative_id
+    assert derivative_preflight.stage_id == "ocr"
+    assert derivative_preflight.pipeline_run_id == ocr_run.pipeline_run_id
+    assert derivative_preflight.stage_invocation_id == ocr_run.stage_invocation_id
+
     stage_invocations: dict[str, str] = {}
     for run in pipeline_runs:
         invocation_id = run.stage_invocation_id

@@ -1,0 +1,259 @@
+{
+  "accepted_outcomes": {
+    "overall_status": "partial",
+    "stages": {
+      "alignment": {
+        "accepted_for_fixture": true,
+        "component_id": "docling-grobid-aligner",
+        "reason_codes": [
+          "SCHOLARLY_ANNOTATIONS_UNALIGNED"
+        ],
+        "selected_native_output": false,
+        "status": "complete"
+      },
+      "canonicalize": {
+        "accepted_for_fixture": true,
+        "component_id": "canonical-document-view",
+        "reason_codes": [
+          "UNRESOLVED_SCHOLARLY_ANCHOR"
+        ],
+        "selected_native_output": false,
+        "status": "complete"
+      },
+      "docling": {
+        "accepted_for_fixture": true,
+        "component_id": "docling",
+        "reason_codes": [
+          "DOCLING_RUNTIME_PROVENANCE_INCOMPLETE"
+        ],
+        "selected_native_output": true,
+        "status": "partial"
+      },
+      "fallback-grobid": {
+        "accepted_for_fixture": true,
+        "component_id": "grobid",
+        "reason_codes": [
+          "GROBID_RUNTIME_PROVENANCE_INCOMPLETE"
+        ],
+        "selected_native_output": true,
+        "status": "partial"
+      },
+      "integrity": {
+        "accepted_for_fixture": true,
+        "component_id": "docling-content-integrity",
+        "reason_codes": [],
+        "selected_native_output": false,
+        "status": "complete"
+      },
+      "ocr": {
+        "accepted_for_fixture": true,
+        "component_id": "ocrmypdf",
+        "reason_codes": [],
+        "selected_native_output": false,
+        "status": "complete"
+      },
+      "primary-grobid": {
+        "accepted_for_fixture": true,
+        "component_id": "grobid",
+        "input_kind": "raster-source-pdf",
+        "reason_codes": [
+          "GROBID_CONVERSION_FAILED"
+        ],
+        "selected_native_output": false,
+        "status": "failed"
+      }
+    }
+  },
+  "capture": {
+    "evidence_artifact_digest": "sha256:7dbdfb0c9f30f6d881739fa3b12c2e7afa872265c7434d032d1668c636311feb",
+    "evidence_artifact_id": 9138405936,
+    "evidence_artifact_name": "document-processing-all-real-31587722084",
+    "native_inventory_sha256": "eda08ebbdfb858cb4e56b9e5cb316e84fe07945d49127260dfdfa0a286361447",
+    "raw_manifest_schema": "deepcritical-live-all-real-evidence-v1",
+    "raw_manifest_sha256": "4b1c5cdd20eca223a341c0e83f48adbef9a6c912431bafa3a9b0721b54ae85c8",
+    "repository": "EmployeeNo427/DeepCritical",
+    "tested_revision": "a2c91ddcd7f4c38cd011a11487e02296c3c356a8",
+    "workflow_job": "all-real",
+    "workflow_path": ".github/workflows/document-processing-live.yml",
+    "workflow_run_attempt": 1,
+    "workflow_run_id": 31587722084
+  },
+  "files": {
+    "README.md": {
+      "byte_size": 1732,
+      "media_type": "text/markdown",
+      "role": "fixture-documentation",
+      "sha256": "acfd659ba782696f7e621ac2c2210e87aabdcfd7eb167733888b8375246cf15b"
+    },
+    "docling_document.json": {
+      "byte_size": 119215,
+      "media_type": "application/json",
+      "role": "selected-native-docling-document",
+      "sha256": "b9cb05a9af0f9d2689341b856f18e2f5fe8cd03250b6b39ce3cf16dddd8b2f61"
+    },
+    "grobid.tei.xml": {
+      "byte_size": 3140,
+      "media_type": "application/tei+xml",
+      "role": "selected-native-grobid-tei",
+      "sha256": "08798caa0545a3396fa9a20d4bdf363282d95e1526dfdbaa1f35ab79b1dadf7e"
+    },
+    "source-rich-raster.pdf": {
+      "byte_size": 17334,
+      "media_type": "application/pdf",
+      "role": "synthetic-raster-source",
+      "sha256": "bc19b80bb3a4ca8ddab1cccad234a6f0622a7bdbf843735cb31a0445bc6a5fe0"
+    }
+  },
+  "fixture_version": "v1",
+  "quality": {
+    "docling": {
+      "broken_reference_count": 0,
+      "issue_codes": [],
+      "located_text_item_count": 1,
+      "locator_coverage": 1.0,
+      "reference_count": 2,
+      "text_item_count": 1
+    },
+    "grobid": {
+      "annotation_count": 3,
+      "normalized_text_characters": 461,
+      "normalized_text_sha256": "fb88b55aeb49249dec1845360ecb549d7c8cf987e5dc27c7601254e95a7a1e78"
+    }
+  },
+  "replay": {
+    "algorithm": "token-sequence-v2",
+    "aligned_count": 0,
+    "artifact_id": "service-capture-v1",
+    "canonical_source_order": [
+      "docling_document",
+      "content_spans",
+      "grobid_tei",
+      "alignment_overlay",
+      "content_integrity_overlay"
+    ],
+    "content_span_count": 1,
+    "expected_diagnostics": {
+      "UNRESOLVED_SCHOLARLY_ANCHOR": 3
+    },
+    "expected_scholarly_anchor_count": 0,
+    "minimum_alignment_score": 0.72,
+    "producer_run_ids": {
+      "alignment": "service-capture-v1-alignment",
+      "docling": "service-capture-v1-docling",
+      "grobid": "service-capture-v1-grobid",
+      "integrity": "service-capture-v1-integrity"
+    },
+    "unaligned_count": 3
+  },
+  "schema_version": "deepcritical-service-capture-fixture-v1",
+  "selection": {
+    "docling_document": {
+      "file": "docling_document.json",
+      "product_schema_version": "docling-document-v1",
+      "source_kind": "source-raster-pdf",
+      "stage_id": "docling"
+    },
+    "grobid_tei": {
+      "file": "grobid.tei.xml",
+      "product_schema_version": "tei-p5",
+      "source_kind": "ocr-derivative-pdf",
+      "stage_id": "fallback-grobid"
+    }
+  },
+  "services": {
+    "docling": {
+      "component_id": "docling",
+      "component_version": "2.96.1",
+      "container_image_id": "sha256:d3ad0dd8e3baac86423e207de7f7c4aaa9dd1f6ddbc888110db29bb1dccaa1bb",
+      "container_reference": "quay.io/docling-project/docling-serve-cpu:v1.21.0@sha256:c7d56cf78c45ab61406bc2dfebbac562c16e38538393f838991a949577cd3d0a",
+      "options": {
+        "do_ocr": true,
+        "image_export_mode": "embedded",
+        "table_mode": "accurate",
+        "to_formats": [
+          "json"
+        ]
+      },
+      "runtime_attestation": {
+        "component_versions": {
+          "docling": "2.96.1",
+          "docling_serve": "1.21.0"
+        },
+        "contract_version": "deepcritical-authenticated-runtime-attestation-reporter-v1",
+        "model_hashes": {},
+        "model_versions": {},
+        "reporter_id": "github-actions-docker-inspector",
+        "schema_version": "deepcritical-runtime-attestation-v1",
+        "source": "authenticated_deployment_reporter"
+      },
+      "serve_version": "1.21.0"
+    },
+    "grobid": {
+      "base_image_reference": "grobid/grobid:0.9.0-full@sha256:52774a8375b30a9bd541936964b48600c65afdb2e9120ae4764322478ab0ca0d",
+      "component_id": "grobid",
+      "component_version": "0.9.0",
+      "container_image_id": "sha256:7bdb827f785b07ceb8b5494de9615d5b4fa90001aa34db4b2ed8070fdbd9e6ca",
+      "container_reference": "deepcritical/grobid:0.9.0-full-p0-c2@sha256:7bdb827f785b07ceb8b5494de9615d5b4fa90001aa34db4b2ed8070fdbd9e6ca",
+      "dockerfile_blob": "7a5a7e97e8c25666e6ff4b3378a8813b56fc0abc",
+      "options": {
+        "consolidate_citations": 0,
+        "consolidate_header": 0,
+        "coordinates": [
+          "persName",
+          "head",
+          "p",
+          "s",
+          "ref",
+          "biblStruct",
+          "figure",
+          "formula"
+        ],
+        "minimum_text_characters": 100,
+        "segment_sentences": true
+      },
+      "runtime_attestation": {
+        "component_versions": {
+          "grobid": "0.9.0"
+        },
+        "contract_version": "deepcritical-authenticated-runtime-attestation-reporter-v1",
+        "model_hashes": {},
+        "model_versions": {},
+        "reporter_id": "github-actions-docker-inspector",
+        "schema_version": "deepcritical-runtime-attestation-v1",
+        "source": "authenticated_deployment_reporter"
+      }
+    },
+    "ocrmypdf": {
+      "component_id": "ocrmypdf",
+      "component_version": "17.4.1",
+      "container_image_id": null,
+      "container_reference": "jbarlow83/ocrmypdf:v17.4.1@sha256:172736b5dd378a3e1780145b47015f62504be7b4e0d8cc6f6b5eb0eae8ebd85b",
+      "options": {
+        "deskew": true,
+        "fallback_reason": "image_only_pages+grobid_text_insufficient",
+        "jobs": 1,
+        "languages": [
+          "eng"
+        ],
+        "mode": "container_cli",
+        "optimize": 1,
+        "output_type": "pdf",
+        "rotate_pages": true,
+        "skip_text": true
+      },
+      "runtime_attestation": {
+        "component_versions": {
+          "ocrmypdf": "17.4.1",
+          "tesseract": "tesseract 5.5.1"
+        },
+        "contract_version": "deepcritical-container-ocr-runner-v1",
+        "model_hashes": {},
+        "model_versions": {},
+        "reporter_id": "deepcritical-container-ocr-runner-v1",
+        "schema_version": "deepcritical-runtime-attestation-v1",
+        "source": "digest_addressed_oci_invocation"
+      }
+    }
+  },
+  "synthetic_input": true
+}
