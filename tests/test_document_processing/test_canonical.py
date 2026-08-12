@@ -3073,6 +3073,20 @@ def test_builder_verifies_every_content_span_against_one_exact_native_node() -> 
             build_canonical_document_view(**invalid_lineage)
 
 
+@pytest.mark.parametrize("definition_path", ["body", "furniture", "nested"])
+def test_builder_rejects_full_tree_canonical_reference_collisions(
+    definition_path: str,
+) -> None:
+    document = _document()
+    if definition_path == "nested":
+        document["metadata"] = {"nested": {"self_ref": "#/body/children/0"}}
+    else:
+        document.setdefault(definition_path, {})["self_ref"] = "#/texts/0"
+
+    with pytest.raises(CanonicalDocumentError, match=r"ambiguous|collides"):
+        build_canonical_document_view(**_fixture_inputs("pdf", document))
+
+
 def test_builder_reports_malformed_native_structures_and_missing_anchors() -> None:
     document = _document()
     inputs = _fixture_inputs("pdf", document)

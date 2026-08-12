@@ -441,6 +441,8 @@ jobs:
             exit 1
           fi
           echo "GROBID_IMAGE_DIGEST=$grobid_image_id" >> "$GITHUB_ENV"
+          echo "DEEPCRITICAL_LIVE_GROBID_DOCKERFILE_BLOB=$grobid_dockerfile_blob" \
+            >> "$GITHUB_ENV"
           echo "DEEPCRITICAL_LIVE_GROBID_IMAGE_REF=$GROBID_CI_IMAGE_TAG@$grobid_image_id" \
             >> "$GITHUB_ENV"
           echo "DEEPCRITICAL_LIVE_GROBID_IMAGE_ID=$grobid_image_id" \

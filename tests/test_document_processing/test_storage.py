@@ -1729,6 +1729,103 @@ def test_canonical_admission_accepts_exact_docling_runtime_attestation(
     assert store.read_canonical_document(product) == view
 
 
+@pytest.mark.parametrize("bypass_admission", [False, True], ids=("admission", "read"))
+def test_complete_docling_rejects_empty_required_model_identity(
+    store: ContentAddressedStore,
+    bypass_admission: bool,
+) -> None:
+    artifact = save_artifact(
+        store,
+        f"native-empty-model-identity-{'read' if bypass_admission else 'admission'}",
+    )
+    run_id = f"{artifact.artifact_id}-canonical-source-run"
+    attestation = docling_runtime_attestation(run_id).model_copy(
+        update={"model_versions": {}, "model_hashes": {}}
+    )
+    configuration = docling_production_configuration(artifact)
+    configuration.update(
+        {
+            "container_digest": attestation.container_digest,
+            "model_versions": {},
+            "model_hashes": {},
+        }
+    )
+    view, _ = make_durable_canonical_view(
+        store,
+        artifact,
+        source_configuration=configuration,
+        source_attestation=attestation,
+        source_runtime_identity_required=True,
+        source_output_policy_snapshot=runtime_output_policy(
+            component_id="docling",
+            configuration=configuration,
+            attestation=attestation,
+            runtime_identity_required=True,
+        ),
+    )
+
+    if bypass_admission:
+        _, product = save_canonical_view_product(
+            store,
+            artifact,
+            view,
+            run_id=f"{artifact.artifact_id}-legacy-view-run",
+            bypass_admission=True,
+        )
+        with pytest.raises(RecordConflictError, match="model identity evidence"):
+            store.read_canonical_document(product)
+        return
+
+    with pytest.raises(RecordConflictError, match="model identity evidence"):
+        save_canonical_view_product(
+            store,
+            artifact,
+            view,
+            run_id=f"{artifact.artifact_id}-view-run",
+        )
+
+
+def test_partial_docling_accepts_exact_empty_model_identity(
+    store: ContentAddressedStore,
+) -> None:
+    artifact = save_artifact(store, "native-partial-empty-model-identity")
+    run_id = f"{artifact.artifact_id}-canonical-source-run"
+    attestation = docling_runtime_attestation(run_id).model_copy(
+        update={"model_versions": {}, "model_hashes": {}}
+    )
+    configuration = docling_production_configuration(artifact)
+    configuration.update(
+        {
+            "container_digest": attestation.container_digest,
+            "model_versions": {},
+            "model_hashes": {},
+        }
+    )
+    view, source_run = make_durable_canonical_view(
+        store,
+        artifact,
+        source_configuration=configuration,
+        source_status=ProcessingRunStatus.PARTIAL,
+        source_attestation=attestation,
+        source_runtime_identity_required=True,
+        source_output_policy_snapshot=runtime_output_policy(
+            component_id="docling",
+            configuration=configuration,
+            attestation=attestation,
+            runtime_identity_required=True,
+        ),
+    )
+
+    _, product = save_canonical_view_product(
+        store,
+        artifact,
+        view,
+        run_id="native-partial-empty-model-identity-view-run",
+    )
+    assert source_run.status is ProcessingRunStatus.PARTIAL
+    assert store.read_canonical_document(product) == view
+
+
 def test_canonical_admission_accepts_clean_partial_docling_without_reporter(
     store: ContentAddressedStore,
 ) -> None:
@@ -2925,6 +3022,69 @@ def test_container_verifier_rejects_unapproved_attested_identity(
                 "docling_serve": "1.21.0",
             },
         )
+
+
+@pytest.mark.parametrize(
+    ("status", "accepted"),
+    [
+        (ProcessingRunStatus.COMPLETE, False),
+        (ProcessingRunStatus.PARTIAL, True),
+    ],
+    ids=("complete", "partial"),
+)
+def test_grobid_required_model_identity_status_is_replayed(
+    store: ContentAddressedStore,
+    status: ProcessingRunStatus,
+    accepted: bool,
+) -> None:
+    artifact = save_artifact(store, f"grobid-empty-model-identity-{status.value}")
+    run_id = f"{artifact.artifact_id}-run"
+    attestation = grobid_runtime_attestation(run_id).model_copy(
+        update={"model_versions": {}, "model_hashes": {}}
+    )
+    configuration = grobid_production_configuration(artifact)
+    configuration.update(
+        {
+            "container_digest": attestation.container_digest,
+            "model_versions": {},
+            "model_hashes": {},
+        }
+    )
+    run = make_component_run(
+        store,
+        artifact.artifact_id,
+        run_id,
+        component=ComponentDescriptor(
+            component_id="grobid",
+            component_version="0.9.0",
+            capability="document.parse.scholarly",
+        ),
+        configuration=configuration,
+        status=status,
+        runtime_attestation=attestation,
+        runtime_identity_required=True,
+        output_policy_snapshot=runtime_output_policy(
+            component_id="grobid",
+            configuration=configuration,
+            attestation=attestation,
+            runtime_identity_required=True,
+        ),
+    )
+
+    def verify() -> None:
+        store._verify_container_configuration(
+            run,
+            purpose="GROBID",
+            component_id="grobid",
+            expected_image="deepcritical/grobid:0.9.0-full-p0-c2",
+            expected_component_versions={"grobid": "0.9.0"},
+        )
+
+    if accepted:
+        verify()
+    else:
+        with pytest.raises(RecordConflictError, match="model identity evidence"):
+            verify()
 
 
 @pytest.mark.parametrize("matching_output_count", [1, 2])

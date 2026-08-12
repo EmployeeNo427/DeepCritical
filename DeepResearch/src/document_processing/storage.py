@@ -1385,7 +1385,6 @@ class ContentAddressedStore:
             raise RecordConflictError(
                 f"{purpose} model version/hash inventories do not match"
             )
-
         attestation = run.runtime_attestation
         trust_policy, document_config = self._runtime_trust_policy(
             run,
@@ -1409,6 +1408,14 @@ class ContentAddressedStore:
                     f"complete {purpose} producer lacks required runtime attestation"
                 )
             return
+        if (
+            run.status is ProcessingRunStatus.COMPLETE
+            and run.runtime_identity_required
+            and (not model_versions or not model_hashes)
+        ):
+            raise RecordConflictError(
+                f"complete {purpose} producer lacks required model identity evidence"
+            )
         if (
             digest != attestation.container_digest
             or model_versions != attestation.model_versions

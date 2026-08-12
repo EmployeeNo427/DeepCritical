@@ -448,8 +448,8 @@ evidence for review. Invocation-dependent OCR and canonical bytes are evidence,
 not frozen reproducibility fixtures; only native parser outputs from a
 successful capture may be promoted in a later reviewed commit.
 
-With the digest-pinned compose stack already healthy, run the direct and
-compiled Docling and GROBID contracts explicitly:
+With the digest-pinned compose stack already healthy, run the direct Docling
+and GROBID contracts explicitly:
 
 ```bash
 export DEEPCRITICAL_RUN_LIVE_DOCUMENT_PROCESSING=1
@@ -464,17 +464,20 @@ export DEEPCRITICAL_LIVE_EXPECTED_DOCLING_SERVE_VERSION="1.21.0"
 export DEEPCRITICAL_LIVE_EXPECTED_GROBID_VERSION="0.9.0"
 
 uv run pytest tests/test_document_processing/test_live_stack_contract.py \
-  -m document_processing_live -q
+  -m document_processing_live \
+  -k 'test_live_docling_async_conversion_contract or test_live_grobid_tei_contract' \
+  -q
 ```
 
 This calls Docling readiness/version endpoints, submits and polls a real async
 conversion, validates the returned serialized `DoclingDocument`, calls GROBID
 alive/version endpoints, validates a real `processFulltextDocument` TEI
-response, and executes the two corresponding compiled-pipeline smokes. The
-compiled tests additionally require the running container IDs and exact image
-references supplied by the workflow’s Docker inspection step. Missing
-credentials, identity evidence, unreachable services, incompatible response
-shapes, and service errors fail the opted-in lane rather than becoming skips.
+response. The compiled and all-real tests additionally require the running
+container IDs and exact image references supplied by the workflow’s Docker
+inspection step, so use the live workflow for those identity-attested lanes.
+Missing credentials, identity evidence, unreachable services, incompatible
+response shapes, and service errors fail the opted-in lane rather than becoming
+skips.
 
 OCR is a separate opt-in because it requires a local Linux-container runtime
 and the approved image to have been pre-pulled. Enable it with the exact

@@ -44,6 +44,7 @@ from .validation import (
     QualitySeverity,
     docling_document_sha256,
     parse_content_integrity_report,
+    validate_docling_reference_definitions,
 )
 
 CANONICAL_DOCUMENT_SCHEMA_VERSION = "deepcritical-canonical-document-view-v1"
@@ -860,6 +861,10 @@ def build_canonical_document_view(
 
     _enforce_native_resource_limits(docling_document)
     try:
+        validate_docling_reference_definitions(docling_document)
+    except ValueError as exc:
+        raise CanonicalDocumentError(str(exc)) from exc
+    try:
         content_span_set = ContentSpanSet.model_validate(
             content_span_set.model_dump(mode="python")
         )
@@ -989,33 +994,18 @@ def build_canonical_document_view(
         )
     nodes = _collect_native_nodes(docling_document, diagnostics, docling_product)
     canonical_index = {node.canonical_ref: node for node in nodes}
-    declared_index: dict[str, list[_NativeNode]] = {}
-    for node in nodes:
-        declared_index.setdefault(node.declared_ref, []).append(node)
-    for declared_ref, matches in declared_index.items():
-        if len(matches) != 1:
-            raise CanonicalDocumentError(
-                f"Docling native reference {declared_ref!r} is ambiguous"
-            )
-        canonical_match = canonical_index.get(declared_ref)
-        if canonical_match is not None and canonical_match is not matches[0]:
-            raise CanonicalDocumentError(
-                f"Docling native reference {declared_ref!r} collides with a "
-                "different canonical node"
-            )
+    declared_index = {node.declared_ref: node for node in nodes}
 
     span_node_by_id: dict[str, _NativeNode] = {}
     for span in content_span_set.spans:
         node_id = span.representation_anchor.node_id
         node = canonical_index.get(node_id)
         if node is None:
-            matches = declared_index.get(node_id, [])
-            if len(matches) != 1:
-                qualifier = "does not exist" if not matches else "is ambiguous"
+            node = declared_index.get(node_id)
+            if node is None:
                 raise CanonicalDocumentError(
-                    f"content span native node {node_id!r} {qualifier}"
+                    f"content span native node {node_id!r} does not exist"
                 )
-            node = matches[0]
         native_text = _native_text(node.item)
         start = span.representation_anchor.char_start
         end = span.representation_anchor.char_end
@@ -1033,18 +1023,13 @@ def build_canonical_document_view(
         direct = canonical_index.get(reference)
         if direct is not None:
             return direct
-        matches = declared_index.get(reference, [])
-        if len(matches) == 1:
-            return matches[0]
-        code = (
-            "UNRESOLVED_NATIVE_REFERENCE"
-            if not matches
-            else "AMBIGUOUS_NATIVE_REFERENCE"
-        )
+        declared = declared_index.get(reference)
+        if declared is not None:
+            return declared
         diagnostics.append(
             _diagnostic(
                 severity=CanonicalDiagnosticSeverity.ERROR,
-                code=code,
+                code="UNRESOLVED_NATIVE_REFERENCE",
                 message=f"{context} reference {reference!r} did not resolve uniquely",
                 product_id=docling_product.product_id,
                 native_node_ids=(reference,),

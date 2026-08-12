@@ -2107,6 +2107,21 @@ def _reference_definition_issues(
     return tuple(issues)
 
 
+def validate_docling_reference_definitions(document: dict[str, Any]) -> None:
+    """Raise when any full-tree ``self_ref`` definition is ambiguous."""
+
+    issues = _reference_definition_issues(document)
+    if not issues:
+        return
+    issue = issues[0]
+    qualifier = (
+        "is ambiguous"
+        if issue.code == "DUPLICATE_DOCLING_SELF_REF"
+        else "collides with a different canonical item"
+    )
+    raise ValueError(f"Docling native reference {issue.item_ref!r} {qualifier}")
+
+
 def _validate_references(document: dict[str, Any]) -> tuple[int, tuple[str, ...]]:
     resolvable: set[str] = {"#"}
     malformed_index_refs: set[str] = set()
@@ -2202,4 +2217,5 @@ __all__ = [
     "parse_content_integrity_report",
     "probably_image_only",
     "validate_content_integrity",
+    "validate_docling_reference_definitions",
 ]

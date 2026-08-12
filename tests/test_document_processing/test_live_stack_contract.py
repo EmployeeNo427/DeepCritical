@@ -448,7 +448,7 @@ def _capture_live_pipeline_evidence(
         stage_label = re.sub(
             r"[^a-zA-Z0-9_.-]+",
             "-",
-            run.stage_invocation_id or run.stage_id,
+            run.stage_id,
         )
         for product in run.outputs:
             payload = store.read_data_product_bytes(product)
@@ -468,6 +468,32 @@ def _capture_live_pipeline_evidence(
                 }
             )
 
+    capture_files_by_product_id = {
+        product["product_id"]: product["capture_file"] for product in captured_products
+    }
+    canonical_run = _run_for_component(
+        result.processing_runs,
+        "canonical-document-view",
+    )
+    canonical_view = store.read_canonical_document(
+        canonical_run.require_output("canonical_document_view")
+    )
+    selected_native_products = []
+    for product in canonical_view.source_products:
+        if product.name not in {"docling_document", "grobid_tei"}:
+            continue
+        capture_file = capture_files_by_product_id.get(product.product_id)
+        if capture_file is None:
+            raise AssertionError(
+                f"selected native product {product.product_id!r} was not captured"
+            )
+        selected_native_products.append(
+            {
+                **product.model_dump(mode="json"),
+                "capture_file": capture_file,
+            }
+        )
+
     manifest = {
         "schema": "deepcritical-live-all-real-evidence-v1",
         "synthetic_input": True,
@@ -485,6 +511,26 @@ def _capture_live_pipeline_evidence(
             "blob_sha256": result.artifact.source_sha256,
             "capture_file": source_path.name,
         },
+        "runtime_images": {
+            "docling": {
+                "reference": _required_environment(
+                    "DEEPCRITICAL_LIVE_DOCLING_IMAGE_REF"
+                ),
+                "image_id": _required_environment("DEEPCRITICAL_LIVE_DOCLING_IMAGE_ID"),
+            },
+            "grobid": {
+                "reference": _required_environment(
+                    "DEEPCRITICAL_LIVE_GROBID_IMAGE_REF"
+                ),
+                "image_id": _required_environment("DEEPCRITICAL_LIVE_GROBID_IMAGE_ID"),
+                "dockerfile_blob": _required_environment(
+                    "DEEPCRITICAL_LIVE_GROBID_DOCKERFILE_BLOB"
+                ),
+            },
+            "ocrmypdf": {
+                "reference": _required_environment("DEEPCRITICAL_LIVE_OCR_IMAGE"),
+            },
+        },
         "result": {
             "status": result.status.value,
             "route": list(result.route),
@@ -501,6 +547,7 @@ def _capture_live_pipeline_evidence(
             diagnostic.model_dump(mode="json") for diagnostic in result.diagnostics
         ],
         "captured_products": captured_products,
+        "selected_native_products": selected_native_products,
     }
     manifest_path = capture_directory / "manifest.json"
     manifest_path.write_text(
@@ -1229,7 +1276,7 @@ async def test_live_all_real_pipeline_captures_native_outputs(
         skipped_stages=set(),
     )
     docling_run = _run_for_component(result.processing_runs, "docling")
-    assert docling_run.stage_invocation_id == "docling"
+    assert docling_run.stage_id == "docling"
     assert docling_run.configuration["options"]["do_ocr"] is True
     assert docling_run.runtime_attestation is not None
     assert docling_run.runtime_attestation.container_reference == docling_image
@@ -1238,7 +1285,7 @@ async def test_live_all_real_pipeline_captures_native_outputs(
     )
 
     ocr_run = _run_for_component(result.processing_runs, "ocrmypdf")
-    assert ocr_run.stage_invocation_id == "ocr"
+    assert ocr_run.stage_id == "ocr"
     assert "image_only_pages" in ocr_run.configuration["fallback_reason"].split("+")
     assert ocr_run.runtime_attestation is not None
     assert ocr_run.runtime_attestation.container_reference == ocr_image
@@ -1259,7 +1306,7 @@ async def test_live_all_real_pipeline_captures_native_outputs(
         run for run in result.processing_runs if run.component_id == "grobid"
     )
     assert len(grobid_runs) == 2
-    assert {run.stage_invocation_id for run in grobid_runs} == {
+    assert {run.stage_id for run in grobid_runs} == {
         "primary-grobid",
         "fallback-grobid",
     }
@@ -1269,9 +1316,12 @@ async def test_live_all_real_pipeline_captures_native_outputs(
     fallback_grobid = next(
         run for run in grobid_runs if run.artifact_id == derivative_id
     )
-    assert primary_grobid.stage_invocation_id == "primary-grobid"
+    assert primary_grobid.stage_id == "primary-grobid"
     if primary_grobid.runtime_attestation is not None:
         assert primary_grobid.runtime_attestation.container_reference == grobid_image
+        assert primary_grobid.runtime_attestation.container_image_id == (
+            grobid_reporter.expected_image_id
+        )
     assert fallback_grobid.require_output("grobid_tei")
     assert fallback_grobid.runtime_attestation is not None
     assert fallback_grobid.runtime_attestation.container_reference == grobid_image
@@ -1285,7 +1335,19 @@ async def test_live_all_real_pipeline_captures_native_outputs(
     )
     canonical_product = canonical_run.require_output("canonical_document_view")
     canonical_view = store.read_canonical_document(canonical_product)
-    assert canonical_run.stage_invocation_id == "canonicalize"
+    assert canonical_run.stage_id == "canonicalize"
+    stage_invocations: dict[str, str] = {}
+    for run in result.processing_runs:
+        invocation_id = run.stage_invocation_id
+        assert invocation_id is not None
+        assert invocation_id.startswith("stage-invocation-")
+        assert stage_invocations.setdefault(run.stage_id, invocation_id) == (
+            invocation_id
+        )
+    assert len(set(stage_invocations.values())) == len(stage_invocations)
+    pipeline_run_ids = {run.pipeline_run_id for run in result.processing_runs}
+    assert None not in pipeline_run_ids
+    assert len(pipeline_run_ids) == 1
     assert canonical_view.artifact_id == artifact.artifact_id
     assert canonical_view.blocks
     assert fallback_grobid.require_output("grobid_tei") in (
@@ -1314,3 +1376,10 @@ async def test_live_all_real_pipeline_captures_native_outputs(
         "runtime_attestation",
         "searchable_pdf",
     } <= {product["name"] for product in capture_manifest["captured_products"]}
+    assert {
+        product["name"] for product in capture_manifest["selected_native_products"]
+    } == {"docling_document", "grobid_tei"}
+    assert all(
+        "stage-invocation-" not in product["capture_file"]
+        for product in capture_manifest["captured_products"]
+    )
