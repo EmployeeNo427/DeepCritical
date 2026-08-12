@@ -19,8 +19,10 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     StringConstraints,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -33,6 +35,9 @@ OciDigest = Annotated[
     StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$", strict=True),
 ]
 DoclingInputFormat = Literal["html", "docx", "pptx", "xlsx", "image"]
+
+PROCESSING_RUN_SCHEMA_V1 = "deepcritical-processing-run-v1"
+PROCESSING_RUN_SCHEMA_V2 = "deepcritical-processing-run-v2"
 
 
 def utc_now() -> datetime:
@@ -575,12 +580,11 @@ class RuntimeAttestation(FrozenModel):
 class ProcessingRun(FrozenModel):
     """Reproducible record of one component invocation on one artifact."""
 
-    schema_version: Literal["deepcritical-processing-run-v1"] = (
-        "deepcritical-processing-run-v1"
-    )
+    schema_version: Literal["deepcritical-processing-run-v2"] = PROCESSING_RUN_SCHEMA_V2
     run_id: str
     artifact_id: str
     pipeline_run_id: str | None = None
+    stage_invocation_id: str | None = None
     repetition_group_id: str | None = None
     stage_id: str
     component: ComponentDescriptor
@@ -614,6 +618,7 @@ class ProcessingRun(FrozenModel):
         "run_id",
         "artifact_id",
         "pipeline_run_id",
+        "stage_invocation_id",
         "repetition_group_id",
         "stage_id",
         "component_invocation_id",
@@ -627,6 +632,16 @@ class ProcessingRun(FrozenModel):
         if not normalized:
             raise ValueError("processing run values must not be empty")
         return normalized
+
+    @model_serializer(mode="wrap")
+    def _serialize_processing_run(
+        self,
+        handler: SerializerFunctionWrapHandler,
+    ) -> dict[str, Any]:
+        payload = handler(self)
+        if self.stage_invocation_id is None:
+            payload.pop("stage_invocation_id", None)
+        return payload
 
     @field_validator("started_at", "finished_at")
     @classmethod
@@ -748,6 +763,8 @@ class ProcessingRun(FrozenModel):
                 raise ValueError("model_hashes must come from runtime attestation")
         if self.repetition_group_id is not None and self.pipeline_run_id is None:
             raise ValueError("repetition_group_id requires pipeline_run_id")
+        if self.stage_invocation_id is not None and self.pipeline_run_id is None:
+            raise ValueError("stage_invocation_id requires pipeline_run_id")
         if (
             self.runtime_identity_required
             and self.status is ProcessingRunStatus.COMPLETE

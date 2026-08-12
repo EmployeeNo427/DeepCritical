@@ -13,6 +13,8 @@ from typing import BinaryIO, Mapping, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from .models import (
+    PROCESSING_RUN_SCHEMA_V1,
+    PROCESSING_RUN_SCHEMA_V2,
     ArtifactLocation,
     ArtifactLocationRole,
     DataProductRef,
@@ -655,7 +657,7 @@ class ContentAddressedStore:
         serialized = _canonical_record_bytes(validated_record)
 
         if path.exists():
-            if path.read_bytes() == serialized:
+            if self._stored_record_matches(path, serialized, validated_record):
                 return path
             raise RecordConflictError(
                 f"immutable {category} ID already has different content: {record_id}"
@@ -670,7 +672,7 @@ class ContentAddressedStore:
             try:
                 self._publish_no_replace(temporary_path, path)
             except FileExistsError:
-                if path.read_bytes() != serialized:
+                if not self._stored_record_matches(path, serialized, validated_record):
                     raise RecordConflictError(
                         f"concurrent conflicting {category} write: {record_id}"
                     ) from None
@@ -714,6 +716,15 @@ class ContentAddressedStore:
         schema_field = model.model_fields.get("schema_version")
         expected_version = schema_field.default if schema_field is not None else None
         actual_version = payload.get("schema_version")
+        if model is ProcessingRun and actual_version == PROCESSING_RUN_SCHEMA_V1:
+            # v1 was originally written without stage-invocation identity.  A
+            # short-lived fork revision also wrote paired invocation IDs while
+            # retaining the v1 tag.  Both shapes are validated against the v2
+            # invariant after this explicit, in-memory migration.  Durable v1
+            # bytes remain immutable; all new records are written as v2.
+            payload = dict(payload)
+            payload["schema_version"] = PROCESSING_RUN_SCHEMA_V2
+            actual_version = PROCESSING_RUN_SCHEMA_V2
         if not isinstance(expected_version, str) or actual_version != expected_version:
             raise UnsupportedSchemaVersionError(
                 f"unsupported schema_version {actual_version!r} at {path}; "
@@ -723,6 +734,20 @@ class ContentAddressedStore:
             return model.model_validate(payload)
         except (ValidationError, ValueError) as exc:
             raise CorruptRecordError(f"invalid record at {path}") from exc
+
+    def _stored_record_matches(
+        self,
+        path: Path,
+        serialized: bytes,
+        record: BaseModel,
+    ) -> bool:
+        """Compare immutable records, including an in-place legacy run record."""
+
+        if path.read_bytes() == serialized:
+            return True
+        if isinstance(record, ProcessingRun):
+            return self._decode_record(path, ProcessingRun) == record
+        return False
 
     def _record_path(self, category: str, record_id: str) -> Path:
         if not record_id.strip():

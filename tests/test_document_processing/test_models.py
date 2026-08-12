@@ -46,7 +46,7 @@ SOURCE_HASH = sha256_bytes(SOURCE_BYTES)
 def test_all_persisted_contracts_have_descriptive_schema_versions() -> None:
     expected = {
         DocumentArtifact: "deepcritical-document-artifact-v1",
-        ProcessingRun: "deepcritical-processing-run-v1",
+        ProcessingRun: "deepcritical-processing-run-v2",
         ProcessingDiagnostic: "deepcritical-processing-diagnostic-v1",
         ExecutionCheckpoint: "deepcritical-execution-checkpoint-v1",
         ContentSpanSet: "deepcritical-content-span-set-v1",
@@ -117,6 +117,8 @@ def processing_run(**overrides: object) -> ProcessingRun:
     values: dict[str, object] = {
         "run_id": "run-docling-1",
         "artifact_id": "pmc-123-pdf",
+        "pipeline_run_id": "pipeline-run-1",
+        "stage_invocation_id": "stage-invocation-1",
         "stage_id": "docling",
         "component": ComponentDescriptor(
             component_id="docling",
@@ -286,7 +288,30 @@ def test_processing_run_rejects_mismatched_config_hash_and_bad_times() -> None:
         )
 
     with pytest.raises(ValidationError, match="requires pipeline_run_id"):
-        processing_run(repetition_group_id="benchmark-v1")
+        processing_run(pipeline_run_id=None, repetition_group_id="benchmark-v1")
+    with pytest.raises(ValidationError, match="requires pipeline_run_id"):
+        processing_run(pipeline_run_id=None, stage_invocation_id="invocation-orphan")
+    with pytest.raises(
+        ValidationError, match="processing run values must not be empty"
+    ):
+        processing_run(stage_invocation_id=" ")
+
+
+def test_processing_run_accepts_legacy_record_without_stage_invocation_id() -> None:
+    payload = processing_run().model_dump(mode="json")
+    del payload["stage_invocation_id"]
+
+    restored = ProcessingRun.model_validate(payload)
+
+    assert restored.stage_invocation_id is None
+
+
+def test_processing_run_v2_rejects_v1_schema_tag() -> None:
+    payload = processing_run().model_dump(mode="json")
+    payload["schema_version"] = "deepcritical-processing-run-v1"
+
+    with pytest.raises(ValidationError, match="deepcritical-processing-run-v2"):
+        ProcessingRun.model_validate(payload)
 
 
 def test_processing_run_validates_the_full_output_policy_snapshot_hash() -> None:

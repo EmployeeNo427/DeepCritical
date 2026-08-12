@@ -8,10 +8,13 @@ The compiler validates the complete graph before an executor sees any input.
 
 from __future__ import annotations
 
+import time
 import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Annotated, Any, Literal, Protocol, TypeAlias
@@ -25,7 +28,12 @@ from pydantic import (
     model_validator,
 )
 
-from .models import ComponentDescriptor, DiagnosticSeverity, configuration_sha256
+from .models import (
+    ComponentDescriptor,
+    DiagnosticSeverity,
+    configuration_sha256,
+    utc_now,
+)
 
 
 class PipelineDefinitionError(ValueError):
@@ -382,6 +390,7 @@ class StageContext:
     pipeline_id: str
     pipeline_version: str
     pipeline_run_id: str
+    stage_invocation_id: str
     stage_id: str
     inputs: Mapping[str, object]
     prior_results: Mapping[str, StageResult]
@@ -406,6 +415,18 @@ class StageContext:
                 f"stage {self.stage_id!r} input {name!r} is not {value_type.__name__}"
             )
         return value
+
+
+_ACTIVE_STAGE_CONTEXT: ContextVar[StageContext | None] = ContextVar(
+    "document_processing_active_stage_context",
+    default=None,
+)
+
+
+def _active_stage_context() -> StageContext | None:
+    """Return the task-local stage invocation while an executor is running."""
+
+    return _ACTIVE_STAGE_CONTEXT.get()
 
 
 class StagePlugin(Protocol):
@@ -668,7 +689,7 @@ class PipelineCompiler:
                 )
                 if (
                     target.required
-                    and not source_port.required
+                    and _output_may_be_absent(source_stage, source_port)
                     and not _condition_guarantees_output(
                         stage.condition,
                         binding.stage_id,
@@ -677,7 +698,8 @@ class PipelineCompiler:
                 ):
                     raise PipelineDefinitionError(
                         f"required input {stage.stage_id}.{port_name} consumes "
-                        f"conditional output {binding.stage_id}.{binding.output_name} "
+                        f"potentially absent output "
+                        f"{binding.stage_id}.{binding.output_name} "
                         "without an output_present guard"
                     )
 
@@ -862,6 +884,17 @@ def _condition_guarantees_output(
     return matches(condition)
 
 
+def _output_may_be_absent(
+    source_stage: StageSpec,
+    source_port: PortContract,
+) -> bool:
+    """Return whether a declared output can be absent at runtime."""
+
+    return not source_port.required or not isinstance(
+        source_stage.condition, AlwaysCondition
+    )
+
+
 def _topological_order(stages: Sequence[StageSpec]) -> tuple[str, ...]:
     positions = {stage.stage_id: index for index, stage in enumerate(stages)}
     indegree = {stage.stage_id: len(stage.depends_on) for stage in stages}
@@ -899,6 +932,48 @@ class StageExecutor(Protocol):
         stage: CompiledStage,
         context: StageContext,
     ) -> StageResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class StageFailure:
+    """Typed context for an unexpected component or executor exception."""
+
+    pipeline_id: str
+    pipeline_version: str
+    pipeline_run_id: str
+    stage_invocation_id: str
+    stage_id: str
+    component: ComponentDescriptor
+    configuration: Mapping[str, Any]
+    configuration_sha256: str
+    input_identity: Mapping[str, str]
+    stage_inputs: Mapping[str, object]
+    exception: Exception
+    started_at: datetime
+    started_clock: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "configuration",
+            MappingProxyType(dict(self.configuration)),
+        )
+        object.__setattr__(
+            self,
+            "input_identity",
+            MappingProxyType(dict(self.input_identity)),
+        )
+        object.__setattr__(
+            self,
+            "stage_inputs",
+            MappingProxyType(dict(self.stage_inputs)),
+        )
+
+
+class StageFailureObserver(Protocol):
+    """Domain-owned persistence hook for unexpected stage failures."""
+
+    async def record_failure(self, failure: StageFailure) -> None: ...
 
 
 class LocalStageExecutor:
@@ -986,8 +1061,14 @@ class PipelineExecution:
 class PipelineOrchestrator:
     """Evaluate typed conditions and schedule a compiled DAG locally."""
 
-    def __init__(self, executor: StageExecutor | None = None) -> None:
+    def __init__(
+        self,
+        executor: StageExecutor | None = None,
+        *,
+        failure_observer: StageFailureObserver | None = None,
+    ) -> None:
         self.executor = executor or LocalStageExecutor()
+        self.failure_observer = failure_observer
 
     async def execute(
         self,
@@ -995,6 +1076,7 @@ class PipelineOrchestrator:
         inputs: Mapping[str, object],
         *,
         pipeline_run_id: str | None = None,
+        input_identity: Mapping[str, str] | None = None,
     ) -> PipelineExecution:
         try:
             current_specification_sha256 = configuration_sha256(
@@ -1030,6 +1112,22 @@ class PipelineOrchestrator:
                 )
 
         execution_id = pipeline_run_id or f"pipeline-{uuid.uuid4()}"
+        resolved_input_identity = dict(input_identity or {})
+        if self.failure_observer is not None:
+            if not resolved_input_identity:
+                raise PipelineExecutionError(
+                    "input_identity is required when a failure observer is configured"
+                )
+            if any(
+                not isinstance(name, str)
+                or not name.strip()
+                or not isinstance(value, str)
+                or not value.strip()
+                for name, value in resolved_input_identity.items()
+            ):
+                raise PipelineExecutionError(
+                    "input_identity names and values must be non-empty strings"
+                )
         results: dict[str, StageResult] = {}
         for stage in pipeline.stages:
             if not _evaluate_condition(stage.spec.condition, results):
@@ -1038,6 +1136,8 @@ class PipelineOrchestrator:
                 )
                 continue
             runtime_inputs: dict[str, object] = {}
+            terminal_missing_inputs: list[tuple[str, StageOutputRef]] = []
+            invalid_missing_inputs: list[tuple[str, StageOutputRef]] = []
             for port_name, binding in stage.spec.inputs.items():
                 if isinstance(binding, PipelineInputRef):
                     runtime_inputs[port_name] = inputs[binding.input_name]
@@ -1048,19 +1148,74 @@ class PipelineOrchestrator:
                     continue
                 target = stage.registration.input_ports[port_name]
                 if target.required:
-                    raise PipelineExecutionError(
-                        f"stage {stage.spec.stage_id!r} required input {port_name!r} "
-                        f"was not produced by {binding.stage_id}.{binding.output_name}"
+                    if source.status in {
+                        StageExecutionStatus.FAILED,
+                        StageExecutionStatus.QUARANTINED,
+                        StageExecutionStatus.SKIPPED,
+                    }:
+                        terminal_missing_inputs.append((port_name, binding))
+                    else:
+                        invalid_missing_inputs.append((port_name, binding))
+            if invalid_missing_inputs:
+                details = "; ".join(
+                    f"required input {port_name!r} was not produced by "
+                    f"{binding.stage_id}.{binding.output_name}"
+                    for port_name, binding in sorted(
+                        invalid_missing_inputs,
+                        key=lambda item: item[0],
                     )
+                )
+                raise PipelineExecutionError(f"stage {stage.spec.stage_id!r} {details}")
+            if terminal_missing_inputs:
+                results[stage.spec.stage_id] = StageResult(
+                    status=StageExecutionStatus.SKIPPED
+                )
+                continue
             context = StageContext(
                 pipeline_id=pipeline.spec.pipeline_id,
                 pipeline_version=pipeline.spec.pipeline_version,
                 pipeline_run_id=execution_id,
+                stage_invocation_id=f"stage-invocation-{uuid.uuid4()}",
                 stage_id=stage.spec.stage_id,
                 inputs=runtime_inputs,
                 prior_results=results,
             )
-            results[stage.spec.stage_id] = await self.executor.execute(stage, context)
+            started_at = utc_now()
+            started_clock = time.perf_counter()
+            stage_context_token = _ACTIVE_STAGE_CONTEXT.set(context)
+            try:
+                results[stage.spec.stage_id] = await self.executor.execute(
+                    stage,
+                    context,
+                )
+            except Exception as exc:
+                if self.failure_observer is not None:
+                    failure = StageFailure(
+                        pipeline_id=pipeline.spec.pipeline_id,
+                        pipeline_version=pipeline.spec.pipeline_version,
+                        pipeline_run_id=execution_id,
+                        stage_invocation_id=context.stage_invocation_id,
+                        stage_id=stage.spec.stage_id,
+                        component=stage.registration.descriptor,
+                        configuration=stage.configuration.model_dump(mode="python"),
+                        configuration_sha256=stage.configuration_sha256,
+                        input_identity=resolved_input_identity,
+                        stage_inputs=runtime_inputs,
+                        exception=exc,
+                        started_at=started_at,
+                        started_clock=started_clock,
+                    )
+                    try:
+                        await self.failure_observer.record_failure(failure)
+                    except Exception as observer_error:
+                        exc.add_note(
+                            "the stage failure observer also failed: "
+                            f"{type(observer_error).__name__}: {observer_error}"
+                        )
+                        raise exc from observer_error
+                raise
+            finally:
+                _ACTIVE_STAGE_CONTEXT.reset(stage_context_token)
         return PipelineExecution(pipeline_run_id=execution_id, results=results)
 
 
@@ -1126,6 +1281,8 @@ __all__ = [
     "StageDiagnostic",
     "StageExecutionStatus",
     "StageExecutor",
+    "StageFailure",
+    "StageFailureObserver",
     "StageOutputRef",
     "StagePlugin",
     "StageResult",
