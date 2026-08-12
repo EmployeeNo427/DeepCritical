@@ -179,7 +179,13 @@ def test_hardening_pull_requests_run_every_isolated_live_job() -> None:
         Loader=yaml.BaseLoader,
     )
     pull_request = workflow["on"]["pull_request"]
-    assert pull_request["branches"] == ["dev"]
+    compare_revision = workflow["on"]["workflow_dispatch"]["inputs"]["compare_revision"]
+    assert compare_revision["required"] == "true"
+    assert compare_revision["type"] == "string"
+    assert pull_request["branches"] == [
+        "dev",
+        "fix/document-processing-hardening",
+    ]
     assert set(pull_request["paths"]) == {
         ".github/workflows/document-processing-live.yml",
         "DeepResearch/src/document_processing/**",
@@ -195,19 +201,43 @@ def test_hardening_pull_requests_run_every_isolated_live_job() -> None:
 
 
 def test_quality_job_enforces_the_complete_repository_gate() -> None:
-    jobs = _live_workflow()["jobs"]
+    workflow = _live_workflow()
+    jobs = workflow["jobs"]
     quality = jobs["quality"]
     assert quality["timeout-minutes"] == 30
     assert all(
         jobs[name]["needs"] == "quality" for name in ("docling", "grobid", "ocr")
     )
+    assert workflow["env"]["COVERAGE_BASE_REVISION"] == (
+        "${{ github.event.pull_request.base.sha || inputs.compare_revision }}"
+    )
+    assert (
+        _step(jobs, "quality", "Check out the tested revision")["with"]["fetch-depth"]
+        == 0
+    )
 
-    document_suite = _step(
+    document_step = _step(
         jobs,
         "quality",
         "Run the complete document-processing suite",
-    )["run"]
+    )
+    assert document_step["env"]["COVERAGE_FILE"] == (".coverage-document-processing")
+    document_suite = document_step["run"]
     assert "tests/test_document_processing" in document_suite
+    assert "--cov=DeepResearch.src.document_processing" in document_suite
+    assert "--cov-branch" in document_suite
+    assert "--cov-report=term-missing" in document_suite
+    assert "--cov-report=xml:document-processing-coverage.xml" in document_suite
+
+    changed_coverage = _step(
+        jobs,
+        "quality",
+        "Enforce complete changed-code coverage",
+    )["run"]
+    assert 'compare-branch="$COVERAGE_BASE_REVISION"' in changed_coverage
+    assert "--include='DeepResearch/src/document_processing/*.py'" in changed_coverage
+    assert "--branch-coverage" in changed_coverage
+    assert "--fail-under=100" in changed_coverage
 
     repository_suite = _step(
         jobs,

@@ -45,6 +45,14 @@ output is present. For `all`, one conjunct proving presence is sufficient; for
 rule prevents a skipped producer with a nominally required port from creating a
 runtime-only missing-input failure.
 
+An unconditional producer may still terminate as `failed` or `quarantined`
+without returning its registered required outputs. In that case, the
+orchestrator marks consumers of the missing required value as `skipped` and
+propagates that state through their dependants. The same rule applies when the
+producer was itself `skipped`. Missing required values from a `complete` or
+`partial` producer remain execution errors; those statuses are not allowed to
+weaken a component's output contract.
+
 `PipelineOrchestrator` schedules the compiled graph through the
 `StageExecutor` protocol. The only implementation in this change is
 `LocalStageExecutor`. The existing document-processing behavior is represented
@@ -63,12 +71,32 @@ document storage or document models.
 
 The document-processing implementation supplies
 `DocumentProcessingFailureRecorder`. It checks whether the failing stage
-already persisted a terminal run during that invocation. If so, it does
-nothing; otherwise it persists exactly one failed `ProcessingRun`. Downstream
-stages are not scheduled and the original exception is re-raised. Cancellation
-is outside the ordinary-exception observer path and is re-raised without being
-converted into a failure record. A custom executor may change execution
-mechanics, but the document orchestrator retains this recorder ownership.
+already persisted a terminal run during that invocation. Correlation uses the
+pipeline-run ID, graph-stage ID, invocation time, and registered capability
+across both source and derivative artifacts. Persisted run and failure-
+diagnostic stage names resolve to that graph-stage identity even when the
+durable parser component has a different implementation ID. If a matching run
+exists, the recorder does nothing; otherwise it persists exactly one failed
+`ProcessingRun`. Downstream stages are not scheduled and the original
+exception is re-raised. Cancellation is outside the ordinary-exception
+observer path and is re-raised without being converted into a failure record.
+A custom executor may change execution mechanics, but the document orchestrator
+retains this recorder ownership.
+
+Every run persisted during a compiled stage is bound to the active document
+workflow and graph-stage invocation by one shared ownership resolver. Success
+and failure commits therefore apply the same pipeline-run, stage-invocation,
+stage, and repetition-group checks. A `stage_invocation_id` without its owning
+`pipeline_run_id` is invalid.
+
+Invocation-bearing records use `deepcritical-processing-run-v2`. The store
+loads both original v1 records (which have no invocation ID) and the temporary
+fork shape that paired pipeline and invocation IDs under the v1 tag, then
+validates them through the v2 model in memory. Existing bytes remain immutable;
+new writes use v2. An orphan invocation in either version is corrupt. Older
+workers that understand only v1 cannot read v2 records, so rollback and
+mixed-version operation require upgrading readers first; write-downgrade is
+deliberately unsupported because it would erase the ownership invariant.
 
 ## Consequences
 

@@ -150,6 +150,13 @@ alternative does. Conditions are a closed typed set (`always`,
 `output_present`, `output_absent`, `diagnostic_present`, `stage_status`,
 `all`, and `any`); arbitrary expressions are not part of the schema.
 
+An `always` producer can still terminate as `failed` or `quarantined` without
+returning a required output. Consumers that require the missing value become
+`skipped`, and that terminal dependency propagates safely. A producer that was
+itself `skipped` propagates the same result. A `complete` or `partial` producer
+must return every registered required output; omission is an execution error
+rather than an implicit skip.
+
 `PipelineOrchestrator` evaluates those conditions and delegates each runnable
 node through the `StageExecutor` protocol. This release provides only
 `LocalStageExecutor`, which executes registered plugins in the current process
@@ -165,11 +172,22 @@ Expected component failures remain the component’s responsibility: it commits
 its terminal run and returns a typed outcome. The orchestrator reports an
 unexpected ordinary exception through the optional `StageFailureObserver`.
 The document pipeline supplies `DocumentProcessingFailureRecorder`, which
-commits one failed run only when the stage did not already commit a terminal
-run, stops downstream execution, and re-raises the original exception.
+commits one failed run only when the graph-stage invocation did not already
+commit a terminal run with the same capability. It correlates the pipeline run,
+graph stage, invocation time, and capability across source and OCR-derivative
+artifacts, so implementation aliases such as primary/fallback GROBID do not
+create duplicate failure records. Processing runs and their failure diagnostics
+use the same graph-stage identity. The recorder stops downstream execution and
+re-raises the original exception.
 Cancellation is re-raised and is never converted into an ordinary failure.
 The generic orchestration module has no dependency on the content-addressed
 store or document-specific models.
+
+The mandatory live-contract quality job runs the complete document-processing
+test suite with branch measurement and blocks unless every changed source line
+and branch is covered relative to the exact review base revision. This focused
+gate prevents unrelated, well-covered modules from masking untested changes;
+repository-wide Codecov reporting remains informational.
 
 This completes Follow-up 1’s allow-listed local execution layer. Its current
 boundary is intentionally local: several private stage values are ordinary
@@ -401,9 +419,13 @@ docker compose -f docker/document-processing/compose.yaml --profile tools run --
 For every processing run, retain ordered typed inputs and outputs, the source
 artifact lineage, exact configuration and policy hashes, component descriptor,
 container image reference and observed image digest, component/model versions,
-timestamps, warnings, resource usage, and transformation lineage. Component
-scratch files and RQ results are staging data only; copy raw outputs to
-content-addressed storage before acknowledging completion.
+timestamps, warnings, resource usage, and transformation lineage. For every
+orchestrated run, also retain the workflow-resume ID and a unique
+stage-invocation ID. The latter correlates one in-memory graph invocation with
+its durable success or failure records; it must not be reused as the
+workflow-resume identity. Component scratch files and RQ results are staging
+data only; copy raw outputs to content-addressed storage before acknowledging
+completion.
 
 The persisted static output policy also records the effective GROBID coordinates
 and consolidation flags, OCR languages/rotation/deskew/jobs/optimization, and

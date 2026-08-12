@@ -12,6 +12,7 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -389,6 +390,7 @@ class StageContext:
     pipeline_id: str
     pipeline_version: str
     pipeline_run_id: str
+    stage_invocation_id: str
     stage_id: str
     inputs: Mapping[str, object]
     prior_results: Mapping[str, StageResult]
@@ -413,6 +415,18 @@ class StageContext:
                 f"stage {self.stage_id!r} input {name!r} is not {value_type.__name__}"
             )
         return value
+
+
+_ACTIVE_STAGE_CONTEXT: ContextVar[StageContext | None] = ContextVar(
+    "document_processing_active_stage_context",
+    default=None,
+)
+
+
+def _active_stage_context() -> StageContext | None:
+    """Return the task-local stage invocation while an executor is running."""
+
+    return _ACTIVE_STAGE_CONTEXT.get()
 
 
 class StagePlugin(Protocol):
@@ -927,11 +941,13 @@ class StageFailure:
     pipeline_id: str
     pipeline_version: str
     pipeline_run_id: str
+    stage_invocation_id: str
     stage_id: str
     component: ComponentDescriptor
     configuration: Mapping[str, Any]
     configuration_sha256: str
     input_identity: Mapping[str, str]
+    stage_inputs: Mapping[str, object]
     exception: Exception
     started_at: datetime
     started_clock: float
@@ -946,6 +962,11 @@ class StageFailure:
             self,
             "input_identity",
             MappingProxyType(dict(self.input_identity)),
+        )
+        object.__setattr__(
+            self,
+            "stage_inputs",
+            MappingProxyType(dict(self.stage_inputs)),
         )
 
 
@@ -1115,6 +1136,8 @@ class PipelineOrchestrator:
                 )
                 continue
             runtime_inputs: dict[str, object] = {}
+            terminal_missing_inputs: list[tuple[str, StageOutputRef]] = []
+            invalid_missing_inputs: list[tuple[str, StageOutputRef]] = []
             for port_name, binding in stage.spec.inputs.items():
                 if isinstance(binding, PipelineInputRef):
                     runtime_inputs[port_name] = inputs[binding.input_name]
@@ -1125,20 +1148,41 @@ class PipelineOrchestrator:
                     continue
                 target = stage.registration.input_ports[port_name]
                 if target.required:
-                    raise PipelineExecutionError(
-                        f"stage {stage.spec.stage_id!r} required input {port_name!r} "
-                        f"was not produced by {binding.stage_id}.{binding.output_name}"
+                    if source.status in {
+                        StageExecutionStatus.FAILED,
+                        StageExecutionStatus.QUARANTINED,
+                        StageExecutionStatus.SKIPPED,
+                    }:
+                        terminal_missing_inputs.append((port_name, binding))
+                    else:
+                        invalid_missing_inputs.append((port_name, binding))
+            if invalid_missing_inputs:
+                details = "; ".join(
+                    f"required input {port_name!r} was not produced by "
+                    f"{binding.stage_id}.{binding.output_name}"
+                    for port_name, binding in sorted(
+                        invalid_missing_inputs,
+                        key=lambda item: item[0],
                     )
+                )
+                raise PipelineExecutionError(f"stage {stage.spec.stage_id!r} {details}")
+            if terminal_missing_inputs:
+                results[stage.spec.stage_id] = StageResult(
+                    status=StageExecutionStatus.SKIPPED
+                )
+                continue
             context = StageContext(
                 pipeline_id=pipeline.spec.pipeline_id,
                 pipeline_version=pipeline.spec.pipeline_version,
                 pipeline_run_id=execution_id,
+                stage_invocation_id=f"stage-invocation-{uuid.uuid4()}",
                 stage_id=stage.spec.stage_id,
                 inputs=runtime_inputs,
                 prior_results=results,
             )
             started_at = utc_now()
             started_clock = time.perf_counter()
+            stage_context_token = _ACTIVE_STAGE_CONTEXT.set(context)
             try:
                 results[stage.spec.stage_id] = await self.executor.execute(
                     stage,
@@ -1150,11 +1194,13 @@ class PipelineOrchestrator:
                         pipeline_id=pipeline.spec.pipeline_id,
                         pipeline_version=pipeline.spec.pipeline_version,
                         pipeline_run_id=execution_id,
+                        stage_invocation_id=context.stage_invocation_id,
                         stage_id=stage.spec.stage_id,
                         component=stage.registration.descriptor,
                         configuration=stage.configuration.model_dump(mode="python"),
                         configuration_sha256=stage.configuration_sha256,
                         input_identity=resolved_input_identity,
+                        stage_inputs=runtime_inputs,
                         exception=exc,
                         started_at=started_at,
                         started_clock=started_clock,
@@ -1168,6 +1214,8 @@ class PipelineOrchestrator:
                         )
                         raise exc from observer_error
                 raise
+            finally:
+                _ACTIVE_STAGE_CONTEXT.reset(stage_context_token)
         return PipelineExecution(pipeline_run_id=execution_id, results=results)
 
 
