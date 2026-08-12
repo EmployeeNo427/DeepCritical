@@ -246,6 +246,7 @@ def test_all_real_job_runs_one_capture_capable_pipeline_with_every_runtime() -> 
         "Build and record the project-owned GROBID image",
     )["run"]
     assert "GROBID_DOCKERFILE_BLOB_SHA" in grobid_build
+    assert "DEEPCRITICAL_LIVE_GROBID_DOCKERFILE_BLOB" in grobid_build
     assert "DEEPCRITICAL_LIVE_GROBID_IMAGE_REF" in grobid_build
     assert "DEEPCRITICAL_LIVE_GROBID_IMAGE_ID" in grobid_build
 
